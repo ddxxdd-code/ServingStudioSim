@@ -1,0 +1,49 @@
+# Store-disabled control for distributed_kv_pd_validation.yaml.
+deployment: pd
+workload:
+  trace_files:
+  - ${trace}
+  input_file_format: text-generation-session-execution-v2
+  arrival_mode: trace_timed
+  session_dependency: chained
+  run_to_end: true
+  request_rate: 1.0
+  tick_dt_us: ${tick}
+io:
+  log_dir: logs/distributed_kv_validation/direct/{case}
+pools:
+  prefill:
+    placement: round-robin
+    groups:
+    - gpu: NVIDIA H200
+      replicas: 2
+      arch:
+        type: llama3_dense_tp
+        model_config: model/config/llama3_8b.json
+        tp_size: 1
+      worker:
+        type: pd_prefill
+  decode:
+    groups:
+    - gpu: NVIDIA H200
+      replicas: 1
+      arch:
+        type: llama3_dense_tp
+        model_config: model/config/llama3_8b.json
+        tp_size: 1
+      worker:
+        type: pd_decode
+compound:
+  case:
+    baseline:
+      trace: tests/fixtures/distributed_kv_conversations.csv
+      tick: 1
+    tick10us:
+      trace: tests/fixtures/distributed_kv_conversations.csv
+      tick: 10
+    tick100us:
+      trace: tests/fixtures/distributed_kv_conversations.csv
+      tick: 100
+    no_reuse:
+      trace: tests/fixtures/distributed_kv_conversations_no_reuse.csv
+      tick: 1

@@ -1,0 +1,67 @@
+# One-factor-at-a-time sensitivity; direct control uses identical model, trace and placement.
+deployment: pd
+workload:
+  trace_files:
+  - ${trace}
+  input_file_format: text-generation-session-execution-v2
+  arrival_mode: trace_timed
+  session_dependency: chained
+  run_to_end: true
+  request_rate: 1.0
+  tick_dt_us: ${tick}
+io:
+  log_dir: logs/distributed_kv_validation/remote/{case}
+pools:
+  prefill:
+    placement: round-robin
+    groups:
+    - gpu: NVIDIA H200
+      replicas: 2
+      arch:
+        type: llama3_dense_tp
+        model_config: model/config/llama3_8b.json
+        tp_size: 1
+      worker:
+        type: remote_cache_pd_prefill
+        max_inflight_remote_reads: ${reads}
+  decode:
+    groups:
+    - gpu: NVIDIA H200
+      replicas: 1
+      arch:
+        type: llama3_dense_tp
+        model_config: model/config/llama3_8b.json
+        tp_size: 1
+      worker:
+        type: remote_cache_pd_decode
+kv_store:
+  worker: distributed_kv_store
+  replicas: ${stores}
+  dram_gb: ${dram}
+  bandwidth_gbps: ${bandwidth}
+  latency_us: ${latency}
+  placement: ${placement}
+  policy: lru
+compound:
+  case:
+    baseline: &baseline
+      stores: 2
+      dram: 64
+      latency: 10
+      bandwidth: 25
+      placement: least-loaded
+      reads: 16
+      tick: 1
+      trace: tests/fixtures/distributed_kv_conversations.csv
+    stores1: {<<: *baseline, stores: 1}
+    stores4: {<<: *baseline, stores: 4}
+    dram32mb: {<<: *baseline, dram: 0.032}
+    latency100us: {<<: *baseline, latency: 100}
+    bandwidth1: {<<: *baseline, bandwidth: 1}
+    round_robin: {<<: *baseline, placement: round-robin}
+    session_hash: {<<: *baseline, placement: session-hash}
+    reads1: {<<: *baseline, reads: 1}
+    reads32: {<<: *baseline, reads: 32}
+    tick10us: {<<: *baseline, tick: 10}
+    tick100us: {<<: *baseline, tick: 100}
+    no_reuse: {<<: *baseline, trace: tests/fixtures/distributed_kv_conversations_no_reuse.csv}

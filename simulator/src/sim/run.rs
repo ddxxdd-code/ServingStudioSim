@@ -183,6 +183,7 @@ pub fn run_sim(
     let mut heartbeat = EveryN::new(ticks(Time::from_ms(HEARTBEAT_INTERVAL_MS)));
     let mut watchdog = EveryN::new(ticks(sample_dt));
 
+    let mut foreground_end = None;
     let cause = loop {
         // 1. Drain arrivals due by now → Flow inserts into the shared store.
         //    The frontend owns the drain loop, so the whole tick is emptied here.
@@ -197,6 +198,8 @@ pub fn run_sim(
             logger.record_request_slo(slo_entry(req, clock, &s[req]))?;
         }
 
+        flow.check_health()?;
+
         // 2b. Periodic `request_state` snapshot — one AGGREGATE row per tick over
         //     the *admitted* set (`iter_admitted`). The analyzer only ever needs
         //     `Σ completed_input_len` / `Σ completed_output_len` per tick (it
@@ -205,7 +208,7 @@ pub fn run_sim(
         //     worker has touched have zero processed tokens and are skipped —
         //     but even on a saturated run, where prefill admits ~the whole
         //     trace, this is one row, not ~150k.
-        if snapshot.fire() {
+        if snapshot.fire() && foreground_end.is_none() {
             let s = store.borrow();
             logger.record_request_state(state_agg(&s, clock))?;
             last_state_clock = Some(clock);
@@ -234,9 +237,16 @@ pub fn run_sim(
         let in_flight = frontend.in_flight();
         let exhausted = frontend.exhausted();
         if exhausted && in_flight == 0 {
-            break TerminationCause::DrainComplete;
+            foreground_end.get_or_insert(clock);
+            if flow.background_pending() == 0 {
+                break TerminationCause::DrainComplete;
+            }
+            anyhow::ensure!(
+                clock - foreground_end.unwrap() < cfg.stuck_threshold,
+                "distributed KV background drain exceeded stuck_threshold"
+            );
         }
-        if !cfg.run_to_end && clock >= cfg.duration {
+        if foreground_end.is_none() && !cfg.run_to_end && clock >= cfg.duration {
             break TerminationCause::DurationReached;
         }
 
@@ -263,6 +273,9 @@ pub fn run_sim(
         clock = clock + cfg.tick_dt;
     };
 
+    // Network/store log timestamps may extend beyond this foreground horizon.
+    // Throughput and completion metrics retain the user-visible interval.
+    let clock = foreground_end.unwrap_or(clock);
     finalize(store, logger, clock, last_state_clock)?;
     logger.flush_all()?;
 
@@ -510,6 +523,85 @@ mod tests {
 
     fn write_trace(dir: &std::path::Path, n: u32) -> PathBuf {
         write_trace_with_output_len(dir, n, 3)
+    }
+
+    #[test]
+    fn background_drain_keeps_foreground_horizon_and_completion_rows() {
+        struct Background<F> {
+            inner: F,
+            pending: usize,
+            last_tick: Time,
+        }
+        impl<F: Flow> Flow for Background<F> {
+            fn on_arrival(&mut self, req: crate::common::Request) {
+                self.inner.on_arrival(req);
+            }
+            fn tick(&mut self, now: Time) -> Vec<OrchAction> {
+                self.last_tick = now;
+                self.pending = self.pending.saturating_sub(1);
+                let actions = self.inner.tick(now);
+                if !actions.is_empty() {
+                    self.pending = 100;
+                }
+                actions
+            }
+            fn background_pending(&self) -> usize {
+                self.pending
+            }
+            fn cluster(&self) -> &crate::worker::SharedGpuCluster {
+                self.inner.cluster()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let trace = write_trace(dir.path(), 1);
+        let store = Rc::new(RefCell::new(RequestStore::new()));
+        let factory = UnifiedWorkerFactory::new(
+            Arc::new(FakeModel::for_ms(1.0)),
+            store.clone(),
+            WorkerConfig::default(),
+            None,
+            "test".into(),
+            "main",
+            build_barebone_worker::<FakeModel>,
+        );
+        let inner = SimpleDpFlow::new(
+            SimpleDpConfig {
+                dp_pool: SimpleDpPoolConfig {
+                    pool: PoolId(0),
+                    num_workers: 1,
+                    placement: DpPlacementPolicy::RoundRobin,
+                },
+            },
+            factory,
+        );
+        let mut flow = Background {
+            inner,
+            pending: 0,
+            last_tick: Time::ZERO,
+        };
+        let mut frontend = TraceFrontend::load(
+            &[trace],
+            &InputFileSchema::text_generation_independent(),
+            ArrivalSchedule::trace_timed(1.0).unwrap(),
+            CapacityLimit::unlimited(),
+            SessionDependency::Independent,
+        )
+        .unwrap();
+        let mut logger = LoggerSession::open(dir.path(), true, false).unwrap();
+        // Duration would expire during the drain; already-completed requests still drain.
+        let summary = run_sim(
+            &mut flow,
+            &store,
+            &mut frontend,
+            &mut logger,
+            &TickCfg::new(5.0, false, 100),
+        )
+        .unwrap();
+        assert_eq!(summary.cause, TerminationCause::DrainComplete);
+        assert_eq!(summary.sim_ms, 3.0);
+        assert_eq!(flow.last_tick, Time::from_ms(13.0));
+        assert_eq!(flow.pending, 0);
+        assert_eq!(frontend.num_completed(), 1);
     }
 
     #[test]

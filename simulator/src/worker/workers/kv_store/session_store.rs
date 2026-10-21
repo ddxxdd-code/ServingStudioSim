@@ -29,6 +29,12 @@ impl SessionStore {
     pub(super) fn used(&self) -> u64 {
         self.cache.used_charge() + self.reserved
     }
+    pub(super) fn reserved(&self) -> u64 {
+        self.reserved
+    }
+    pub(super) fn pinned(&self) -> u64 {
+        self.cache.pinned_charge()
+    }
     pub(super) fn cached(&self) -> u64 {
         self.cache.used_charge()
     }
@@ -92,17 +98,53 @@ impl SessionStore {
         (tokens, result.mutations)
     }
 
-    pub(super) fn consumed(&mut self, session: u32, req: RequestId) {
+    pub(super) fn consumed(&mut self, session: u32, req: RequestId) -> bool {
         if self.pins.get(&session) == Some(&req) {
             self.pins.remove(&session);
             self.cache.set_pinned(session, false);
+            return true;
         }
+        false
+    }
+
+    pub(super) fn cancel(&mut self, session: u32, req: RequestId) {
+        if self
+            .incoming
+            .get(&session)
+            .is_some_and(|(owner, _)| *owner == req)
+        {
+            let (_, tokens) = self.incoming.remove(&session).unwrap();
+            self.reserved -= tokens;
+        }
+        self.consumed(session, req);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_releases_reservation_and_stale_ids_preserve_new_pin() {
+        let mut store = SessionStore::new(100, PrefixCachePolicy::Lru);
+        store
+            .reserve(1, RequestId(1), 90, KvRetention::PinnedUntilFetched)
+            .unwrap();
+        store.cancel(1, RequestId(2));
+        assert_eq!(store.used(), 90);
+        store.cancel(1, RequestId(1));
+        assert_eq!(store.used(), 0);
+        store
+            .reserve(1, RequestId(2), 100, KvRetention::PinnedUntilFetched)
+            .unwrap();
+        store.land(1, RequestId(2), KvRetention::PinnedUntilFetched);
+        assert!(!store.consumed(1, RequestId(1)));
+        store.cancel(1, RequestId(1));
+        assert!(store.busy(1));
+        assert!(store.consumed(1, RequestId(2)));
+        assert!(!store.consumed(1, RequestId(2)));
+        assert_eq!(store.available_for_pin(), 100);
+    }
+
     #[test]
     fn concurrent_pushes_reserve_capacity_and_pins_survive_pressure() {
         let mut store = SessionStore::new(100, PrefixCachePolicy::Lru);

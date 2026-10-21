@@ -64,6 +64,11 @@ impl super::RemotePrefixKv for FullAttnKv {
         tokens: u64,
         now: Time,
     ) {
+        // Recheck at landing: another request may have grown the local cache
+        // while this read was in flight.
+        if u64::from(self.prefix_caches[partition as usize].peek(session, u32::MAX)) >= tokens {
+            return;
+        }
         self.retain_prefix(
             request,
             partition,
@@ -73,6 +78,7 @@ impl super::RemotePrefixKv for FullAttnKv {
             now,
             PrefixCacheRetentionReason::RemoteRead,
         );
+        self.prefix_caches[partition as usize].mark_remote_read(session, request);
         self.sample_submit(partition, now);
     }
 
@@ -81,6 +87,7 @@ impl super::RemotePrefixKv for FullAttnKv {
         request: RequestId,
         partition: PartitionId,
         session: SessionInput,
+        now: Time,
     ) -> u64 {
         let context = self.ledger.prefill_context(request);
         let tokens = self.partitions[partition as usize]
@@ -91,7 +98,69 @@ impl super::RemotePrefixKv for FullAttnKv {
         let context = context.unwrap_or_else(|| ResolvedPrefillContext::new(session, 0, 0));
         self.ledger.set_prefill_context(request, context);
         self.ledger.hold(request, partition, tokens);
+        if let Some(session_id) = session.session_id() {
+            if u64::from(self.prefix_caches[partition as usize].peek(session_id, u32::MAX)) < tokens
+            {
+                self.retain_prefix(
+                    request,
+                    partition,
+                    session_id,
+                    tokens,
+                    context.cache_return_metadata(),
+                    now,
+                    PrefixCacheRetentionReason::RequestComplete,
+                );
+            }
+        }
+        self.sample_submit(partition, now);
         tokens
+    }
+
+    fn remote_hit_tokens(
+        &self,
+        request: RequestId,
+        partition: PartitionId,
+        session: SessionInput,
+        hit: u32,
+    ) -> u32 {
+        if session
+            .session_id()
+            .and_then(|id| self.prefix_caches[partition as usize].remote_reader(id))
+            == Some(request)
+        {
+            hit
+        } else {
+            0
+        }
+    }
+
+    fn complete_push(&mut self, request: RequestId, now: Time) {
+        // Standalone PD still uses the original direct handoff lifecycle.
+        if self
+            .ledger
+            .prefill_context(request)
+            .and_then(ResolvedPrefillContext::session_id)
+            .is_none()
+        {
+            self.complete_handoff(request, now);
+            return;
+        }
+        if let Some((partition, _)) = self.ledger.take_held(request) {
+            self.ledger.take_prefill_context(request);
+            self.sample_submit(partition, now);
+        }
+    }
+
+    fn cancel_remote(&mut self, request: RequestId, now: Time) {
+        if let Some(partition) = self.ledger.placement(request) {
+            self.partitions[partition as usize].remove_prefill_admit(request);
+            self.release(request, partition);
+            self.sample_submit(partition, now);
+        } else if let Some((partition, _)) = self.ledger.take_held(request) {
+            self.ledger.take_prefill_context(request);
+            self.ledger.forget_promise(request);
+            self.sample_submit(partition, now);
+        }
     }
 }
 
@@ -718,6 +787,71 @@ mod tests {
             max_retained_tokens,
             policy,
         }
+    }
+
+    #[test]
+    fn remote_landing_and_push_ack_cannot_shrink_newer_local_prefix() {
+        use crate::worker::kv::RemotePrefixKv;
+        let mut kv = FullAttnKv::with_prefix_cache(
+            1,
+            200,
+            capped_prefix_cache(200, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
+        let session = SessionInput::Session {
+            session_id: 7,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens: 0,
+        };
+        let req = RequestId(1);
+        let resolved = kv.preview_prefill_context(0, 40, session);
+        let footprint = kv.footprint(req, 40, 0);
+        kv.reserve_prefill_context(req, 0, resolved, footprint, Time::ZERO);
+        kv.drain_ready();
+        assert_eq!(kv.hold_for_push(req, 0, session, Time::ZERO), 40);
+        assert_eq!(kv.prefix_caches[0].peek(7, 200), 40);
+        assert_eq!(kv.ledger.partition_held(0), 40);
+        assert_eq!(kv.non_cache_peak(0) + kv.prefix_caches[0].used_tokens(), 80);
+        kv.install_remote_prefix(RequestId(2), 0, 7, 80, Time::from_us(1));
+        kv.install_remote_prefix(RequestId(3), 0, 7, 20, Time::from_us(2));
+        assert_eq!(kv.prefix_caches[0].peek(7, 200), 80);
+        kv.complete_push(req, Time::from_us(3));
+        assert_eq!(kv.ledger.partition_held(0), 0);
+        assert_eq!(kv.prefix_caches[0].peek(7, 200), 80);
+    }
+
+    #[test]
+    fn push_copy_obeys_physical_slack_and_cancel_releases_hold() {
+        use crate::worker::kv::RemotePrefixKv;
+        let mut kv = FullAttnKv::with_prefix_cache(
+            1,
+            100,
+            capped_prefix_cache(100, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
+        let session = SessionInput::Session {
+            session_id: 7,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens: 0,
+        };
+        let req = RequestId(1);
+        let resolved = kv.preview_prefill_context(0, 70, session);
+        let footprint = kv.footprint(req, 70, 0);
+        kv.reserve_prefill_context(req, 0, resolved, footprint, Time::ZERO);
+        kv.drain_ready();
+        kv.hold_for_push(req, 0, session, Time::ZERO);
+        assert_eq!(kv.ledger.partition_held(0), 70);
+        assert_eq!(kv.prefix_caches[0].peek(7, 100), 30);
+        assert_eq!(
+            kv.non_cache_peak(0) + kv.prefix_caches[0].used_tokens(),
+            100
+        );
+        kv.cancel_remote(req, Time::ZERO);
+        assert_eq!(kv.ledger.partition_held(0), 0);
+        kv.complete_push(req, Time::ZERO);
+        assert_eq!(kv.prefix_caches[0].peek(7, 100), 30);
     }
 
     #[test]

@@ -39,6 +39,16 @@ pub(crate) struct KvStoreEventEntry {
     pub placement_policy: Option<&'static str>,
     pub send_backlog_ms: Option<f64>,
     pub occupancy_ratio: Option<f64>,
+    pub reserved_tokens: Option<u64>,
+    pub pinned_tokens: Option<u64>,
+    pub bytes: Option<u64>,
+    pub queue_ms: Option<f64>,
+    pub transfer_end_ms: Option<f64>,
+    pub source_pool: Option<&'static str>,
+    pub destination_pool: Option<&'static str>,
+    pub local_hit_tokens: Option<u64>,
+    pub remote_hit_tokens: Option<u64>,
+    pub background_writes: Option<u64>,
 }
 pub(crate) fn kv_store_event_to_record_batch(rows: &[KvStoreEventEntry]) -> Result<RecordBatch> {
     macro_rules! col {
@@ -66,6 +76,16 @@ pub(crate) fn kv_store_event_to_record_batch(rows: &[KvStoreEventEntry]) -> Resu
             col!(StringArray, placement_policy),
             col!(Float64Array, send_backlog_ms),
             col!(Float64Array, occupancy_ratio),
+            col!(UInt64Array, reserved_tokens),
+            col!(UInt64Array, pinned_tokens),
+            col!(UInt64Array, bytes),
+            col!(Float64Array, queue_ms),
+            col!(Float64Array, transfer_end_ms),
+            col!(StringArray, source_pool),
+            col!(StringArray, destination_pool),
+            col!(UInt64Array, local_hit_tokens),
+            col!(UInt64Array, remote_hit_tokens),
+            col!(UInt64Array, background_writes),
         ],
     )?)
 }

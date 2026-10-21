@@ -202,6 +202,8 @@ pub struct GpuCluster {
     /// whole run (the cluster is the single shared transfer oracle).
     #[serde(skip)]
     logger: Option<NetworkLogger>,
+    #[serde(skip)]
+    pub(crate) kv_store_logger: Option<crate::log::kv_store_logger::SharedKvStoreLogger>,
     /// Per-worker × group KV-pool token capacity, as
     /// `(pool_tag, pool, worker_id, group_id, capacity_tokens)`. A static per-run
     /// fact each worker reports at construction via
@@ -229,7 +231,14 @@ impl GpuCluster {
             cost,
             host_cost: None,
             logger: None,
+            kv_store_logger: None,
             kv_caps: Vec::new(),
+        }
+    }
+
+    pub(crate) fn record_kv_event(&self, row: crate::log::rows::KvStoreEventEntry) {
+        if let Some(logger) = &self.kv_store_logger {
+            logger.borrow_mut().record(row);
         }
     }
 
@@ -426,6 +435,25 @@ impl GpuCluster {
         let end = start + transfer_dur;
         self.groups[send_gid as usize].send_free = end;
         self.groups[recv_gid as usize].recv_free = end;
+        if host_endpoint {
+            self.record_kv_event(crate::log::rows::KvStoreEventEntry {
+                time_ms: now.as_ms(),
+                store_worker: if kind == "kv_store_push" {
+                    r.owner_worker_id
+                } else {
+                    s.owner_worker_id
+                },
+                request_id: tag.parse().unwrap_or_default(),
+                operation: "transfer",
+                reason: kind,
+                bytes: Some(bytes),
+                queue_ms: Some((start - now).as_ms()),
+                transfer_end_ms: Some(end.as_ms()),
+                source_pool: Some(s.owner_pool_tag),
+                destination_pool: Some(r.owner_pool_tag),
+                ..Default::default()
+            });
+        }
         // Record the on-wire window (incl. queueing) with both endpoints resolved
         // from the two groups' owners. A logging failure warns but never aborts
         // the transfer — the timing above is already committed.

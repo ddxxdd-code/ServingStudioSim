@@ -124,6 +124,9 @@ impl<K: IterWorkerKv, A: RemoteKvAdmission<K>, E: IterModelExecution<K>> IterWor
     fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
         self.advance_reads(now);
         let compute = self.iteration.tick(now, events);
+        for row in self.iteration.admission.drain_reuse() {
+            self.cluster.borrow().record_kv_event(row);
+        }
         self.iteration
             .admission
             .drain_lookups(&self.iteration.context, events);
@@ -146,7 +149,7 @@ impl<K: IterWorkerKv, A: RemoteKvAdmission<K>, E: IterModelExecution<K>>
                     .checked_mul(self.bytes_per_token)
                     .expect("KV byte overflow"),
                 "kv_store_read",
-                "",
+                &req.0.to_string(),
             );
             self.reads.push_back((end, req));
         }

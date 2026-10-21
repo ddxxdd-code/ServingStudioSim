@@ -111,6 +111,23 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         self.worker_wakeup_times[worker_id.0 as usize] = Time::ZERO;
     }
 
+    pub(crate) fn pending_wakeups(&self) -> usize {
+        self.worker_wakeup_times
+            .iter()
+            .filter(|&&t| t != NO_WAKEUP_TIME)
+            .count()
+    }
+
+    pub(crate) fn broadcast_now(&mut self, msg: W::Msg)
+    where
+        W::Msg: Clone,
+    {
+        for worker in &mut self.workers {
+            worker.enqueue(msg.clone());
+        }
+        self.worker_wakeup_times.fill(Time::ZERO);
+    }
+
     fn choose_worker_idx(&mut self) -> usize {
         match self.placement {
             DpPlacementPolicy::LeastQueued => self.choose_least_queued_idx(),

@@ -19,7 +19,7 @@ pub(crate) struct KvStoreUnifiedFlow<
     router: KvStoreRouter,
     cluster: SharedGpuCluster,
     writes: HashSet<RequestId>,
-    completed: HashSet<RequestId>,
+    failure: Option<String>,
 }
 impl<W: IterWorker<Msg = RemoteCacheWorkerMsg, Event = RemoteCacheWorkerEvent>>
     KvStoreUnifiedFlow<W>
@@ -48,7 +48,7 @@ impl<W: IterWorker<Msg = RemoteCacheWorkerMsg, Event = RemoteCacheWorkerEvent>>
             router,
             cluster,
             writes: HashSet::new(),
-            completed: HashSet::new(),
+            failure: None,
         }
     }
 }
@@ -62,6 +62,30 @@ impl<W: IterWorker<Msg = RemoteCacheWorkerMsg, Event = RemoteCacheWorkerEvent>> 
     }
     fn cluster(&self) -> &SharedGpuCluster {
         &self.cluster
+    }
+    fn background_pending(&self) -> usize {
+        self.writes.len() + self.router.pending() + self.pool.pending_wakeups()
+    }
+    fn check_health(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.failure.is_none(),
+            "{}",
+            self.failure.as_deref().unwrap_or("")
+        );
+        Ok(())
+    }
+    fn cancel(&mut self, req: RequestId, now: Time) {
+        let session = self.requests.borrow()[req]
+            .request
+            .definition
+            .session
+            .session_id();
+        if let Some(session) = session {
+            self.router.cancel(session, req);
+        }
+        self.writes.remove(&req);
+        self.pool
+            .broadcast_now(RemoteCacheWorkerMsg::Cancel { req, at: now });
     }
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {
         let mut actions = Vec::new();
@@ -97,18 +121,11 @@ impl<W: IterWorker<Msg = RemoteCacheWorkerMsg, Event = RemoteCacheWorkerEvent>> 
                         },
                     );
                     self.writes.remove(&req);
-                    if self.completed.remove(&req) {
-                        actions.push(OrchAction::Complete { req });
-                    }
                 }
-                KvStoreEvent::PushRejected {
-                    origin,
-                    req,
-                    reason,
-                    ..
-                } => self
-                    .pool
-                    .route_msg_now(origin, RemoteCacheWorkerMsg::KvPushRejected { req, reason }),
+                KvStoreEvent::PushRejected { req, reason, .. } => {
+                    self.cancel(req, now);
+                    self.failure = Some(format!("distributed KV push rejected for {req:?}: {reason:?}; all stores exhausted"));
+                }
                 KvStoreEvent::Evicted { .. } => unreachable!("router consumes invalidations"),
             }
         }
@@ -117,11 +134,17 @@ impl<W: IterWorker<Msg = RemoteCacheWorkerMsg, Event = RemoteCacheWorkerEvent>> 
         for event in events {
             match event {
                 RemoteCacheWorkerEvent::RequestComplete { req, .. } => {
-                    if self.writes.contains(&req) {
-                        self.completed.insert(req);
-                    } else {
-                        actions.push(OrchAction::Complete { req });
-                    }
+                    self.cluster
+                        .borrow()
+                        .record_kv_event(crate::log::rows::KvStoreEventEntry {
+                            time_ms: now.as_ms(),
+                            request_id: req.0,
+                            operation: "request-complete",
+                            reason: "foreground",
+                            background_writes: Some((self.writes.len()) as u64),
+                            ..Default::default()
+                        });
+                    actions.push(OrchAction::Complete { req });
                 }
                 RemoteCacheWorkerEvent::KvLookup {
                     worker,
@@ -159,7 +182,7 @@ where
     cluster: SharedGpuCluster,
     prefill_writes: HashMap<RequestId, WorkerId>,
     decode_writes: HashMap<RequestId, WorkerId>,
-    completed: HashSet<RequestId>,
+    failure: Option<String>,
 }
 impl<P, D> KvStorePdFlow<P, D>
 where
@@ -197,7 +220,7 @@ where
             cluster,
             prefill_writes: HashMap::new(),
             decode_writes: HashMap::new(),
-            completed: HashSet::new(),
+            failure: None,
         }
     }
 }
@@ -214,6 +237,36 @@ where
     fn cluster(&self) -> &SharedGpuCluster {
         &self.cluster
     }
+    fn background_pending(&self) -> usize {
+        self.prefill_writes.len()
+            + self.decode_writes.len()
+            + self.router.pending()
+            + self.prefill.pending_wakeups()
+            + self.decode.pending_wakeups()
+    }
+    fn check_health(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.failure.is_none(),
+            "{}",
+            self.failure.as_deref().unwrap_or("")
+        );
+        Ok(())
+    }
+    fn cancel(&mut self, req: RequestId, now: Time) {
+        let session = self.requests.borrow()[req]
+            .request
+            .definition
+            .session
+            .session_id();
+        if let Some(session) = session {
+            self.router.cancel(session, req);
+        }
+        self.prefill_writes.remove(&req);
+        self.decode_writes.remove(&req);
+        self.prefill
+            .broadcast_now(RemotePdPrefillMsg::Cancel { req, at: now });
+        self.decode.broadcast_now(RemotePdDecodeMsg::Cancel { req });
+    }
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {
         let mut actions = Vec::new();
         let mut pevents = Vec::new();
@@ -221,11 +274,19 @@ where
         for event in pevents {
             match event {
                 RemotePdPrefillEvent::RequestComplete { req, .. } => {
-                    if self.prefill_writes.contains_key(&req) {
-                        self.completed.insert(req);
-                    } else {
-                        actions.push(OrchAction::Complete { req });
-                    }
+                    self.cluster
+                        .borrow()
+                        .record_kv_event(crate::log::rows::KvStoreEventEntry {
+                            time_ms: now.as_ms(),
+                            request_id: req.0,
+                            operation: "request-complete",
+                            reason: "foreground",
+                            background_writes: Some(
+                                (self.prefill_writes.len() + self.decode_writes.len()) as u64,
+                            ),
+                            ..Default::default()
+                        });
+                    actions.push(OrchAction::Complete { req });
                 }
                 RemotePdPrefillEvent::KvLookup {
                     worker,
@@ -314,14 +375,10 @@ where
                             },
                         );
                     }
-                    if self.completed.remove(&req) {
-                        actions.push(OrchAction::Complete { req });
-                    }
                 }
                 KvStoreEvent::PushRejected { req, reason, .. } => {
-                    // Failure is explicit and synchronous; do not leave a held
-                    // source waiting behind another compute wakeup forever.
-                    panic!("distributed KV push rejected for {req:?}: {reason:?}");
+                    self.cancel(req, now);
+                    self.failure = Some(format!("distributed KV push rejected for {req:?}: {reason:?}; all stores exhausted"));
                 }
                 KvStoreEvent::Evicted { .. } => unreachable!("router consumes invalidations"),
             }
@@ -331,11 +388,19 @@ where
         for event in devents {
             match event {
                 RemotePdDecodeEvent::RequestComplete { req, .. } => {
-                    if self.decode_writes.contains_key(&req) {
-                        self.completed.insert(req);
-                    } else {
-                        actions.push(OrchAction::Complete { req });
-                    }
+                    self.cluster
+                        .borrow()
+                        .record_kv_event(crate::log::rows::KvStoreEventEntry {
+                            time_ms: now.as_ms(),
+                            request_id: req.0,
+                            operation: "request-complete",
+                            reason: "foreground",
+                            background_writes: Some(
+                                (self.prefill_writes.len() + self.decode_writes.len()) as u64,
+                            ),
+                            ..Default::default()
+                        });
+                    actions.push(OrchAction::Complete { req });
                 }
                 RemotePdDecodeEvent::KvConsumed {
                     req,
@@ -425,6 +490,169 @@ mod tests {
         panic!("request {req:?} did not complete");
     }
     #[test]
+    fn next_turn_can_use_local_prefix_while_shared_writes_are_outstanding() {
+        let requests = Rc::new(RefCell::new(RequestStore::new()));
+        let factory = UnifiedWorkerFactory::new(
+            Arc::new(FakeModel::for_ms(1.0)),
+            requests.clone(),
+            WorkerConfig {
+                attn_kv_bytes: 1000,
+                ..Default::default()
+            },
+            None,
+            "test".into(),
+            "main",
+            build_remote_cache_unified_worker::<FakeModel>,
+        );
+        let mut slow = spec();
+        slow.latency_us = 100_000.0;
+        let mut flow = KvStoreUnifiedFlow::new(&pool(0, 1), &factory, &slow, 1);
+        let mut clock = 0;
+        flow.on_arrival(request(0, 0, 3, Time::ZERO));
+        drive(&mut flow, &mut clock, RequestId(0));
+        assert_eq!(flow.writes.len(), 1);
+        flow.on_arrival(request(1, 20, 3, Time::from_us(clock * 100)));
+        drive(&mut flow, &mut clock, RequestId(1));
+        assert_eq!(flow.writes.len(), 2);
+        assert_eq!(
+            requests.borrow()[RequestId(1)]
+                .telemetry
+                .prefix_cache_hit_tokens,
+            Some(20)
+        );
+        assert!(
+            clock < 1000,
+            "both completions precede the first store landing"
+        );
+        for _ in 0..4000 {
+            assert!(flow.tick(Time::from_us(clock * 100)).is_empty());
+            clock += 1;
+            if flow.background_pending() == 0 {
+                break;
+            }
+        }
+        assert_eq!(flow.background_pending(), 0);
+    }
+
+    #[test]
+    fn relay_capacity_exhaustion_is_an_explicit_error_and_single_token_is_background() {
+        for output in [1, 3] {
+            let requests = Rc::new(RefCell::new(RequestStore::new()));
+            let config = WorkerConfig {
+                attn_kv_bytes: 1000,
+                ..Default::default()
+            };
+            let pf = UnifiedWorkerFactory::new(
+                Arc::new(FakeModel::for_ms(1.0)),
+                requests.clone(),
+                config,
+                None,
+                "test".into(),
+                "prefill",
+                build_remote_cache_pd_prefill_worker::<FakeModel>,
+            );
+            let df = UnifiedWorkerFactory::new(
+                Arc::new(FakeModel::for_ms(1.0)),
+                requests,
+                config,
+                None,
+                "test".into(),
+                "decode",
+                build_remote_cache_pd_decode_worker::<FakeModel>,
+            );
+            let mut tiny = spec();
+            tiny.dram_gb = 0.000000001;
+            tiny.latency_us = 100_000.0;
+            let mut flow = KvStorePdFlow::new(
+                &pool(0, 1),
+                &pf,
+                &pool(1, 1),
+                &df,
+                &tiny,
+                1,
+                CostSource::analytic(1.0),
+            );
+            flow.on_arrival(request(0, 0, output, Time::ZERO));
+            let mut complete = false;
+            for step in 0..100 {
+                complete |= !flow.tick(Time::from_us(step * 100)).is_empty();
+                if complete || flow.check_health().is_err() {
+                    break;
+                }
+            }
+            if output == 1 {
+                assert!(complete);
+                assert!(flow.background_pending() > 0);
+                assert!(flow.check_health().is_ok());
+            } else {
+                assert!(!complete);
+                assert!(flow
+                    .check_health()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("CapacityExceeded"));
+                assert!(flow.prefill_writes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn pd_cancel_at_each_protocol_phase_drains_and_allows_next_session_turn() {
+        for cancel_step in [0, 10, 11, 12, 13] {
+            let requests = Rc::new(RefCell::new(RequestStore::new()));
+            let config = WorkerConfig {
+                attn_kv_bytes: 1000,
+                ..Default::default()
+            };
+            let pf = UnifiedWorkerFactory::new(
+                Arc::new(FakeModel::for_ms(1.0)),
+                requests.clone(),
+                config,
+                None,
+                "test".into(),
+                "prefill",
+                build_remote_cache_pd_prefill_worker::<FakeModel>,
+            );
+            let df = UnifiedWorkerFactory::new(
+                Arc::new(FakeModel::for_ms(1.0)),
+                requests,
+                config,
+                None,
+                "test".into(),
+                "decode",
+                build_remote_cache_pd_decode_worker::<FakeModel>,
+            );
+            let mut flow = KvStorePdFlow::new(
+                &pool(0, 1),
+                &pf,
+                &pool(1, 1),
+                &df,
+                &spec(),
+                1,
+                CostSource::analytic(1.0),
+            );
+            flow.on_arrival(request(0, 0, 8, Time::ZERO));
+            for step in 0..=cancel_step {
+                assert!(flow.tick(Time::from_us(step * 100)).is_empty());
+            }
+            let now = Time::from_us(cancel_step * 100);
+            flow.cancel(RequestId(0), now);
+            for step in cancel_step..100 {
+                assert!(flow.tick(Time::from_us(step * 100)).is_empty());
+            }
+            assert_eq!(flow.background_pending(), 0, "cancel step {cancel_step}");
+            flow.on_arrival(request(1, 0, 3, Time::from_ms(10.0)));
+            let mut clock = 100;
+            drive(&mut flow, &mut clock, RequestId(1));
+            for step in clock..clock + 100 {
+                assert!(flow.tick(Time::from_us(step * 100)).is_empty());
+            }
+            assert_eq!(flow.background_pending(), 0);
+            assert!(flow.check_health().is_ok());
+        }
+    }
+
+    #[test]
     fn unified_shared_prefix_survives_reads_on_different_workers() {
         let requests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
@@ -449,6 +677,15 @@ mod tests {
                 Time::from_us(clock * 100),
             ));
             drive(&mut flow, &mut clock, RequestId(id));
+            assert!(flow.background_pending() > 0);
+            for _ in 0..500 {
+                if flow.background_pending() == 0 {
+                    break;
+                }
+                assert!(flow.tick(Time::from_us(clock * 100)).is_empty());
+                clock += 1;
+            }
+            assert_eq!(flow.background_pending(), 0);
         }
         assert_eq!(flow.cluster.borrow().num_gpus(), 3);
         let requests = requests.borrow();
@@ -508,6 +745,15 @@ mod tests {
                 Time::from_us(clock * 100),
             ));
             drive(&mut flow, &mut clock, RequestId(id));
+            assert!(flow.background_pending() > 0);
+            for _ in 0..500 {
+                if flow.background_pending() == 0 {
+                    break;
+                }
+                assert!(flow.tick(Time::from_us(clock * 100)).is_empty());
+                clock += 1;
+            }
+            assert_eq!(flow.background_pending(), 0);
             assert_eq!(
                 requests.borrow()[RequestId(id)]
                     .progress

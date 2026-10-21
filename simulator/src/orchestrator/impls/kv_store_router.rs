@@ -9,13 +9,26 @@ use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::{IterWorker, KvStoreLoad};
 use crate::worker::types::{KvPushRejectReason, KvRetention, KvStoreEvent, KvStoreMsg};
 use crate::worker::workers::kv_store::{build_kv_store_worker, KvStoreWorker};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+#[derive(Clone, Copy)]
+struct KvLocation {
+    store: WorkerId,
+    tokens: u64,
+}
+struct PendingPush {
+    message: KvStoreMsg,
+    candidates: VecDeque<usize>,
+}
 
 pub(crate) struct KvStoreRouter {
     logger: Option<SharedKvStoreLogger>,
+    cluster: SharedGpuCluster,
     workers: Vec<KvStoreWorker>,
     wakeups: Vec<Option<Time>>,
-    directory: HashMap<u32, (WorkerId, u64)>,
+    directory: HashMap<u32, KvLocation>,
+    pushes: HashMap<RequestId, PendingPush>,
+    cancelled: HashSet<RequestId>,
     placement: KvStorePlacement,
     next: usize,
     replies: Vec<KvStoreEvent>,
@@ -42,9 +55,12 @@ impl KvStoreRouter {
             .collect();
         Self {
             logger: None,
+            cluster: cluster.clone(),
             workers,
             wakeups: vec![None; spec.replicas as usize],
             directory: HashMap::new(),
+            pushes: HashMap::new(),
+            cancelled: HashSet::new(),
             placement: spec.placement,
             next: 0,
             replies: Vec::new(),
@@ -55,6 +71,7 @@ impl KvStoreRouter {
         for worker in &mut self.workers {
             worker.logger = Some(logger.clone());
         }
+        self.cluster.borrow_mut().kv_store_logger = Some(logger.clone());
         self.logger = Some(logger);
     }
     fn route(&mut self, worker: WorkerId, msg: KvStoreMsg) {
@@ -69,7 +86,8 @@ impl KvStoreRouter {
         session: u32,
         requested_tokens: u32,
     ) {
-        if let Some(&(worker, _)) = self.directory.get(&session) {
+        if let Some(location) = self.directory.get(&session).filter(|l| l.tokens > 0) {
+            let worker = location.store;
             self.route(
                 worker,
                 KvStoreMsg::Lookup {
@@ -100,52 +118,72 @@ impl KvStoreRouter {
         retention: KvRetention,
         now: Time,
     ) {
-        let eligible = |worker: &KvStoreWorker| {
-            retention == KvRetention::Shared || worker.available_pinned_tokens() >= tokens
+        let count = self.workers.len();
+        let start = if self.placement == KvStorePlacement::SessionHash {
+            session as usize % count
+        } else {
+            self.next
         };
-        let choice = match self.placement {
-            KvStorePlacement::LeastLoaded => self
-                .workers
-                .iter()
-                .enumerate()
-                .filter(|(_, w)| eligible(w))
-                .min_by(|(ia, a), (ib, b)| {
-                    // Equal weights: occupancy ratio plus backlog in milliseconds.
-                    let score = |w: &KvStoreWorker| {
-                        w.used_tokens() as f64 / w.capacity_tokens() as f64
-                            + w.send_backlog(now).as_ms()
-                    };
-                    score(a).total_cmp(&score(b)).then(ia.cmp(ib))
-                })
-                .map(|(i, _)| i),
-            KvStorePlacement::RoundRobin | KvStorePlacement::SessionHash => {
-                let start = if self.placement == KvStorePlacement::SessionHash {
-                    session as usize % self.workers.len()
-                } else {
-                    self.next
+        let mut candidates: Vec<_> = (0..count).map(|offset| (start + offset) % count).collect();
+        if self.placement == KvStorePlacement::LeastLoaded {
+            candidates.sort_by(|&a, &b| {
+                // First-cut heuristic: occupancy ratio + sender backlog in ms.
+                // Capacity is checked authoritatively by each store at reservation.
+                let score = |i: usize| {
+                    self.workers[i].used_tokens() as f64
+                        / self.workers[i].capacity_tokens().max(1) as f64
+                        + self.workers[i].send_backlog(now).as_ms()
                 };
-                (0..self.workers.len())
-                    .map(|offset| (start + offset) % self.workers.len())
-                    .find(|&i| eligible(&self.workers[i]))
-            }
+                score(a).total_cmp(&score(b)).then(a.cmp(&b))
+            });
+        }
+        self.next = (candidates[0] + 1) % count;
+        self.pushes.insert(
+            req,
+            PendingPush {
+                message: KvStoreMsg::Push {
+                    origin,
+                    req,
+                    session,
+                    tokens,
+                    send_gid,
+                    retention,
+                },
+                candidates: candidates.into(),
+            },
+        );
+        let events = self.try_next(req, now, false);
+        self.process_events(events, now);
+    }
+
+    fn try_next(&mut self, req: RequestId, now: Time, retry: bool) -> Vec<KvStoreEvent> {
+        let pending = self.pushes.get_mut(&req).expect("registered push");
+        let KvStoreMsg::Push {
+            origin,
+            session,
+            tokens,
+            ..
+        } = pending.message
+        else {
+            unreachable!()
         };
-        let Some(index) = choice else {
-            self.replies.push(KvStoreEvent::PushRejected {
+        let Some(index) = pending.candidates.pop_front() else {
+            self.pushes.remove(&req);
+            return vec![KvStoreEvent::PushRejected {
                 store: WorkerId(0),
                 origin,
                 req,
                 reason: KvPushRejectReason::CapacityExceeded,
-            });
-            return;
+            }];
         };
-        self.next = (index + 1) % self.workers.len();
+        let message = pending.message;
         if let Some(logger) = &self.logger {
             logger.borrow_mut().record(KvStoreEventEntry {
                 time_ms: now.as_ms(),
                 store_worker: index as u16,
                 request_id: req.0,
                 session_id: session,
-                operation: "placement",
+                operation: if retry { "retry" } else { "placement" },
                 reason: "push",
                 requested_tokens: tokens,
                 placement_policy: Some(match self.placement {
@@ -161,41 +199,61 @@ impl KvStoreRouter {
                 ..Default::default()
             });
         }
-        self.route(
-            WorkerId(index as u16),
-            KvStoreMsg::Push {
-                origin,
-                req,
-                session,
-                tokens,
-                send_gid,
-                retention,
-            },
-        );
-        // Process acceptance immediately, so a subsequent placement sees reserved
-        // capacity rather than overbooking all same-tick offers onto one store.
+        self.route(WorkerId(index as u16), message);
         let mut events = Vec::new();
         self.wakeups[index] = self.workers[index].tick(now, &mut events);
-        self.process_events(events);
+        events
+    }
+
+    pub(crate) fn pending(&self) -> usize {
+        self.pushes.len() + self.replies.len() + self.wakeups.iter().filter(|w| w.is_some()).count()
+    }
+
+    pub(crate) fn cancel(&mut self, session: u32, req: RequestId) {
+        self.cancelled.insert(req);
+        self.pushes.remove(&req);
+        self.replies.retain(|event| match event {
+            KvStoreEvent::LookupResult { req: r, .. }
+            | KvStoreEvent::PushComplete { req: r, .. }
+            | KvStoreEvent::PushRejected { req: r, .. } => *r != req,
+            KvStoreEvent::Evicted { .. } => true,
+        });
+        // Broadcast is deliberately identity-guarded at SessionStore: a relay
+        // may already have landed or its acknowledgement may still be queued.
+        for index in 0..self.workers.len() {
+            self.route(WorkerId(index as u16), KvStoreMsg::Cancel { session, req });
+        }
     }
     pub(crate) fn consumed(&mut self, store: WorkerId, session: u32, req: RequestId) {
         self.route(store, KvStoreMsg::Consumed { session, req });
     }
-    fn process_events(&mut self, events: Vec<KvStoreEvent>) {
-        for event in events {
+    fn process_events(&mut self, events: Vec<KvStoreEvent>, now: Time) {
+        let mut events: VecDeque<_> = events.into();
+        while let Some(event) = events.pop_front() {
+            let req = match event {
+                KvStoreEvent::LookupResult { req, .. }
+                | KvStoreEvent::PushComplete { req, .. }
+                | KvStoreEvent::PushRejected { req, .. } => Some(req),
+                KvStoreEvent::Evicted { .. } => None,
+            };
+            if req.is_some_and(|r| self.cancelled.contains(&r)) {
+                continue;
+            }
             match event {
                 KvStoreEvent::PushComplete {
                     store,
                     session,
                     tokens,
+                    req,
                     ..
                 } => {
+                    self.pushes.remove(&req);
                     if tokens > 0 {
-                        self.directory.insert(session, (store, tokens));
+                        self.directory.insert(session, KvLocation { store, tokens });
                     } else if self
                         .directory
                         .get(&session)
-                        .is_some_and(|(w, _)| *w == store)
+                        .is_some_and(|location| location.store == store)
                     {
                         self.directory.remove(&session);
                     }
@@ -205,10 +263,13 @@ impl KvStoreRouter {
                     if self
                         .directory
                         .get(&session)
-                        .is_some_and(|(w, _)| *w == store)
+                        .is_some_and(|location| location.store == store)
                     {
                         self.directory.remove(&session);
                     }
+                }
+                KvStoreEvent::PushRejected { req, .. } if self.pushes.contains_key(&req) => {
+                    events.extend(self.try_next(req, now, true));
                 }
                 _ => self.replies.push(event),
             }
@@ -221,7 +282,7 @@ impl KvStoreRouter {
                 *wakeup = worker.tick(now, &mut events);
             }
         }
-        self.process_events(events);
+        self.process_events(events, now);
         std::mem::take(&mut self.replies)
     }
 }
@@ -247,6 +308,156 @@ mod tests {
         )
     }
     #[test]
+    fn lookup_observes_push_that_is_due_on_the_same_tick() {
+        let cluster = test_cluster();
+        let gpu = cluster.borrow_mut().allocate(0, 0, 1, "test", "main");
+        let send = cluster.borrow_mut().register_comm_group(gpu, 1, "main", 0);
+        let mut router = KvStoreRouter::new(
+            &KvStorePoolSpec {
+                worker: Default::default(),
+                replicas: 1,
+                dram_gb: 0.001,
+                bandwidth_gbps: 1.0,
+                latency_us: 0.0,
+                placement: KvStorePlacement::LeastLoaded,
+                policy: PrefixCachePolicy::Lru,
+            },
+            1,
+            &cluster,
+        );
+        router.push(
+            WorkerId(0),
+            RequestId(0),
+            7,
+            20,
+            send,
+            KvRetention::Shared,
+            Time::ZERO,
+        );
+        router.tick(Time::from_us(10));
+        router.push(
+            WorkerId(0),
+            RequestId(1),
+            7,
+            80,
+            send,
+            KvRetention::Shared,
+            Time::from_us(10),
+        );
+        router.lookup(WorkerId(0), RequestId(2), 7, 80);
+        let events = router.tick(Time::from_us(20));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            KvStoreEvent::LookupResult {
+                req: RequestId(2),
+                resident_tokens: 80,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn queued_pin_rejection_retries_an_untried_store() {
+        let cluster = test_cluster();
+        let gpu = cluster.borrow_mut().allocate(0, 0, 1, "test", "main");
+        let send = cluster.borrow_mut().register_comm_group(gpu, 1, "main", 0);
+        let mut router = KvStoreRouter::new(
+            &KvStorePoolSpec {
+                worker: Default::default(),
+                replicas: 2,
+                dram_gb: 0.0000001,
+                bandwidth_gbps: 1.0,
+                latency_us: 0.0,
+                placement: KvStorePlacement::SessionHash,
+                policy: PrefixCachePolicy::Lru,
+            },
+            1,
+            &cluster,
+        );
+        router.push(
+            WorkerId(0),
+            RequestId(0),
+            0,
+            20,
+            send,
+            KvRetention::PinnedUntilFetched,
+            Time::ZERO,
+        );
+        router.tick(Time::from_us(10));
+        // Session 0 queues behind its existing pin on store 0.
+        router.push(
+            WorkerId(0),
+            RequestId(1),
+            0,
+            90,
+            send,
+            KvRetention::PinnedUntilFetched,
+            Time::from_us(10),
+        );
+        router.push(
+            WorkerId(0),
+            RequestId(2),
+            2,
+            80,
+            send,
+            KvRetention::PinnedUntilFetched,
+            Time::from_us(10),
+        );
+        router.tick(Time::from_us(20));
+        router.consumed(WorkerId(0), 0, RequestId(0));
+        assert!(router.tick(Time::from_us(20)).is_empty());
+        let events = router.tick(Time::from_us(30));
+        assert!(matches!(
+            events.as_slice(),
+            [KvStoreEvent::PushComplete {
+                req: RequestId(1),
+                store: WorkerId(1),
+                tokens: 90,
+                ..
+            }]
+        ));
+        assert!(router.pushes.is_empty());
+        router.cancel(0, RequestId(1));
+        router.tick(Time::from_us(30));
+        assert_eq!(router.workers[1].available_pinned_tokens(), 100);
+    }
+
+    #[test]
+    fn cancel_inflight_push_releases_capacity_and_suppresses_late_ack() {
+        let cluster = test_cluster();
+        let gpu = cluster.borrow_mut().allocate(0, 0, 1, "test", "main");
+        let send = cluster.borrow_mut().register_comm_group(gpu, 1, "main", 0);
+        let mut router = KvStoreRouter::new(
+            &KvStorePoolSpec {
+                worker: Default::default(),
+                replicas: 1,
+                dram_gb: 0.0000001,
+                bandwidth_gbps: 1.0,
+                latency_us: 0.0,
+                placement: KvStorePlacement::LeastLoaded,
+                policy: PrefixCachePolicy::Lru,
+            },
+            1,
+            &cluster,
+        );
+        router.push(
+            WorkerId(0),
+            RequestId(0),
+            7,
+            100,
+            send,
+            KvRetention::PinnedUntilFetched,
+            Time::ZERO,
+        );
+        assert_eq!(router.workers[0].available_pinned_tokens(), 0);
+        router.cancel(7, RequestId(0));
+        assert!(router.tick(Time::ZERO).is_empty());
+        assert_eq!(router.workers[0].available_pinned_tokens(), 100);
+        assert!(router.tick(Time::from_ms(1.0)).is_empty());
+        assert!(!router.directory.contains_key(&7));
+    }
+
+    #[test]
     fn directory_miss_never_dispatches_to_store() {
         let mut router = router();
         router.lookup(WorkerId(3), RequestId(1), 42, 100);
@@ -263,16 +474,28 @@ mod tests {
     #[test]
     fn stale_eviction_cannot_remove_newer_store_copy() {
         let mut router = router();
-        router.directory.insert(7, (WorkerId(1), 50));
-        router.process_events(vec![KvStoreEvent::Evicted {
-            store: WorkerId(0),
-            session: 7,
-        }]);
+        router.directory.insert(
+            7,
+            KvLocation {
+                store: WorkerId(1),
+                tokens: 50,
+            },
+        );
+        router.process_events(
+            vec![KvStoreEvent::Evicted {
+                store: WorkerId(0),
+                session: 7,
+            }],
+            Time::ZERO,
+        );
         assert!(router.directory.contains_key(&7));
-        router.process_events(vec![KvStoreEvent::Evicted {
-            store: WorkerId(1),
-            session: 7,
-        }]);
+        router.process_events(
+            vec![KvStoreEvent::Evicted {
+                store: WorkerId(1),
+                session: 7,
+            }],
+            Time::ZERO,
+        );
         assert!(!router.directory.contains_key(&7));
     }
 

@@ -71,15 +71,22 @@ Each tick, in order:
 1. **Drain arrivals** due by `clock` → `flow.on_arrival(req)` (the flow inserts
    facts into the shared `RequestStore`).
 2. **`flow.tick(clock)`** → `Vec<OrchAction>`; each `Complete { req }` writes that
-   request's terminal `request_slo` parquet row.
+   request's terminal `request_slo` parquet row. `flow.check_health()` propagates
+   protocol failures as ordinary simulation errors.
 3. **Periodic `request_state` snapshot** (every `snapshot_dt`) — dense over the
    *admitted* set, so per-segment workload is a plain diff of consecutive
    snapshots. Plus a heartbeat log line.
-4. **Termination check** (all O(1)): `DrainComplete` (trace exhausted + zero
-   in-flight), `DurationReached` (`clock ≥ duration`, unless `run_to_end`), or
+4. **Termination check**: `DrainComplete` (trace exhausted + zero
+   in-flight + no background protocol work), `DurationReached` (`clock ≥ duration`, unless `run_to_end`), or
    `Stuck` (a watchdog: trace drained but neither completions nor the
    admitted-id watermark advanced for `stuck_threshold`).
 5. **Advance** `clock += tick_dt`.
+
+Remote shared writes do not delay frontend completion. Once foreground work is
+finished, its clock is frozen for summary/finalization while the flow drains
+background operations (bounded by `stuck_threshold`). Network/store logs may
+extend beyond that foreground horizon. A foreground duration cutoff retains
+the existing partial-run behavior.
 
 In-flight is tracked from arrival/completion **counters**, never by scanning the
 store each tick (that scan was ~90% of runtime on large backlogs). Periodic steps

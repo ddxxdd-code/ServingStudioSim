@@ -46,6 +46,7 @@ pub trait IterAdmission<K: KvStore> {
 
 /// The remote shell owns transfer submission and feeds landed reads to admission.
 pub(crate) trait RemoteKvAdmission<K: KvStore>: IterAdmission<K> {
+    fn drain_reuse(&mut self) -> Vec<crate::log::rows::KvStoreEventEntry>;
     fn drain_lookups(&mut self, context: &WorkerContext, events: &mut Vec<Self::Event>);
     fn take_read(&mut self) -> Option<(RequestId, crate::worker::types::RemoteReadPlan)>;
     fn read_landed(&mut self, kv: &mut K, req: RequestId, now: Time);

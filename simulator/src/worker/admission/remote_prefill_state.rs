@@ -30,6 +30,7 @@ pub(super) struct RemotePrefillState<P: PendingOrderPolicy> {
     pub(super) lookups: Vec<(RequestId, u32, u32)>,
     reads: VecDeque<(RequestId, RemoteReadPlan)>,
     recv_gid: u16,
+    pub(super) reuse: Vec<crate::log::rows::KvStoreEventEntry>,
 }
 
 impl<P: PendingOrderPolicy> RemotePrefillState<P> {
@@ -54,6 +55,7 @@ impl<P: PendingOrderPolicy> RemotePrefillState<P> {
             lookups: Vec::new(),
             reads: VecDeque::new(),
             recv_gid,
+            reuse: Vec::new(),
         }
     }
     pub(super) fn enqueue(
@@ -110,9 +112,12 @@ impl<P: PendingOrderPolicy> RemotePrefillState<P> {
         self.reads.pop_front()
     }
     pub(super) fn read_landed(&mut self, kv: &mut impl RemotePrefixKv, req: RequestId, now: Time) {
-        let Some(selected) = self.selected.get(&req) else {
+        let Some(selected) = self.selected.get_mut(&req) else {
             return;
         };
+        if let Some(best) = kv.retained_prefix_partition(selected.candidate.session_input) {
+            selected.partition = best;
+        }
         kv.install_remote_prefix(
             req,
             selected.partition,
@@ -223,6 +228,18 @@ impl<P: PendingOrderPolicy> RemotePrefillState<P> {
             } else {
                 self.policy.pop(&mut self.policy_context);
             }
+            let hit = resolved.resident_prefix_tokens();
+            let remote = kv.remote_hit_tokens(c.request_id, partition, c.session_input, hit);
+            self.reuse.push(crate::log::rows::KvStoreEventEntry {
+                time_ms: now.as_ms(),
+                request_id: c.request_id.0,
+                session_id: c.session_input.session_id().unwrap_or_default(),
+                operation: "prefix-reuse",
+                reason: "admission",
+                local_hit_tokens: Some(u64::from(hit - remote)),
+                remote_hit_tokens: Some(u64::from(remote)),
+                ..Default::default()
+            });
             kv.reserve_prefill_context(c.request_id, partition, resolved, footprint, now);
             admitted += 1;
             used[partition as usize] = used[partition as usize]

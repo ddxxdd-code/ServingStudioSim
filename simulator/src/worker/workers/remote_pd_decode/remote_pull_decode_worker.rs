@@ -128,10 +128,7 @@ impl<K: RemotePrefixKv, E: IterModelExecution<K>> IterWorker for RemotePullDecod
             } => self
                 .core
                 .on_msg_handoff(req, send_gid, tokens, prefill_worker),
-            Msg::KvPushComplete { req, at, .. } => self.core.kv_store.complete_handoff(req, at),
-            Msg::KvPushRejected { req, reason } => {
-                panic!("decode write-back rejected for {req:?}: {reason:?}")
-            }
+            Msg::KvPushComplete { req, at, .. } => self.core.kv_store.complete_push(req, at),
             Msg::Cancel { req } => self.cancellations.push(req),
         }
     }
@@ -156,8 +153,8 @@ impl<K: RemotePrefixKv, E: IterModelExecution<K>> IterWorker for RemotePullDecod
                     });
             }
             self.core.cancel_pull(req);
+            self.core.kv_store.cancel_remote(req, now);
             self.core.release_request(req, current_tokens);
-            self.core.kv_store.complete_handoff(req, now);
         }
         let mut landed = Vec::new();
         self.core.advance_pulls(now, &mut landed);
@@ -191,7 +188,10 @@ impl<K: RemotePrefixKv, E: IterModelExecution<K>> IterWorker for RemotePullDecod
                     .definition
                     .session;
                 if let Some(session_id) = session.session_id() {
-                    let tokens = self.core.kv_store.hold_for_push(req, partition, session);
+                    let tokens = self
+                        .core
+                        .kv_store
+                        .hold_for_push(req, partition, session, now);
                     events.push(Event::KvPushOffer {
                         worker: self.id(),
                         req,

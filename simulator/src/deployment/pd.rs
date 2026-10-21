@@ -242,6 +242,16 @@ fn worker_config(
     log_stage_transitions: bool,
     kv_log_stride: u32,
 ) -> anyhow::Result<WorkerConfig> {
+    anyhow::ensure!(
+        !matches!(
+            worker,
+            IterWorkerSel::RemoteCachePdPrefill {
+                prefix_cache_mode: crate::worker::PrefixCacheMode::Disabled,
+                ..
+            }
+        ),
+        "remote shared-prefix lookup requires an enabled local prefix cache"
+    );
     let (attn_gpu_memory_gb, gpu_time_multiplier, prefix_cache) = match worker {
         IterWorkerSel::RemoteCachePdPrefill {
             attn_gpu_memory_gb,
@@ -456,5 +466,27 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+    }
+}
+
+#[cfg(test)]
+mod remote_config_tests {
+    use super::*;
+    #[test]
+    fn remote_prefill_rejects_disabled_local_prefix_cache() {
+        let worker = IterWorkerSel::RemoteCachePdPrefill {
+            attn_gpu_memory_gb: 80.0,
+            gpu_time_multiplier: 1.0,
+            prefix_cache_mode: crate::worker::PrefixCacheMode::Disabled,
+            prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
+            prefix_cache_max_gpu_memory_gb: None,
+            max_inflight_remote_reads: 16,
+            max_batch_tokens: None,
+            pending_order: crate::worker::PendingOrderKind::SessionStart,
+        };
+        let error = worker_config(&worker, Path::new("unused"), false, false, 1)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("enabled local prefix cache"));
     }
 }

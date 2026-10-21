@@ -66,7 +66,11 @@ impl IterWorker for KvStoreWorker {
         self.id
     }
     fn enqueue(&mut self, msg: KvStoreMsg) {
-        self.inbox.push_back(msg);
+        if matches!(msg, KvStoreMsg::Cancel { .. }) {
+            self.inbox.push_front(msg);
+        } else {
+            self.inbox.push_back(msg);
+        }
     }
     fn status(&self) -> WorkerStatus {
         WorkerStatus {
@@ -75,6 +79,12 @@ impl IterWorker for KvStoreWorker {
         }
     }
     fn tick(&mut self, now: Time, events: &mut Vec<KvStoreEvent>) -> Option<Time> {
+        // Cancellation wins over an arrival at this tick. Other messages must
+        // observe already-due landings, especially lookups of a growing entry.
+        while let Some(KvStoreMsg::Cancel { session, req }) = self.inbox.front().copied() {
+            self.inbox.pop_front();
+            self.on_msg_cancel(session, req, now);
+        }
         self.land_pushes(now, events);
         while let Some(msg) = self.inbox.pop_front() {
             match msg {
@@ -100,6 +110,7 @@ impl IterWorker for KvStoreWorker {
                     retention,
                 }),
                 KvStoreMsg::Consumed { session, req } => self.on_msg_consumed(session, req, now),
+                KvStoreMsg::Cancel { session, req } => self.on_msg_cancel(session, req, now),
             }
         }
         let waiting = self.waiting.len();
@@ -125,6 +136,29 @@ impl IterWorker for KvStoreWorker {
 }
 
 impl KvStoreWorker {
+    fn on_msg_cancel(&mut self, session: u32, req: RequestId, now: Time) {
+        self.inbox.retain(|msg| match msg {
+            KvStoreMsg::Lookup { req: r, .. }
+            | KvStoreMsg::Push { req: r, .. }
+            | KvStoreMsg::Consumed { req: r, .. }
+            | KvStoreMsg::Cancel { req: r, .. } => *r != req,
+        });
+        self.waiting.retain(|p| p.req != req);
+        self.receiving.retain(|(_, p)| p.req != req);
+        self.on_msg_consumed(session, req, now);
+        self.store.cancel(session, req);
+        self.record(KvStoreEventEntry {
+            time_ms: now.as_ms(),
+            request_id: req.0,
+            session_id: session,
+            operation: "cancel",
+            reason: "request",
+            cache_used_before: self.store.cached(),
+            cache_used_after: self.store.cached(),
+            ..Default::default()
+        });
+    }
+
     fn on_msg_lookup(
         &mut self,
         origin: WorkerId,
@@ -159,7 +193,9 @@ impl KvStoreWorker {
         self.waiting.push_back(push);
     }
     fn on_msg_consumed(&mut self, session: u32, req: RequestId, now: Time) {
-        self.store.consumed(session, req);
+        if !self.store.consumed(session, req) {
+            return;
+        }
         self.record(KvStoreEventEntry {
             time_ms: now.as_ms(),
             request_id: req.0,
@@ -176,6 +212,15 @@ impl KvStoreWorker {
             self.store
                 .reserve(push.session, push.req, push.tokens, push.retention)
         else {
+            self.record(KvStoreEventEntry {
+                time_ms: now.as_ms(),
+                request_id: push.req.0,
+                session_id: push.session,
+                operation: "push-rejected",
+                reason: "capacity-exceeded",
+                requested_tokens: push.tokens,
+                ..Default::default()
+            });
             events.push(KvStoreEvent::PushRejected {
                 store: self.id,
                 origin: push.origin,
@@ -185,6 +230,17 @@ impl KvStoreWorker {
             return;
         };
         self.emit_mutations(mutations, push.req, now, events);
+        self.record(KvStoreEventEntry {
+            time_ms: now.as_ms(),
+            request_id: push.req.0,
+            session_id: push.session,
+            operation: "reserve",
+            reason: "incoming-push",
+            requested_tokens: accepted,
+            cache_used_before: self.store.cached(),
+            cache_used_after: self.store.cached(),
+            ..Default::default()
+        });
         push.tokens = accepted;
         let end = if accepted == 0 {
             now
@@ -197,7 +253,7 @@ impl KvStoreWorker {
                     .checked_mul(self.bytes_per_token)
                     .expect("KV transfer byte overflow"),
                 "kv_store_push",
-                "",
+                &push.req.0.to_string(),
             )
         };
         // recv_group serializes nonempty transfers. An empty write still waits
@@ -272,6 +328,8 @@ impl KvStoreWorker {
     }
     fn record(&self, mut row: KvStoreEventEntry) {
         row.store_worker = self.id.0;
+        row.reserved_tokens = Some(self.store.reserved());
+        row.pinned_tokens = Some(self.store.pinned());
         if let Some(logger) = &self.logger {
             logger.borrow_mut().record(row);
         }

@@ -229,11 +229,21 @@ pub trait RemotePrefixKv: PrefixKv + HandoffKv {
         tokens: u64,
         now: Time,
     );
-    /// Move resident/prefilled bytes to held ownership, without double counting.
+    /// Hold the transfer source and retain a separately charged, evictable local copy.
     fn hold_for_push(
         &mut self,
         request: RequestId,
         partition: PartitionId,
         session: SessionInput,
+        now: Time,
     ) -> u64;
+    fn remote_hit_tokens(
+        &self,
+        request: RequestId,
+        partition: PartitionId,
+        session: SessionInput,
+        hit: u32,
+    ) -> u32;
+    fn complete_push(&mut self, request: RequestId, now: Time);
+    fn cancel_remote(&mut self, request: RequestId, now: Time);
 }

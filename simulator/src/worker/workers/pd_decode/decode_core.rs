@@ -263,7 +263,11 @@ where
                 transfer.recv_gid,
                 bytes,
                 kind,
-                "",
+                &if kind == "kv_store_read" {
+                    request.0.to_string()
+                } else {
+                    String::new()
+                },
             );
             self.pull_pipeline.in_flight = Some(InFlightPull {
                 request,

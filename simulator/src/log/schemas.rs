@@ -32,6 +32,16 @@ pub fn kv_store_event_schema() -> Arc<Schema> {
         Field::new("placement_policy", DataType::Utf8, true),
         Field::new("send_backlog_ms", DataType::Float64, true),
         Field::new("occupancy_ratio", DataType::Float64, true),
+        Field::new("reserved_tokens", DataType::UInt64, true),
+        Field::new("pinned_tokens", DataType::UInt64, true),
+        Field::new("bytes", DataType::UInt64, true),
+        Field::new("queue_ms", DataType::Float64, true),
+        Field::new("transfer_end_ms", DataType::Float64, true),
+        Field::new("source_pool", DataType::Utf8, true),
+        Field::new("destination_pool", DataType::Utf8, true),
+        Field::new("local_hit_tokens", DataType::UInt64, true),
+        Field::new("remote_hit_tokens", DataType::UInt64, true),
+        Field::new("background_writes", DataType::UInt64, true),
     ]))
 }
 

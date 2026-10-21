@@ -26,6 +26,15 @@ use crate::worker::SharedGpuCluster;
 pub trait Flow<Definition: RequestDefinition = TextGenerationDefinition> {
     fn on_arrival(&mut self, req: Request<Definition>);
     fn tick(&mut self, now: Time) -> Vec<OrchAction>;
+    /// Background protocol work must drain without postponing frontend completion.
+    fn background_pending(&self) -> usize {
+        0
+    }
+    fn check_health(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Cancel remote resource ownership; frontend cancellation is caller-owned.
+    fn cancel(&mut self, _req: crate::common::RequestId, _now: Time) {}
     /// The shared GPU cluster — both the run's GPU registry (the `gpus` field is
     /// what L7 serializes into `raw/run_meta.json`) and the inter-worker
     /// transfer timing oracle. L7 borrows it to read either side.

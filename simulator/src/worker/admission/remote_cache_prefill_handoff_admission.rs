@@ -53,9 +53,10 @@ impl<P: PendingOrderPolicy, K: RemotePrefixKv> IterAdmission<K>
             } => self
                 .state
                 .lookup_result(req, resident_tokens, store_send_gid, store_worker),
-            Msg::KvPushComplete { req, at, .. } => kv.complete_handoff(req, at),
-            Msg::KvPushRejected { req, reason } => {
-                panic!("PD store relay rejected for {req:?}: {reason:?}")
+            Msg::KvPushComplete { req, at, .. } => kv.complete_push(req, at),
+            Msg::Cancel { req, at } => {
+                self.state.cancel(req);
+                kv.cancel_remote(req, at);
             }
         }
     }
@@ -93,7 +94,7 @@ impl<P: PendingOrderPolicy, K: RemotePrefixKv> IterAdmission<K>
             }
             for (req, session, complete) in transitions {
                 if let Some(session_id) = session.session_id() {
-                    let tokens = kv.hold_for_push(req, partition, session);
+                    let tokens = kv.hold_for_push(req, partition, session, now);
                     events.push(Event::KvPushOffer {
                         worker: context.id,
                         req,
@@ -139,6 +140,9 @@ impl<P: PendingOrderPolicy, K: RemotePrefixKv> IterAdmission<K>
 impl<P: PendingOrderPolicy, K: RemotePrefixKv> RemoteKvAdmission<K>
     for RemoteCachePrefillHandoffAdmission<P>
 {
+    fn drain_reuse(&mut self) -> Vec<crate::log::rows::KvStoreEventEntry> {
+        std::mem::take(&mut self.state.reuse)
+    }
     fn drain_lookups(&mut self, context: &WorkerContext, events: &mut Vec<Event>) {
         for (req, session, requested_tokens) in self.state.lookups.drain(..) {
             events.push(Event::KvLookup {

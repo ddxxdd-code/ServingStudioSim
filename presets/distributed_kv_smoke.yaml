@@ -9,6 +9,7 @@ workload:
   session_dependency: chained
   run_to_end: true
   request_rate: 1.0
+  tick_dt_us: 1  # Resolve the 10 us network latency.
 
 io:
   log_dir: logs/distributed_kv_smoke/stores{stores}_{placement}

@@ -50,7 +50,14 @@ pub enum KvStoreMsg {
         retention: KvRetention,
     },
     /// Decode → store, including cancellation. Request identity guards stale acks.
-    Consumed { session: u32, req: RequestId },
+    Consumed {
+        session: u32,
+        req: RequestId,
+    },
+    Cancel {
+        session: u32,
+        req: RequestId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,10 +108,9 @@ pub enum RemoteCacheWorkerMsg {
         tokens: u64,
         at: Time,
     },
-    /// Store/router → producer; explicitly fail a rejected relay.
-    KvPushRejected {
+    Cancel {
         req: RequestId,
-        reason: KvPushRejectReason,
+        at: Time,
     },
 }
 
@@ -147,10 +153,9 @@ pub enum RemotePdPrefillMsg {
         tokens: u64,
         at: Time,
     },
-    /// Store/router → prefill; fail explicitly if the relay cannot be retained.
-    KvPushRejected {
+    Cancel {
         req: RequestId,
-        reason: KvPushRejectReason,
+        at: Time,
     },
 }
 
@@ -206,11 +211,6 @@ pub enum RemotePdDecodeMsg {
         req: RequestId,
         tokens: u64,
         at: Time,
-    },
-    /// Store/router → decode; explicit capacity failure.
-    KvPushRejected {
-        req: RequestId,
-        reason: KvPushRejectReason,
     },
     /// L6 → decode; release a relay even if it has not been fetched.
     Cancel { req: RequestId },

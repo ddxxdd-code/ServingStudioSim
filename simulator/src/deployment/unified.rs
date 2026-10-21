@@ -150,6 +150,10 @@ impl Deployment for UnifiedDeployment {
             max_inflight_remote_reads > 0,
             "max_inflight_remote_reads must be positive"
         );
+        anyhow::ensure!(
+            !remote || prefix_cache_mode != crate::worker::PrefixCacheMode::Disabled,
+            "remote shared-prefix lookup requires an enabled local prefix cache"
+        );
         let prefix_cache = resolve_prefix_cache_config(
             "unified",
             prefix_cache_mode,
