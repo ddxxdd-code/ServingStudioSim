@@ -10,14 +10,35 @@ jobs:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=bfd
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - run: git submodule update --init alignment/load_generator/req-frontend
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           python-version: '3.12'
       - name: Install CPU-only validation dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
           uv venv
-          uv pip install pytest pyarrow pyyaml asteval
+          uv pip install pytest pyarrow pyyaml asteval 'coverage>=7.10'
           cargo install just --locked
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked
       - name: Protocol, always-miss equivalence, and audit negative tests
         run: just test-distributed-kv
+      - uses: actions/checkout@v7
+        with:
+          repository: kvcache-ai/Mooncake
+          ref: d236a313f888bd06f62a0d95dd06cb6b19b1b52a
+          path: target/kv-references/mooncake
+      - uses: actions/checkout@v7
+        with:
+          repository: ovg-project/kvcached
+          ref: a7dfbfe27b0219db6e9e27f5b1b724fdccf8dc6d
+          path: target/kv-references/kvcached
+      - name: Added Rust and Python code each exceed 80 percent coverage
+        env:
+          MOONCAKE_CHECKOUT: ${{ github.workspace }}/target/kv-references/mooncake
+          KVCACHED_CHECKOUT: ${{ github.workspace }}/target/kv-references/kvcached
+        run: just test-distributed-kv-coverage

@@ -479,11 +479,89 @@ impl PrefixCache {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pinned_entry_resists_replacement_and_all_pinned_shrink_then_unpin_reclaims() {
+        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Lru, 1, 0);
+        cache.insert(7, 100, 100, None);
+        cache.set_pinned(7, true);
+        assert_eq!(cache.pinned_charge(), 100);
+        let replacement = cache.insert(7, 20, 100, None);
+        assert_eq!(replacement.retained_tokens, 0);
+        assert_eq!(replacement.mutations.len(), 0);
+        assert_eq!(cache.copy(7, 100), 100);
+        assert_eq!(cache.shrink_to(0).len(), 0);
+        assert_eq!(cache.used_charge(), 100);
+        cache.set_pinned(7, false);
+        let evictions = cache.shrink_to(0);
+        assert_eq!(evictions.len(), 1);
+        assert_eq!(
+            (
+                evictions[0].session_id,
+                evictions[0].entry_tokens_before,
+                evictions[0].cache_used_after
+            ),
+            (7, 100, 0)
+        );
+        assert_eq!(cache.copy(7, 100), 0);
+    }
+
+    #[test]
+    fn lfu_copy_frequency_beats_age_and_misses_do_not_refresh() {
+        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Lfu, 1, 0);
+        cache.insert(7, 40, 100, None);
+        cache.insert(8, 40, 100, None);
+        assert_eq!(cache.copy(7, 20), 20);
+        assert_eq!(cache.copy(7, 100), 40);
+        assert_eq!(cache.copy(8, 0), 0);
+        assert_eq!(cache.copy(99, 40), 0);
+        let result = cache.insert(9, 40, 100, None);
+        assert_eq!(result.mutations[0].session_id, 8);
+        assert_eq!(cache.peek(7, 100), 40);
+        assert_eq!(cache.peek(8, 100), 0);
+        assert_eq!(cache.used_charge(), 80);
+    }
+
+    fn external_oracles() -> serde_json::Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/kv_storage_external_oracles.json"
+        )))
+        .expect("external KV oracle fixture must be valid JSON")
+    }
+
+    fn run_mooncake_eviction_trace(policy: PrefixCachePolicy) -> Vec<String> {
+        let mut cache = PrefixCache::new(10, policy, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        cache.insert(1, 1, 10, None);
+        cache.insert(2, 1, 10, None);
+        let first = cache.victim().expect("first victim");
+        cache.remove(first);
+        cache.insert(3, 1, 10, None);
+        cache.insert(4, 1, 10, None);
+        assert_eq!(cache.copy(2, 1), 1, "copy must preserve the entry");
+        assert_eq!(cache.copy(3, 1), 1, "copy must preserve the entry");
+        let second = cache.victim().expect("second victim");
+        vec![format!("key{first}"), format!("key{second}")]
+    }
+
     /// Full-attention settings: every prefix length is resumable and a retained
     /// entry costs exactly its tokens. The quantized/charged behaviour is
     /// covered by the hybrid store's own tests.
     const TOKEN_QUANTUM: u32 = 1;
     const NO_EXTRA_CHARGE: u64 = 0;
+
+    #[test]
+    fn lru_and_fifo_victims_exactly_match_the_pinned_mooncake_run() {
+        let fixture = external_oracles();
+        let observations = &fixture["mooncake"]["observations"];
+        assert_eq!(
+            serde_json::to_value(run_mooncake_eviction_trace(PrefixCachePolicy::Lru)).unwrap(),
+            observations["lru_evictions"]
+        );
+        assert_eq!(
+            serde_json::to_value(run_mooncake_eviction_trace(PrefixCachePolicy::Fifo)).unwrap(),
+            observations["fifo_evictions"]
+        );
+    }
 
     #[test]
     fn runtime_config_resolves_disabled_uncapped_and_bounded_token_limits() {

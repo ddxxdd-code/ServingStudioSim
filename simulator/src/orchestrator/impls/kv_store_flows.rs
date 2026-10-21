@@ -979,4 +979,93 @@ mod tests {
             assert_eq!(local.tick(now), remote.tick(now), "step {step}");
         }
     }
+
+    #[test]
+    fn rejected_relay_receipts_reach_disk_after_the_failed_flow_is_dropped() {
+        // run_sim flushes only request logs before returning a protocol error.
+        // Store receipts are written when main drops the flow and its logger.
+        use arrow_array::StringArray;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Rc::new(RefCell::new(RequestStore::new()));
+        let config = WorkerConfig {
+            attn_kv_bytes: 1000,
+            ..Default::default()
+        };
+        let pf = UnifiedWorkerFactory::new(
+            Arc::new(FakeModel::for_ms(1.0)),
+            requests.clone(),
+            config,
+            None,
+            "test".into(),
+            "prefill",
+            build_remote_cache_pd_prefill_worker::<FakeModel>,
+        );
+        let df = UnifiedWorkerFactory::new(
+            Arc::new(FakeModel::for_ms(1.0)),
+            requests,
+            config,
+            None,
+            "test".into(),
+            "decode",
+            build_remote_cache_pd_decode_worker::<FakeModel>,
+        );
+        // Each of the two stores holds one token, so a 20-token relay fits nowhere.
+        let mut tiny = spec();
+        tiny.dram_gb = 0.000000001;
+        let mut flow = KvStorePdFlow::new(
+            &pool(0, 1),
+            &pf,
+            &pool(1, 1),
+            &df,
+            &tiny,
+            1,
+            CostSource::analytic(1.0),
+        );
+        flow.attach_logger(directory.path());
+        flow.on_arrival(request(0, 0, 3, Time::ZERO));
+        let mut failure = None;
+        for step in 0..100 {
+            flow.tick(Time::from_us(step * 100));
+            if let Err(error) = flow.check_health() {
+                failure = Some(error.to_string());
+                break;
+            }
+        }
+        assert!(failure.unwrap().contains("CapacityExceeded"));
+        drop(flow);
+        let file =
+            std::fs::File::open(directory.path().join("raw/kv_store_event.parquet")).unwrap();
+        let mut receipts = Vec::new();
+        for batch in ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+        {
+            let batch = batch.unwrap();
+            let text = |name| {
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .clone()
+            };
+            let (operation, reason) = (text("operation"), text("reason"));
+            for row in 0..batch.num_rows() {
+                receipts.push(format!("{}/{}", operation.value(row), reason.value(row)));
+            }
+        }
+        assert_eq!(
+            receipts,
+            [
+                "prefix-reuse/admission",
+                "placement/push",
+                "push-rejected/capacity-exceeded",
+                "retry/push",
+                "push-rejected/capacity-exceeded"
+            ]
+        );
+    }
 }

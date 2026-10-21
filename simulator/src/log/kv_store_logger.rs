@@ -72,3 +72,64 @@ impl Drop for KvStoreLogger {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Float64Array, UInt64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    #[test]
+    fn batch_flush_and_drop_preserve_every_receipt_in_run_wide_sequence() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("raw")).unwrap();
+        let logger = KvStoreLogger::open(directory.path());
+        // Cross the 1024-row flush threshold, then leave a tail for Drop.
+        for i in 0..1030_u64 {
+            logger.borrow_mut().record(KvStoreEventEntry {
+                time_ms: i as f64 * 0.25,
+                operation: "reserve",
+                reason: "incoming-push",
+                cache_used_before: i,
+                cache_used_after: i,
+                requested_tokens: 80,
+                reserved_tokens: Some(80),
+                ..Default::default()
+            });
+        }
+        drop(logger);
+        let file =
+            std::fs::File::open(directory.path().join("raw/kv_store_event.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut next = 0_u64;
+        for batch in reader {
+            let batch = batch.unwrap();
+            let integers = |name| {
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+            };
+            let times = batch
+                .column_by_name("time_ms")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                assert_eq!(integers("sequence").value(row), next);
+                assert_eq!(times.value(row), next as f64 * 0.25);
+                assert_eq!(integers("cache_used_before").value(row), next);
+                assert_eq!(integers("cache_used_after").value(row), next);
+                assert_eq!(integers("reserved_tokens").value(row), 80);
+                next += 1;
+            }
+        }
+        assert_eq!(next, 1030);
+    }
+}

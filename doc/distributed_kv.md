@@ -185,6 +185,18 @@ tests cover optional-block omission/null, defaults, sweeps, and invalid blocks.
 Run `just test-all` for the repository gate; its dependency sync and GPU tier
 require the documented CUDA environment.
 
+Pinned upstream storage-oracle tests additionally require exact equality for
+Mooncake LRU/FIFO victim order and kvcached all-or-nothing allocation/release
+accounting. See [KV storage reference parity](kv_storage_reference_parity.md)
+for commits, regeneration instructions, and the explicit boundary of that
+claim. It is not a claim of whole-system Mooncake or kvcached equivalence.
+
+Concrete behavioral cases and added-line coverage are documented in
+[distributed KV test coverage](distributed_kv_test_coverage.md). The reproducible
+`just test-distributed-kv-coverage` command requires at least 80% added executable
+line coverage for Rust and Python separately and for every entirely new source
+file, with embedded Rust test code excluded.
+
 ## Fair comparison and resolution
 
 `presets/distributed_kv_pd_validation.yaml` defines 16 cases.

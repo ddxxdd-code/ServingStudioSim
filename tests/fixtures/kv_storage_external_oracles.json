@@ -1,0 +1,73 @@
+{
+  "kvcached": {
+    "capacity": 8,
+    "commit": "a7dfbfe27b0219db6e9e27f5b1b724fdccf8dc6d",
+    "observations": [
+      {
+        "accepted": 5,
+        "free": 3,
+        "operation": "allocate",
+        "requested": 5,
+        "success": true,
+        "used": 5
+      },
+      {
+        "accepted": 0,
+        "free": 3,
+        "operation": "allocate",
+        "requested": 4,
+        "success": false,
+        "used": 5
+      },
+      {
+        "accepted": 5,
+        "free": 8,
+        "operation": "release",
+        "requested": 5,
+        "success": true,
+        "used": 0
+      },
+      {
+        "accepted": 8,
+        "free": 0,
+        "operation": "allocate",
+        "requested": 8,
+        "success": true,
+        "used": 8
+      }
+    ],
+    "repository": "https://github.com/ovg-project/kvcached",
+    "source": "kvcached/kv_cache_manager.py",
+    "source_sha256": "6212b484388b3d9dad842d72131457c737524149fb230ca4db8d1236e5da9285",
+    "trace": "fixed mapped page: allocate 5, reject 4, release 5, allocate 8"
+  },
+  "mooncake": {
+    "commit": "d236a313f888bd06f62a0d95dd06cb6b19b1b52a",
+    "observations": {
+      "fifo_evictions": [
+        "key1",
+        "key2"
+      ],
+      "lru_evictions": [
+        "key1",
+        "key4"
+      ]
+    },
+    "repository": "https://github.com/kvcache-ai/Mooncake",
+    "source": "mooncake-store/include/eviction_strategy.h",
+    "source_sha256": "3c1d939659a97d901030c591cac21952a28294eb4dd250b9cfd266513fdf6a4b",
+    "trace": "upstream EvictionStrategyTest.EvictKey/FIFOEvictKey sequence"
+  },
+  "schema_version": 1,
+  "scope": {
+    "exact": [
+      "Mooncake LRU/FIFO victim order",
+      "kvcached all-or-nothing allocation and release accounting"
+    ],
+    "excluded": [
+      "object bytes, sharding, replication, leases, and distributed consistency",
+      "CUDA virtual-address mapping, page geometry, and engine integration",
+      "ServingStudioSim timing, routing, session-directory, and relay protocol events"
+    ]
+  }
+}

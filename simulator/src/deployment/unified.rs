@@ -556,6 +556,78 @@ mod tests {
     use crate::common::RequestId;
     use crate::worker::{HpUnifiedWorker, WorkerEventCommon};
 
+    #[test]
+    fn assembled_remote_unified_reuses_twenty_tokens_on_a_different_replica() {
+        use crate::common::{RequestStore, SessionInput, Time};
+        use crate::test_helpers::{text_request, FakeModel};
+        use std::{cell::RefCell, rc::Rc};
+        let requests = Rc::new(RefCell::new(RequestStore::new()));
+        requests.borrow_mut().reserve_slots(2);
+        let directory = tempfile::tempdir().unwrap();
+        let spec = KvStorePoolSpec {
+            worker: Default::default(),
+            replicas: 2,
+            dram_gb: 0.000001,
+            bandwidth_gbps: 1.0,
+            latency_us: 1.0,
+            placement: crate::orchestrator::config::KvStorePlacement::RoundRobin,
+            backlog_weight_per_ms: 1.0,
+            policy: crate::worker::PrefixCachePolicy::Lru,
+        };
+        let mut flow = assemble_flow(
+            Some(&spec),
+            Arc::new(FakeModel::for_ms(1.0)),
+            requests.clone(),
+            WorkerConfig::default(),
+            Some(directory.path().to_path_buf()),
+            "test".into(),
+            SimpleDpConfig {
+                dp_pool: SimpleDpPoolConfig {
+                    pool: PoolId(0),
+                    num_workers: 2,
+                    placement: DpPlacementPolicy::RoundRobin,
+                },
+            },
+            build_barebone_worker::<FakeModel>,
+        )
+        .unwrap();
+        assert_eq!(flow.cluster().borrow().num_gpus(), 2);
+        let mut clock = 0;
+        for id in 0..2 {
+            let mut request = text_request(
+                RequestId(id),
+                if id == 0 { 20 } else { 10 },
+                2,
+                Time::from_us(clock * 100),
+            );
+            request.definition.session = SessionInput::Session {
+                session_id: 7,
+                session_start_time: Time::ZERO,
+                declared_prefix_tokens: if id == 0 { 0 } else { 20 },
+            };
+            flow.on_arrival(request);
+            let mut completions = 0;
+            for _ in 0..100 {
+                completions += flow.tick(Time::from_us(clock * 100)).len();
+                clock += 1;
+                if completions == 1 && flow.background_pending() == 0 {
+                    break;
+                }
+            }
+            flow.check_health().unwrap();
+            assert_eq!(completions, 1);
+            assert_eq!(flow.background_pending(), 0);
+        }
+        let records = requests.borrow();
+        assert_eq!(
+            records[RequestId(1)].telemetry.prefix_cache_hit_tokens,
+            Some(20)
+        );
+        assert_eq!(records[RequestId(1)].progress.prefill_tokens_processed, 10);
+        assert_eq!(records[RequestId(1)].progress.output_tokens_emitted, 2);
+        assert!(records[RequestId(1)].lifecycle.completed);
+    }
+
     fn hp_worker() -> IterWorkerSel {
         IterWorkerSel::HpUnified {
             attn_gpu_memory_gb: 80.0,
@@ -698,5 +770,54 @@ pools:
         assert_eq!((*ep_size, *nvl_num_gpu), (8, 8));
         assert_eq!(*mtp_mode, crate::arch::Glm52MtpMode::Off);
         ensure_hp_unified(&group.worker).expect("GLM hp_unified pairing is accepted");
+    }
+
+    #[test]
+    fn kv_store_and_remote_selector_require_each_other_and_an_enabled_cache() {
+        use crate::common::RequestStore;
+        use crate::deployment::config::RunConfig;
+        use std::{cell::RefCell, rc::Rc};
+        // Guards run before any model file is read, so no model JSON is needed.
+        let build_error = |worker: &str, kv_store: bool| {
+            let yaml = format!(
+                r#"
+deployment: unified
+{store}workload: {{ trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1.0, run_to_end: true, request_rate: 1.0 }}
+io: {{ log_dir: "unused", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }}
+pools:
+  main:
+    placement: least-queued
+    groups:
+      - {{ gpu: "H200", replicas: 1, arch: {{ type: llama3_dense_tp, model_config: "m.json", fp8: false, tp_size: 1 }}, worker: {worker} }}
+"#,
+                store = if kv_store {
+                    "kv_store: { replicas: 1, dram_gb: 1.0, bandwidth_gbps: 1.0, latency_us: 1.0 }\n"
+                } else {
+                    ""
+                },
+            );
+            let RunConfig::Unified(cfg) = serde_yaml::from_str(&yaml).unwrap() else {
+                panic!("expected a unified config");
+            };
+            let requests = Rc::new(RefCell::new(RequestStore::new()));
+            match UnifiedDeployment::build(&cfg, &PerfApiBridge::new_uninit_for_test(), requests) {
+                Ok(_) => panic!("accepted {worker} with kv_store={kv_store}"),
+                Err(error) => error.to_string(),
+            }
+        };
+        let pairing = "kv_store requires worker remote_cache_unified";
+        assert!(
+            build_error("{ type: barebone, attn_gpu_memory_gb: 80.0 }", true).contains(pairing)
+        );
+        assert!(build_error(
+            "{ type: remote_cache_unified, attn_gpu_memory_gb: 80.0 }",
+            false
+        )
+        .contains(pairing));
+        assert!(build_error(
+            "{ type: remote_cache_unified, attn_gpu_memory_gb: 80.0, prefix_cache_mode: disabled }",
+            true
+        )
+        .contains("requires an enabled local prefix cache"));
     }
 }

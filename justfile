@@ -64,6 +64,25 @@ test-distributed-kv:
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib remote_cache
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib kv_store
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib worker::kv::full_attn
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib worker::kv::shared::prefix_cache
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib deployment::
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib pinned_mooncake
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib pinned_kvcached
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib log::kv_sampler
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib sim::run
-    uv run --no-sync python -m pytest tests/test_distributed_kv_validation.py -q
+    uv run --no-sync python -m pytest tests/test_distributed_kv_validation.py tests/test_kv_storage_external_oracles.py tests/test_kv_storage_trace.py tests/test_kv_coverage.py -q
+
+# Added executable lines versus the original KV base, Rust/Python independently.
+# Requires cargo-llvm-cov, llvm-tools-preview, coverage>=7.10 and pinned checkouts.
+test-distributed-kv-coverage base="48864532c291e5cd48d01efb515d63733496e420":
+    test -n "${MOONCAKE_CHECKOUT:-}" && test -n "${KVCACHED_CHECKOUT:-}"
+    mkdir -p target/kv-coverage-reports
+    uv run --no-sync cargo llvm-cov clean --workspace
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo llvm-cov -p simulator --lib --no-report
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo llvm-cov -p analyzer --no-report
+    uv run --no-sync cargo llvm-cov report -p simulator -p analyzer --lcov --output-path target/kv-coverage-reports/rust.lcov
+    COVERAGE_FILE=target/kv-coverage-reports/python.coverage uv run --no-sync coverage erase --rcfile tools/kv_coverage.rc
+    COVERAGE_FILE=target/kv-coverage-reports/python.coverage uv run --no-sync coverage run --rcfile tools/kv_coverage.rc -m pytest tests/test_l7_launcher.py tests/test_distributed_kv_validation.py tests/test_kv_storage_external_oracles.py tests/test_kv_storage_trace.py tests/test_kv_coverage.py -q
+    COVERAGE_FILE=target/kv-coverage-reports/python.coverage uv run --no-sync coverage combine --rcfile tools/kv_coverage.rc
+    COVERAGE_FILE=target/kv-coverage-reports/python.coverage uv run --no-sync coverage json --rcfile tools/kv_coverage.rc -o target/kv-coverage-reports/python.json
+    uv run --no-sync python tools/check_kv_coverage.py --base {{base}} --rust-lcov target/kv-coverage-reports/rust.lcov --python-json target/kv-coverage-reports/python.json --output target/kv-coverage-reports/added-lines.json --minimum 80

@@ -123,6 +123,189 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_order_landings_preserve_reserved_plus_resident_capacity() {
+        let mut store = SessionStore::new(100, PrefixCachePolicy::Lru);
+        store
+            .reserve(7, RequestId(1), 60, KvRetention::Shared)
+            .unwrap();
+        store
+            .reserve(8, RequestId(2), 40, KvRetention::Shared)
+            .unwrap();
+        assert_eq!(
+            (store.used(), store.reserved(), store.cached()),
+            (100, 100, 0)
+        );
+        assert_eq!(store.copy(7, 100), 0);
+        assert_eq!(store.copy(8, 100), 0);
+        assert_eq!(store.land(8, RequestId(2), KvRetention::Shared).0, 40);
+        assert_eq!(
+            (store.used(), store.reserved(), store.cached()),
+            (100, 60, 40)
+        );
+        assert_eq!(store.land(7, RequestId(1), KvRetention::Shared).0, 60);
+        assert_eq!(
+            (store.used(), store.reserved(), store.cached()),
+            (100, 0, 100)
+        );
+        assert_eq!(store.copy(7, 45), 45);
+        assert_eq!(store.copy(7, 100), 60);
+        assert_eq!(store.copy(8, 100), 40);
+    }
+
+    #[test]
+    fn oversized_pin_rejection_keeps_existing_shared_entries_and_receipts_unchanged() {
+        let mut store = SessionStore::new(100, PrefixCachePolicy::Lru);
+        store
+            .reserve(7, RequestId(1), 80, KvRetention::Shared)
+            .unwrap();
+        store.land(7, RequestId(1), KvRetention::Shared);
+        assert!(store
+            .reserve(8, RequestId(2), 101, KvRetention::PinnedUntilFetched)
+            .is_none());
+        assert_eq!((store.used(), store.reserved(), store.pinned()), (80, 0, 0));
+        assert!(!store.busy(8));
+        assert_eq!(store.copy(7, 100), 80);
+        let (accepted, evictions) = store
+            .reserve(8, RequestId(3), 101, KvRetention::Shared)
+            .unwrap();
+        assert_eq!(accepted, 100);
+        assert_eq!(evictions.len(), 1);
+        assert_eq!(
+            (
+                evictions[0].session_id,
+                evictions[0].entry_tokens_before,
+                evictions[0].cache_used_before,
+                evictions[0].cache_used_after
+            ),
+            (7, 80, 80, 0)
+        );
+        store.land(8, RequestId(3), KvRetention::Shared);
+        assert_eq!(store.copy(7, 100), 0);
+        assert_eq!(store.copy(8, 200), 100);
+    }
+
+    #[test]
+    fn full_pin_allows_zero_length_shared_write_without_evicting_relay() {
+        let mut store = SessionStore::new(100, PrefixCachePolicy::Lru);
+        store
+            .reserve(7, RequestId(1), 100, KvRetention::PinnedUntilFetched)
+            .unwrap();
+        store.land(7, RequestId(1), KvRetention::PinnedUntilFetched);
+        let (accepted, evictions) = store
+            .reserve(8, RequestId(2), 50, KvRetention::Shared)
+            .unwrap();
+        assert_eq!(accepted, 0);
+        assert_eq!(evictions.len(), 0);
+        assert!(store.busy(8));
+        assert_eq!(store.land(8, RequestId(2), KvRetention::Shared).0, 0);
+        assert!(!store.busy(8));
+        assert_eq!(
+            (store.used(), store.pinned(), store.reserved()),
+            (100, 100, 0)
+        );
+        assert_eq!(store.copy(7, 100), 100);
+        assert_eq!(store.copy(8, 100), 0);
+        assert!(!store.consumed(7, RequestId(99)));
+        assert_eq!(store.pinned(), 100);
+        assert!(store.consumed(7, RequestId(1)));
+        assert_eq!(store.available_for_pin(), 100);
+    }
+
+    #[test]
+    fn lru_shared_copies_and_fifo_reads_choose_different_capacity_victims() {
+        for (policy, victim, survivor) in [
+            (PrefixCachePolicy::Lru, 8, 7),
+            (PrefixCachePolicy::Fifo, 7, 8),
+        ] {
+            let mut store = SessionStore::new(100, policy);
+            for (session, req) in [(7, RequestId(1)), (8, RequestId(2))] {
+                store
+                    .reserve(session, req, 40, KvRetention::Shared)
+                    .unwrap();
+                store.land(session, req, KvRetention::Shared);
+            }
+            assert_eq!(store.copy(7, 20), 20);
+            assert_eq!(store.copy(7, 100), 40);
+            let (accepted, evictions) = store
+                .reserve(9, RequestId(3), 50, KvRetention::Shared)
+                .unwrap();
+            assert_eq!(accepted, 50);
+            assert_eq!(evictions.len(), 1);
+            assert_eq!(evictions[0].session_id, victim);
+            assert_eq!(
+                (store.cached(), store.reserved(), store.used()),
+                (40, 50, 90)
+            );
+            store.land(9, RequestId(3), KvRetention::Shared);
+            assert_eq!(store.copy(victim, 100), 0);
+            assert_eq!(store.copy(survivor, 100), 40);
+            assert_eq!(store.copy(9, 100), 50);
+        }
+    }
+
+    fn allocator_observation(
+        operation: &str,
+        requested: u64,
+        accepted: u64,
+        success: bool,
+        store: &SessionStore,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "operation": operation,
+            "requested": requested,
+            "accepted": accepted,
+            "success": success,
+            "used": store.used(),
+            "free": store.available_for_pin(),
+        })
+    }
+
+    #[test]
+    fn pinned_reservations_exactly_match_the_pinned_kvcached_allocator_run() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/kv_storage_external_oracles.json"
+        )))
+        .expect("external KV oracle fixture must be valid JSON");
+        let capacity = fixture["kvcached"]["capacity"].as_u64().unwrap();
+        let mut store = SessionStore::new(capacity, PrefixCachePolicy::Lru);
+        let mut actual = Vec::new();
+
+        let first = store.reserve(1, RequestId(1), 5, KvRetention::PinnedUntilFetched);
+        actual.push(allocator_observation(
+            "allocate",
+            5,
+            first.as_ref().map_or(0, |(tokens, _)| *tokens),
+            first.is_some(),
+            &store,
+        ));
+        let rejected = store.reserve(2, RequestId(2), 4, KvRetention::PinnedUntilFetched);
+        actual.push(allocator_observation(
+            "allocate",
+            4,
+            rejected.as_ref().map_or(0, |(tokens, _)| *tokens),
+            rejected.is_some(),
+            &store,
+        ));
+        store.cancel(1, RequestId(1));
+        actual.push(allocator_observation("release", 5, 5, true, &store));
+        let full = store.reserve(2, RequestId(2), capacity, KvRetention::PinnedUntilFetched);
+        actual.push(allocator_observation(
+            "allocate",
+            capacity,
+            full.as_ref().map_or(0, |(tokens, _)| *tokens),
+            full.is_some(),
+            &store,
+        ));
+
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            fixture["kvcached"]["observations"]
+        );
+    }
+
     #[test]
     fn cancellation_releases_reservation_and_stale_ids_preserve_new_pin() {
         let mut store = SessionStore::new(100, PrefixCachePolicy::Lru);

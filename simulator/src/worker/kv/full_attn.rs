@@ -1170,4 +1170,35 @@ mod tests {
         assert_eq!(kv_store.prefix_caches[0].peek(7, 60), 60);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 60);
     }
+
+    #[test]
+    fn remote_landing_during_a_running_prefill_leaves_room_for_that_prefill() {
+        use crate::worker::kv::RemotePrefixKv;
+        let mut kv = FullAttnKv::with_prefix_cache(
+            1,
+            100,
+            capped_prefix_cache(100, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
+        // Admission reserves a 70-token prefill (plus 4 decode tokens), then the
+        // iteration shell drains the promise when that prefill starts computing.
+        let session = session_with_prefix(8, 0);
+        let resolved = kv.preview_prefill_context(0, 70, session);
+        let footprint = kv.footprint(RequestId(1), 70, 4);
+        kv.reserve_prefill_context(RequestId(1), 0, resolved, footprint, Time::ZERO);
+        kv.drain_ready();
+        // RemoteCacheIterWorker lands reads before each compute tick, so another
+        // session's 50-token read can install while that prefill is running.
+        kv.install_remote_prefix(RequestId(2), 0, 7, 50, Time::from_us(1));
+        // The prefill completes and its KV becomes resident decode state.
+        kv.commit_resident(RequestId(1), 0, 70, 4);
+        let cached = kv.prefix_caches[0].used_tokens();
+        assert!(
+            kv.non_cache_peak(0) + cached <= 100,
+            "running prefill peak {} + remote prefix {} exceed 100 HBM tokens",
+            kv.non_cache_peak(0),
+            cached
+        );
+    }
 }

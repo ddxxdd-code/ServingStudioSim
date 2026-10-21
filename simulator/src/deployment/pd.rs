@@ -472,6 +472,105 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
 #[cfg(test)]
 mod remote_config_tests {
     use super::*;
+
+    #[test]
+    fn remote_selector_maps_budget_order_and_capacity_to_worker_configuration() {
+        let worker: IterWorkerSel = serde_json::from_value(serde_json::json!({
+            "type": "remote_cache_pd_prefill", "attn_gpu_memory_gb": 0.000001,
+            "gpu_time_multiplier": 1.5, "max_batch_tokens": 32,
+            "pending_order": "fifo", "max_inflight_remote_reads": 3,
+            "prefix_cache_policy": "lfu"
+        }))
+        .unwrap();
+        ensure_pd_prefill(&worker).unwrap();
+        let config = worker_config(&worker, Path::new("unused"), true, true, 4).unwrap();
+        assert_eq!(config.attn_kv_bytes, 1000);
+        assert_eq!(config.max_batch_tokens, Some(32));
+        assert_eq!(config.max_inflight_remote_reads, 3);
+        assert_eq!(config.gpu_time_multiplier, 1.5);
+        assert_eq!(config.pending_order, crate::worker::PendingOrderKind::Fifo);
+        assert_eq!(config.kv_log_stride, 4);
+        let decode: IterWorkerSel = serde_json::from_value(serde_json::json!({
+            "type": "remote_cache_pd_decode", "attn_gpu_memory_gb": 0.000002
+        }))
+        .unwrap();
+        ensure_pd_decode(&decode).unwrap();
+        let config = worker_config(&decode, Path::new("unused"), false, false, 1).unwrap();
+        assert_eq!(config.attn_kv_bytes, 2000);
+        assert_eq!(
+            config.prefix_cache,
+            crate::worker::kv::PrefixCacheConfig::Disabled
+        );
+    }
+
+    #[test]
+    fn assembled_remote_pd_reads_previous_turn_and_drains_both_writebacks() {
+        use crate::common::{RequestId, RequestStore, SessionInput, Time};
+        use crate::test_helpers::{text_request, FakeModel};
+        use std::{cell::RefCell, rc::Rc};
+        let requests = Rc::new(RefCell::new(RequestStore::new()));
+        requests.borrow_mut().reserve_slots(2);
+        let directory = tempfile::tempdir().unwrap();
+        let spec = KvStorePoolSpec {
+            worker: Default::default(),
+            replicas: 2,
+            dram_gb: 0.000001,
+            bandwidth_gbps: 1.0,
+            latency_us: 1.0,
+            placement: crate::orchestrator::config::KvStorePlacement::RoundRobin,
+            backlog_weight_per_ms: 1.0,
+            policy: PrefixCachePolicy::Lru,
+        };
+        let mut flow = assemble_pd_flow(
+            Some(&spec),
+            Arc::new(FakeModel::for_ms(1.0)),
+            Arc::new(FakeModel::for_ms(1.0)),
+            requests.clone(),
+            WorkerConfig::default(),
+            WorkerConfig::default(),
+            Some(directory.path().to_path_buf()),
+            "test".into(),
+            "test".into(),
+            pool_cfg(PD_PREFILL_POOL, 2, PlacementPolicy::RoundRobin),
+            pool_cfg(PD_DECODE_POOL, 1, PlacementPolicy::RoundRobin),
+            CostSource::analytic(1.0),
+        )
+        .unwrap();
+        assert_eq!(flow.cluster().borrow().num_gpus(), 3);
+        let mut clock = 0;
+        for id in 0..2 {
+            let mut request = text_request(
+                RequestId(id),
+                if id == 0 { 20 } else { 10 },
+                3,
+                Time::from_us(clock * 100),
+            );
+            request.definition.session = SessionInput::Session {
+                session_id: 7,
+                session_start_time: Time::ZERO,
+                declared_prefix_tokens: if id == 0 { 0 } else { 20 },
+            };
+            flow.on_arrival(request);
+            let mut completions = 0;
+            for _ in 0..150 {
+                completions += flow.tick(Time::from_us(clock * 100)).len();
+                clock += 1;
+                if completions == 1 && flow.background_pending() == 0 {
+                    break;
+                }
+            }
+            flow.check_health().unwrap();
+            assert_eq!(completions, 1);
+            assert_eq!(flow.background_pending(), 0);
+        }
+        let records = requests.borrow();
+        assert_eq!(
+            records[RequestId(1)].telemetry.prefix_cache_hit_tokens,
+            Some(20)
+        );
+        assert_eq!(records[RequestId(1)].progress.prefill_tokens_processed, 10);
+        assert_eq!(records[RequestId(1)].progress.output_tokens_emitted, 3);
+    }
     #[test]
     fn remote_prefill_rejects_disabled_local_prefix_cache() {
         let worker = IterWorkerSel::RemoteCachePdPrefill {
@@ -488,5 +587,119 @@ mod remote_config_tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("enabled local prefix cache"));
+    }
+
+    #[test]
+    fn kv_store_requires_both_remote_selectors_and_matching_relay_layouts() {
+        use crate::arch::contract::UnifiedArchInput;
+        use crate::common::RequestStore;
+        use crate::deployment::config::RunConfig;
+        use crate::test_helpers::FakeModel;
+        use crate::timing::LeafMetrics;
+        use std::{cell::RefCell, rc::Rc};
+        // Selector guards run before any model file is read.
+        let build_error = |prefill: &str, decode: &str, kv_store: bool| {
+            let group = |worker: &str| {
+                format!(
+                    r#"{{ gpu: "H200", replicas: 1, arch: {{ type: llama3_dense_tp, model_config: "m.json", fp8: false, tp_size: 1 }}, worker: {worker} }}"#
+                )
+            };
+            let yaml = format!(
+                r#"
+deployment: pd
+{store}workload: {{ trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1.0, run_to_end: true, request_rate: 1.0 }}
+io: {{ log_dir: "unused", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }}
+pools:
+  prefill:
+    placement: least-queued
+    groups:
+      - {prefill}
+  decode:
+    placement: least-queued
+    groups:
+      - {decode}
+"#,
+                store = if kv_store {
+                    "kv_store: { replicas: 1, dram_gb: 1.0, bandwidth_gbps: 1.0, latency_us: 1.0 }\n"
+                } else {
+                    ""
+                },
+                prefill = group(prefill),
+                decode = group(decode),
+            );
+            let RunConfig::Pd(cfg) = serde_yaml::from_str(&yaml).unwrap() else {
+                panic!("expected a pd config");
+            };
+            let requests = Rc::new(RefCell::new(RequestStore::new()));
+            match PdDeployment::build(&cfg, &PerfApiBridge::new_uninit_for_test(), requests) {
+                Ok(_) => panic!("accepted {prefill} + {decode} with kv_store={kv_store}"),
+                Err(error) => error.to_string(),
+            }
+        };
+        let (direct_prefill, remote_prefill) = (
+            "{ type: pd_prefill, attn_gpu_memory_gb: 80.0 }",
+            "{ type: remote_cache_pd_prefill, attn_gpu_memory_gb: 80.0 }",
+        );
+        let (direct_decode, remote_decode) = (
+            "{ type: pd_decode, attn_gpu_memory_gb: 80.0 }",
+            "{ type: remote_cache_pd_decode, attn_gpu_memory_gb: 80.0 }",
+        );
+        let pairing =
+            "pd: kv_store requires both remote_cache_pd_prefill and remote_cache_pd_decode";
+        for (prefill, decode, kv_store) in [
+            (remote_prefill, direct_decode, true),
+            (direct_prefill, remote_decode, true),
+            (direct_prefill, direct_decode, true),
+            (remote_prefill, remote_decode, false),
+        ] {
+            assert!(build_error(prefill, decode, kv_store).contains(pairing));
+        }
+
+        // A relay copies prefill KV bytes into decode, so per-token sizes must match.
+        struct TwoBytesPerToken(FakeModel);
+        impl IterwiseUnifiedModel for TwoBytesPerToken {
+            fn eval_iter(
+                &self,
+                batch: &UnifiedArchInput,
+                slots: &mut Vec<LeafMetrics>,
+                scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                self.0.eval_iter(batch, slots, scratch)
+            }
+            fn total_kv_bytes_per_token(&self) -> u64 {
+                2
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+        }
+        let spec = KvStorePoolSpec {
+            worker: Default::default(),
+            replicas: 1,
+            dram_gb: 1.0,
+            bandwidth_gbps: 1.0,
+            latency_us: 1.0,
+            placement: Default::default(),
+            backlog_weight_per_ms: 1.0,
+            policy: PrefixCachePolicy::Lru,
+        };
+        let mismatch = assemble_pd_flow(
+            Some(&spec),
+            Arc::new(FakeModel::for_ms(1.0)),
+            Arc::new(TwoBytesPerToken(FakeModel::for_ms(1.0))),
+            Rc::new(RefCell::new(RequestStore::new())),
+            WorkerConfig::default(),
+            WorkerConfig::default(),
+            None,
+            "test".into(),
+            "test".into(),
+            pool_cfg(PD_PREFILL_POOL, 1, PlacementPolicy::RoundRobin),
+            pool_cfg(PD_DECODE_POOL, 1, PlacementPolicy::RoundRobin),
+            CostSource::analytic(1.0),
+        );
+        match mismatch {
+            Ok(_) => panic!("accepted a 1-byte prefill relay into a 2-byte decode layout"),
+            Err(error) => assert!(error.to_string().contains("PD relay KV layouts must match")),
+        }
     }
 }

@@ -462,4 +462,50 @@ mod tests {
         assert_eq!(values("held_kv"), [0, 70, 50]);
         assert_eq!(values("non_cache_kv"), [0, 80, 60]);
     }
+
+    #[test]
+    fn held_and_non_cache_window_maxima_come_from_different_submits() {
+        // One window: held peaks at submit 1, non-cache at submit 2 and active at
+        // submit 3. Reading both maxima from any single snapshot would emit
+        // (70, 80), (10, 90) or (0, 1) instead of (70, 90).
+        let dir = tempdir().unwrap();
+        let mut sampler = KvSampler::open(dir.path(), "prefill", WorkerId(0), 1, 3).unwrap();
+        for (at, (active, retained, held)) in [(0, 0, 0), (80, 0, 70), (95, 5, 10), (100, 99, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            sampler.submit(
+                0,
+                KvSubmit {
+                    held_kv: held,
+                    ..sub(active, retained)
+                },
+                Time::from_us(at as u64),
+            );
+        }
+        sampler.flush_all().unwrap();
+        let batch = ParquetRecordBatchReaderBuilder::try_new(
+            File::open(dir.path().join("raw/kv_snapshot/worker_prefill_0.parquet")).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        let values = |name| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        assert_eq!(values("active_kv"), [0, 100]);
+        assert_eq!(values("retained_prefix_kv"), [0, 99]);
+        assert_eq!(values("held_kv"), [0, 70]);
+        assert_eq!(values("non_cache_kv"), [0, 90]);
+    }
 }

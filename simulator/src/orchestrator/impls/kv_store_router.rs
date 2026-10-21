@@ -296,6 +296,117 @@ mod tests {
     use super::*;
     use crate::test_helpers::test_cluster;
     use crate::worker::kv::PrefixCachePolicy;
+
+    #[test]
+    fn zero_length_write_clears_only_the_directory_at_its_destination() {
+        let cluster = test_cluster();
+        let mut spec = KvStorePoolSpec {
+            worker: Default::default(),
+            replicas: 2,
+            dram_gb: 0.0000001,
+            bandwidth_gbps: 1.0,
+            latency_us: 0.0,
+            placement: KvStorePlacement::SessionHash,
+            backlog_weight_per_ms: 1.0,
+            policy: PrefixCachePolicy::Lru,
+        };
+        // Session 8 hashes to store 0. An empty landing on store 0 must not
+        // invalidate a previously confirmed 80-token copy on store 1.
+        let mut router = KvStoreRouter::new(&spec, 1, &cluster);
+        router.directory.insert(
+            8,
+            KvLocation {
+                store: WorkerId(1),
+                tokens: 80,
+            },
+        );
+        router.push(
+            WorkerId(3),
+            RequestId(1),
+            8,
+            0,
+            0,
+            KvRetention::Shared,
+            Time::ZERO,
+        );
+        assert!(matches!(
+            router.tick(Time::ZERO).as_slice(),
+            [KvStoreEvent::PushComplete {
+                req: RequestId(1),
+                tokens: 0,
+                store: WorkerId(0),
+                ..
+            }]
+        ));
+        assert_eq!(
+            (router.directory[&8].store, router.directory[&8].tokens),
+            (WorkerId(1), 80)
+        );
+        spec.placement = KvStorePlacement::RoundRobin;
+        router.placement = spec.placement;
+        // Round-robin now targets store 1, so its own empty receipt clears it.
+        router.push(
+            WorkerId(3),
+            RequestId(2),
+            8,
+            0,
+            0,
+            KvRetention::Shared,
+            Time::ZERO,
+        );
+        router.tick(Time::ZERO);
+        assert!(!router.directory.contains_key(&8));
+        router.lookup(WorkerId(3), RequestId(3), 8, 80);
+        assert!(matches!(
+            router.tick(Time::ZERO).as_slice(),
+            [KvStoreEvent::LookupResult {
+                req: RequestId(3),
+                resident_tokens: 0,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn cancel_queued_lookup_and_completed_push_replies_cannot_reach_compute() {
+        let mut router = router();
+        router.lookup(WorkerId(3), RequestId(1), 7, 80);
+        router.push(
+            WorkerId(3),
+            RequestId(2),
+            8,
+            0,
+            0,
+            KvRetention::Shared,
+            Time::ZERO,
+        );
+        assert_eq!(router.replies.len(), 2);
+        router.cancel(7, RequestId(1));
+        router.cancel(8, RequestId(2));
+        assert_eq!(router.tick(Time::ZERO).len(), 0);
+        assert_eq!(router.pending(), 0);
+        // Delayed messages from the cancelled operations are filtered too.
+        router.process_events(
+            vec![KvStoreEvent::LookupResult {
+                store: WorkerId(0),
+                origin: WorkerId(3),
+                req: RequestId(1),
+                resident_tokens: 80,
+                store_send_gid: 0,
+            }],
+            Time::from_us(10),
+        );
+        assert_eq!(router.tick(Time::from_us(10)).len(), 0);
+        router.lookup(WorkerId(3), RequestId(3), 7, 80);
+        assert!(matches!(
+            router.tick(Time::from_us(10)).as_slice(),
+            [KvStoreEvent::LookupResult {
+                req: RequestId(3),
+                resident_tokens: 0,
+                ..
+            }]
+        ));
+    }
     fn router() -> KvStoreRouter {
         KvStoreRouter::new(
             &KvStorePoolSpec {

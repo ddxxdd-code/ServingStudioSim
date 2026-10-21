@@ -1,0 +1,5 @@
+[run]
+branch = True
+parallel = True
+patch = subprocess
+source = launcher/schema, tools, tests/fixtures

@@ -64,6 +64,55 @@ const KV_PLACEMENT_CHOICES: [&str; 3] = ["least-loaded", "round-robin", "session
 const KV_STORE_WORKER_CHOICES: [&str; 1] = ["distributed_kv_store"];
 const KV_EVICTION_CHOICES: [&str; 4] = ["lru", "fifo", "lfu", "largest-first"];
 
+#[cfg(test)]
+mod kv_store_config_tests {
+    use super::*;
+
+    #[test]
+    fn exact_one_token_capacity_is_valid_and_invalid_resources_report_the_field() {
+        let spec: KvStorePoolSpec = serde_json::from_value(serde_json::json!({
+            "replicas": 1, "dram_gb": 0.000001, "bandwidth_gbps": 1.0, "latency_us": 0.0
+        }))
+        .unwrap();
+        assert_eq!(spec.backlog_weight_per_ms, 1.0);
+        spec.validate(1000).unwrap();
+        let mut bad = spec.clone();
+        bad.replicas = 0;
+        assert!(bad
+            .validate(1000)
+            .unwrap_err()
+            .to_string()
+            .contains("replicas"));
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, 0.000000999] {
+            bad = spec.clone();
+            bad.dram_gb = value;
+            assert!(bad
+                .validate(1000)
+                .unwrap_err()
+                .to_string()
+                .contains("dram_gb"));
+        }
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            bad = spec.clone();
+            bad.bandwidth_gbps = value;
+            assert!(bad
+                .validate(1000)
+                .unwrap_err()
+                .to_string()
+                .contains("bandwidth_gbps"));
+        }
+        for value in [-1.0, f64::NAN, f64::INFINITY] {
+            bad = spec.clone();
+            bad.latency_us = value;
+            assert!(bad
+                .validate(1000)
+                .unwrap_err()
+                .to_string()
+                .contains("latency_us"));
+        }
+    }
+}
+
 fn default_backlog_weight() -> f64 {
     1.0
 }
