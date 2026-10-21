@@ -1,0 +1,50 @@
+# Small chained session crosses replicas to exercise shared remote reuse.
+deployment: pd
+
+workload:
+  trace_files:
+    - tests/fixtures/distributed_kv.csv
+  input_file_format: text-generation-session-execution-v2
+  arrival_mode: trace_timed
+  session_dependency: chained
+  run_to_end: true
+  request_rate: 1.0
+
+io:
+  log_dir: logs/distributed_kv_pd_smoke/stores{stores}_{placement}
+
+pools:
+  prefill:
+    placement: round-robin
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 2
+        arch:
+          type: llama3_dense_tp
+          model_config: model/config/llama3_8b.json
+          tp_size: 1
+        worker:
+          type: remote_cache_pd_prefill
+  decode:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: llama3_dense_tp
+          model_config: model/config/llama3_8b.json
+          tp_size: 1
+        worker:
+          type: remote_cache_pd_decode
+
+kv_store:
+  worker: distributed_kv_store
+  replicas: ${stores}
+  dram_gb: 64
+  bandwidth_gbps: 25
+  latency_us: 10
+  placement: ${placement}
+  policy: lru
+
+sweep:
+  stores: [1, 2]
+  placement: [least-loaded, round-robin, session-hash]

@@ -8,6 +8,7 @@ mod build_hp_worker;
 mod build_pd_prefill_worker;
 mod build_qwen36_hybrid_worker;
 mod iter_batch_worker;
+pub(crate) use iter_batch_worker::IterBatchWorker;
 
 pub(crate) use build_barebone_worker::build_barebone_worker;
 pub(crate) use build_hp_worker::build_hp_worker;

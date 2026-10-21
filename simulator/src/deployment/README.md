@@ -122,3 +122,8 @@ and routing.
   and reads `workload` / `io` off the `RunConfig` to drive the run.
 - **Below (assembled):** the L4 arch model build cascade, L5 worker recipes and
   `WorkerConfig`, and the matching L6 flow/pool controllers.
+
+## Distributed KV cache
+
+See [distributed KV](../../../doc/distributed_kv.md) for the opt-in DRAM pool, remote worker selectors,
+push/read ownership, PD relay, capacity and logging contracts.

@@ -254,3 +254,8 @@ Deployments and pool controllers only call those recipes:
 
 Message/event enums, pool behavior, and flow barriers remain L6 contracts; the
 composition refactor does not create a second deployment layer.
+
+## Distributed KV cache
+
+See [distributed KV](../../../doc/distributed_kv.md) for the opt-in DRAM pool, remote worker selectors,
+push/read ownership, PD relay, capacity and logging contracts.

@@ -52,14 +52,115 @@ const PREFIX_CACHE_MODE_CHOICES: [&str; 2] = ["disabled", "opportunistic"];
 /// it advances the clock by as `kernel_time * gpu_time_multiplier` (≥ 1.0);
 /// cost_log / manifest stay pre-scale (pure kernel), so the overhead surfaces as
 /// a gap between iter/section slices in the trace, never inside a kernel slice.
+fn default_max_remote_reads() -> usize {
+    16
+}
+
 fn default_gpu_time_multiplier() -> f64 {
     1.0
+}
+
+/// Dedicated storage worker provider, independent of compute architecture.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvStoreWorkerSel {
+    #[default]
+    DistributedKvStore,
 }
 
 /// Iteration-wise worker provider.
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IterWorkerSel {
+    RemoteCacheUnified {
+        /// GPU memory for the worker (GB; primarily KV cache budget). Sizes each
+        /// DP shard's KV pool.
+        #[param(default = 80.0)]
+        attn_gpu_memory_gb: f64,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
+        /// Optional per-iteration token budget, applied PER DP group (each shard
+        /// reserves its own live decodes then fills its own remainder). See
+        /// `Barebone::max_batch_tokens`. None = unbounded (`u32::MAX`
+        /// internally).
+        #[serde(default)]
+        max_batch_tokens: Option<u32>,
+        /// Order in which queued requests are offered to the admission gates.
+        /// `session-start` favours long-lived conversations (and so the largest
+        /// retained prefixes); `fifo` is plain request arrival order.
+        #[serde(default)]
+        #[param(string, default = "session-start", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
+        /// Whether completed-session KV may reuse each partition's idle KV.
+        #[serde(default)]
+        #[param(string, default = "opportunistic", choices = PREFIX_CACHE_MODE_CHOICES)]
+        prefix_cache_mode: PrefixCacheMode,
+        /// Victim policy used only when retained session KV is enabled.
+        #[serde(default)]
+        #[param(string, default = "lru", choices = PREFIX_CACHE_POLICY_CHOICES)]
+        prefix_cache_policy: PrefixCachePolicy,
+        /// Optional per-partition retained-prefix ceiling (GB). None uses all
+        /// dynamically available attention KV slack.
+        #[serde(default)]
+        prefix_cache_max_gpu_memory_gb: Option<f64>,
+        /// Upper bound on selected remote lookup/read requests.
+        #[serde(default = "default_max_remote_reads")]
+        #[param(default = 16)]
+        max_inflight_remote_reads: usize,
+    },
+    RemoteCachePdPrefill {
+        /// GPU memory for the worker (GB; primarily KV cache budget). Sizes each
+        /// DP shard's KV pool.
+        #[param(default = 80.0)]
+        attn_gpu_memory_gb: f64,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
+        /// Optional per-iteration token budget, applied PER DP group (each shard
+        /// reserves its own live decodes then fills its own remainder). See
+        /// `Barebone::max_batch_tokens`. None = unbounded (`u32::MAX`
+        /// internally).
+        #[serde(default)]
+        max_batch_tokens: Option<u32>,
+        /// Order in which queued requests are offered to the admission gates.
+        /// `session-start` favours long-lived conversations (and so the largest
+        /// retained prefixes); `fifo` is plain request arrival order.
+        #[serde(default)]
+        #[param(string, default = "session-start", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
+        /// Whether completed-session KV may reuse each partition's idle KV.
+        #[serde(default)]
+        #[param(string, default = "opportunistic", choices = PREFIX_CACHE_MODE_CHOICES)]
+        prefix_cache_mode: PrefixCacheMode,
+        /// Victim policy used only when retained session KV is enabled.
+        #[serde(default)]
+        #[param(string, default = "lru", choices = PREFIX_CACHE_POLICY_CHOICES)]
+        prefix_cache_policy: PrefixCachePolicy,
+        /// Optional per-partition retained-prefix ceiling (GB). None uses all
+        /// dynamically available attention KV slack.
+        #[serde(default)]
+        prefix_cache_max_gpu_memory_gb: Option<f64>,
+        /// Upper bound on selected remote lookup/read requests.
+        #[serde(default = "default_max_remote_reads")]
+        #[param(default = 16)]
+        max_inflight_remote_reads: usize,
+    },
+    RemoteCachePdDecode {
+        /// GPU memory for the worker (GB; primarily KV cache budget).
+        #[param(default = 80.0)]
+        attn_gpu_memory_gb: f64,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
+    },
+
     Barebone {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]

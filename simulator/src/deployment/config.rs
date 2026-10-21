@@ -211,6 +211,9 @@ impl RunConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnifiedConfig {
+    /// Optional dedicated DRAM pool; requires matching remote worker selectors.
+    #[serde(default)]
+    pub kv_store: Option<crate::orchestrator::config::KvStorePoolSpec>,
     pub workload: WorkloadSpec,
     pub io: IoSpec,
     pub pools: UnifiedPools,
@@ -229,6 +232,9 @@ pub struct UnifiedPools {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PdConfig {
+    /// Optional dedicated DRAM pool; requires matching remote worker selectors.
+    #[serde(default)]
+    pub kv_store: Option<crate::orchestrator::config::KvStorePoolSpec>,
     pub workload: WorkloadSpec,
     pub io: IoSpec,
     pub pools: PdPools,

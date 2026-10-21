@@ -55,6 +55,46 @@ pub struct FullAttnKv {
     sampler: Option<KvSampler>,
 }
 
+impl super::RemotePrefixKv for FullAttnKv {
+    fn install_remote_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session: u32,
+        tokens: u64,
+        now: Time,
+    ) {
+        self.retain_prefix(
+            request,
+            partition,
+            session,
+            tokens,
+            None,
+            now,
+            PrefixCacheRetentionReason::RemoteRead,
+        );
+        self.sample_submit(partition, now);
+    }
+
+    fn hold_for_push(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session: SessionInput,
+    ) -> u64 {
+        let context = self.ledger.prefill_context(request);
+        let tokens = self.partitions[partition as usize]
+            .decode_current_kv(request)
+            .or_else(|| context.map(|c| u64::from(c.post_prefill_context_tokens())))
+            .expect("push source must own resident or prefilled KV");
+        self.release(request, partition);
+        let context = context.unwrap_or_else(|| ResolvedPrefillContext::new(session, 0, 0));
+        self.ledger.set_prefill_context(request, context);
+        self.ledger.hold(request, partition, tokens);
+        tokens
+    }
+}
+
 impl KvStore for FullAttnKv {
     type Footprint = FullAttentionKvFootprint;
 

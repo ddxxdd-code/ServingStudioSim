@@ -233,6 +233,50 @@ def _arch(cand):
     return cand["pools"]["main"]["groups"][0]["arch"]
 
 
+@pytest.fixture
+def store_schema():
+    import copy
+
+    raw = copy.deepcopy(_FIXTURE)
+    raw["deployments"]["unified"]["optional_blocks"] = ["kv_store"]
+    raw["optional_blocks"] = {
+        "kv_store": [
+            {"name": "replicas", "type": "int", "default": 1},
+            {"name": "dram_gb", "type": "float", "required": True},
+            {"name": "placement", "type": "string", "default": "least-loaded",
+             "choices": ["least-loaded", "round-robin", "session-hash"]},
+        ]
+    }
+    return schema_from_dict(raw)
+
+
+def test_optional_store_stays_absent_or_null(store_schema):
+    assert "kv_store" not in normalize_params(_base(), store_schema)
+    assert normalize_params(_base(kv_store=None), store_schema)["kv_store"] is None
+    assert validate_params(_base(kv_store=None), store_schema) == []
+
+
+def test_optional_store_defaults_and_sweep(store_schema):
+    preset = _base(kv_store={"dram_gb": 16, "replicas": "${stores}"},
+                   sweep={"stores": [1, 3]}, log_dir="logs/store{stores}")
+    assert validate_params(preset, store_schema) == []
+    candidates = [normalize_params(c, store_schema)
+                  for c in expand_sweep_params(preset, store_schema)]
+    assert [c["kv_store"]["replicas"] for c in candidates] == [1, 3]
+    assert all(c["kv_store"]["placement"] == "least-loaded" for c in candidates)
+
+
+@pytest.mark.parametrize("block", ["${store}", [], {"typo": 2},
+                                       {"dram_gb": 16, "placement": "invalid"}])
+def test_optional_store_rejects_invalid_structure_and_keys(store_schema, block):
+    assert validate_params(_base(kv_store=block), store_schema)
+
+
+def test_optional_store_requires_deployment_support(schema):
+    assert any("kv_store" in error
+               for error in validate_params(_base(kv_store={"dram_gb": 16}), schema))
+
+
 def test_run_analysis_delegates_both_optimality_modes_to_analyzer(monkeypatch, tmp_path):
     analyzer_path = tmp_path / "analyze"
     analyzer_path.write_text("")

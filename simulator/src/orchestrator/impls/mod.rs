@@ -3,6 +3,8 @@
 pub mod afd;
 pub mod afd_attn_pool;
 pub mod afd_ffn_pool;
+pub(crate) mod kv_store_flows;
+pub(crate) mod kv_store_router;
 pub mod pd;
 pub mod simple_dp;
 

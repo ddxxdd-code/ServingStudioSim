@@ -20,6 +20,67 @@ use serde::Deserialize;
 
 use schema_derive::ParamStruct;
 
+/// Writes choose a store; reads always follow the session directory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvStorePlacement {
+    #[default]
+    LeastLoaded,
+    RoundRobin,
+    SessionHash,
+}
+
+/// Dedicated DRAM pool, independent of compute arch/group configuration.
+#[derive(Debug, Clone, Deserialize, ParamStruct)]
+#[serde(deny_unknown_fields)]
+pub struct KvStorePoolSpec {
+    /// Storage-only worker composition (no arch or model).
+    #[serde(default)]
+    #[param(string, default = "distributed_kv_store", choices = KV_STORE_WORKER_CHOICES)]
+    pub worker: crate::worker::config::KvStoreWorkerSel,
+    /// Number of dedicated DRAM nodes.
+    #[param(default = 1)]
+    pub replicas: u16,
+    /// Capacity of each node, in decimal GB.
+    pub dram_gb: f64,
+    /// Per-link transfer bandwidth in decimal GB/s.
+    pub bandwidth_gbps: f64,
+    /// Per-transfer setup latency in microseconds.
+    pub latency_us: f64,
+    /// Placement acts on writes; reads follow the directory.
+    #[serde(default)]
+    #[param(string, default = "least-loaded", choices = KV_PLACEMENT_CHOICES)]
+    pub placement: KvStorePlacement,
+    /// Eviction policy for shared entries only.
+    #[serde(default)]
+    #[param(string, default = "lru", choices = KV_EVICTION_CHOICES)]
+    pub policy: crate::worker::kv::PrefixCachePolicy,
+}
+const KV_PLACEMENT_CHOICES: [&str; 3] = ["least-loaded", "round-robin", "session-hash"];
+const KV_STORE_WORKER_CHOICES: [&str; 1] = ["distributed_kv_store"];
+const KV_EVICTION_CHOICES: [&str; 4] = ["lru", "fifo", "lfu", "largest-first"];
+
+impl KvStorePoolSpec {
+    pub fn validate(&self, bytes_per_token: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(self.replicas > 0, "kv_store.replicas must be positive");
+        anyhow::ensure!(
+            self.dram_gb.is_finite()
+                && self.dram_gb > 0.0
+                && self.dram_gb * 1e9 >= bytes_per_token as f64,
+            "kv_store.dram_gb must hold at least one KV token"
+        );
+        anyhow::ensure!(
+            self.bandwidth_gbps.is_finite() && self.bandwidth_gbps > 0.0,
+            "kv_store.bandwidth_gbps must be finite and positive"
+        );
+        anyhow::ensure!(
+            self.latency_us.is_finite() && self.latency_us >= 0.0,
+            "kv_store.latency_us must be finite and nonnegative"
+        );
+        Ok(())
+    }
+}
+
 /// L6 per-pool worker selection policy. Closed set → serde enum (kebab-case so
 /// `least-queued` / `round-robin` match the wire spelling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

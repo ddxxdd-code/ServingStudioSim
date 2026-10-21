@@ -10,6 +10,256 @@
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::LoadBalance;
 
+/// Shared prefixes are evictable; a PD relay remains pinned until consumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvRetention {
+    Shared,
+    PinnedUntilFetched,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvPushRejectReason {
+    CapacityExceeded,
+}
+
+/// The receiver submits this plan through the shared transfer oracle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteReadPlan {
+    pub store_send_gid: u16,
+    pub recv_gid: u16,
+    pub tokens: u64,
+    pub store_worker: WorkerId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvStoreMsg {
+    /// Router → store; correlation fields are echoed without reading requests.
+    Lookup {
+        origin: WorkerId,
+        req: RequestId,
+        session: u32,
+        requested_tokens: u32,
+    },
+    /// Router → store; reserve space before submitting the incoming transfer.
+    Push {
+        origin: WorkerId,
+        req: RequestId,
+        session: u32,
+        tokens: u64,
+        send_gid: u16,
+        retention: KvRetention,
+    },
+    /// Decode → store, including cancellation. Request identity guards stale acks.
+    Consumed { session: u32, req: RequestId },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvStoreEvent {
+    /// Store → requesting GPU; zero tokens represents a stale-directory miss.
+    LookupResult {
+        store: WorkerId,
+        origin: WorkerId,
+        req: RequestId,
+        resident_tokens: u32,
+        store_send_gid: u16,
+    },
+    /// Store → producer and (for pinned relay writes) decode pool, after landing.
+    PushComplete {
+        store: WorkerId,
+        origin: WorkerId,
+        req: RequestId,
+        session: u32,
+        retention: KvRetention,
+        store_send_gid: u16,
+        tokens: u64,
+    },
+    /// Store/router → producer; no transfer was charged.
+    PushRejected {
+        store: WorkerId,
+        origin: WorkerId,
+        req: RequestId,
+        reason: KvPushRejectReason,
+    },
+    /// Receipt-driven invalidation of the router directory.
+    Evicted { store: WorkerId, session: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteCacheWorkerMsg {
+    /// L6 → unified admission.
+    Request(RequestId),
+    /// Router → admission; the shell submits a read for a nonzero hit.
+    KvLookupResult {
+        req: RequestId,
+        resident_tokens: u32,
+        store_send_gid: u16,
+        store_worker: WorkerId,
+    },
+    /// Store → producer; release source hold at this timestamp.
+    KvPushComplete {
+        req: RequestId,
+        tokens: u64,
+        at: Time,
+    },
+    /// Store/router → producer; explicitly fail a rejected relay.
+    KvPushRejected {
+        req: RequestId,
+        reason: KvPushRejectReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteCacheWorkerEvent {
+    /// Unified → L6 terminal notification.
+    RequestComplete { worker: WorkerId, req: RequestId },
+    /// Admission → router on insufficient local reuse.
+    KvLookup {
+        worker: WorkerId,
+        req: RequestId,
+        session: u32,
+        requested_tokens: u32,
+    },
+    /// Producer → router; source KV stays held until acknowledgement.
+    KvPushOffer {
+        worker: WorkerId,
+        req: RequestId,
+        session: u32,
+        tokens: u64,
+        send_gid: u16,
+        retention: KvRetention,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemotePdPrefillMsg {
+    /// L6 → prefill admission.
+    Request(RequestId),
+    /// Router → prefill's shared-prefix read path.
+    KvLookupResult {
+        req: RequestId,
+        resident_tokens: u32,
+        store_send_gid: u16,
+        store_worker: WorkerId,
+    },
+    /// Store → prefill; releases hold before decode fetches the relay.
+    KvPushComplete {
+        req: RequestId,
+        tokens: u64,
+        at: Time,
+    },
+    /// Store/router → prefill; fail explicitly if the relay cannot be retained.
+    KvPushRejected {
+        req: RequestId,
+        reason: KvPushRejectReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemotePdPrefillEvent {
+    /// Single-token request completed by prefill.
+    RequestComplete { worker: WorkerId, req: RequestId },
+    /// Prefill admission → router for shared-prefix reuse.
+    KvLookup {
+        worker: WorkerId,
+        req: RequestId,
+        session: u32,
+        requested_tokens: u32,
+    },
+    /// Prefill → store, with pinned retention for requests needing decode.
+    KvPushOffer {
+        worker: WorkerId,
+        req: RequestId,
+        session: u32,
+        tokens: u64,
+        send_gid: u16,
+        retention: KvRetention,
+    },
+    /// Standalone requests retain the direct-link path; no fabricated session id.
+    StandaloneHandoff {
+        worker: WorkerId,
+        req: RequestId,
+        send_gid: u16,
+        tokens: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemotePdDecodeMsg {
+    /// Already-local test ingress.
+    Request(RequestId),
+    /// Router → decode after the store's push completion; no lookup is needed.
+    Handoff {
+        req: RequestId,
+        store_send_gid: u16,
+        tokens: u64,
+        store_worker: WorkerId,
+    },
+    /// Standalone requests bypass the remote store, as in direct-link PD.
+    StandaloneHandoff {
+        req: RequestId,
+        send_gid: u16,
+        tokens: u64,
+        prefill_worker: WorkerId,
+    },
+    /// Store → decode; releases completion-time source hold.
+    KvPushComplete {
+        req: RequestId,
+        tokens: u64,
+        at: Time,
+    },
+    /// Store/router → decode; explicit capacity failure.
+    KvPushRejected {
+        req: RequestId,
+        reason: KvPushRejectReason,
+    },
+    /// L6 → decode; release a relay even if it has not been fetched.
+    Cancel { req: RequestId },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemotePdDecodeEvent {
+    /// Decode → L6 terminal notification.
+    RequestComplete { worker: WorkerId, req: RequestId },
+    /// Decode → store after read arrival or cancellation.
+    KvConsumed {
+        worker: WorkerId,
+        req: RequestId,
+        session: u32,
+        store_worker: WorkerId,
+    },
+    /// Decode → store with the full completed context.
+    KvPushOffer {
+        worker: WorkerId,
+        req: RequestId,
+        session: u32,
+        tokens: u64,
+        send_gid: u16,
+        retention: KvRetention,
+    },
+    /// Standalone-only acknowledgement of the direct-link prefill source.
+    StandalonePullComplete {
+        worker: WorkerId,
+        req: RequestId,
+        prefill_worker: WorkerId,
+    },
+}
+
+impl From<RequestId> for RemoteCacheWorkerMsg {
+    fn from(req: RequestId) -> Self {
+        Self::Request(req)
+    }
+}
+impl From<RequestId> for RemotePdPrefillMsg {
+    fn from(req: RequestId) -> Self {
+        Self::Request(req)
+    }
+}
+impl From<RequestId> for RemotePdDecodeMsg {
+    fn from(req: RequestId) -> Self {
+        Self::Request(req)
+    }
+}
+
 // ── FSM types ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,6 +650,8 @@ pub struct WorkerStatus {
 
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerConfig {
+    /// Bound selected requests waiting for a remote lookup/read.
+    pub max_inflight_remote_reads: usize,
     pub balance: LoadBalance,
     /// This worker's KV-cache memory allowance in bytes (its GPU's attention
     /// budget). Same per-worker tier as `gpu_name`; the worker divides it by the
@@ -457,6 +709,7 @@ impl Default for WorkerConfig {
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
             max_batch_tokens: None,
+            max_inflight_remote_reads: 16,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             ssm_checkpoint_interval_tokens: None,

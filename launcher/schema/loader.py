@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +220,7 @@ class Registry:
     pool_common: list[dict]
     workload_common: list[dict]
     io_common: list[dict]
+    optional_blocks: dict[str, list[dict]] = field(default_factory=dict)
 
     def roles(self, deployment: str) -> dict[str, str]:
         """role -> contract for one deployment (e.g. {"main": "iter_wise"})."""
@@ -256,6 +257,7 @@ def schema_from_dict(raw: dict[str, Any]) -> Registry:
         pool_common=raw.get("pool_common", []),
         workload_common=common.get("workload", []),
         io_common=common.get("io", []),
+        optional_blocks=raw.get("optional_blocks", {}),
     )
 
 
@@ -300,6 +302,12 @@ def iter_slots(registry: Registry, config: dict, *, create: bool = False) -> Ite
             parent[key] = {}
             return parent[key]
         return None
+
+    for block in registry.deployments[deployment].get("optional_blocks", []):
+        node = config.get(block)
+        if isinstance(node, dict):
+            for pdef in registry.optional_blocks.get(block, []):
+                yield Slot(node, pdef["name"], pdef, (block, pdef["name"]))
 
     workload = _child(config, "workload")
     if workload is not None:
@@ -368,7 +376,13 @@ def unknown_keys(registry: Registry, config: dict) -> list[str]:
                 errors.append(where)
 
     root_allowed = {"deployment", "workload", "io", "pools"} | CONTROL_KEYS
+    blocks = registry.deployments[deployment].get("optional_blocks", [])
+    root_allowed |= set(blocks)
     _check(config, root_allowed, "")
+    for block in blocks:
+        node = config.get(block)
+        if isinstance(node, dict):
+            _check(node, {p["name"] for p in registry.optional_blocks.get(block, [])}, block)
 
     workload = config.get("workload")
     if isinstance(workload, dict):

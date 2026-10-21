@@ -30,17 +30,27 @@ use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, FfnWorkerEvent, FfnWo
 /// `SharedGpuCluster` at construction (used by PD workers for runtime
 /// transfers; ignored by barebone/hp after their one-shot `allocate`).
 pub trait IterWorker {
-    /// Role-specific message set this worker accepts. Always wraps
-    /// `WorkerMsgCommon` (which carries the universal `Request`).
+    /// Role-specific message set. Compute workers inline `Request`; a storage
+    /// worker accepts only lookup, push, and consume messages.
     type Msg;
-    /// Role-specific event set this worker emits. Always wraps
-    /// `WorkerEventCommon` (which carries the universal `RequestComplete`).
+    /// Role-specific event set. Compute workers inline `RequestComplete`;
+    /// storage workers acknowledge transfers and report cache mutations.
     type Event;
 
     fn id(&self) -> WorkerId;
     fn enqueue(&mut self, msg: Self::Msg);
     fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time>;
     fn status(&self) -> WorkerStatus;
+}
+
+/// Router load observations; incoming reserved bytes count toward occupancy.
+pub trait KvStoreLoad:
+    IterWorker<Msg = crate::worker::types::KvStoreMsg, Event = crate::worker::types::KvStoreEvent>
+{
+    fn used_tokens(&self) -> u64;
+    fn capacity_tokens(&self) -> u64;
+    fn available_pinned_tokens(&self) -> u64;
+    fn send_backlog(&self, now: Time) -> Time;
 }
 
 /// Extra L6-facing capability required by the AFD attention pool.

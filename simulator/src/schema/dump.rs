@@ -45,8 +45,8 @@ fn providers(schema: &[(&str, &[ParamDef])]) -> Value {
 pub fn list_params() -> Value {
     json!({
         "deployments": {
-            "unified": { "pools": { "main": "iter_wise" } },
-            "pd":      { "pools": { "prefill": "iter_wise", "decode": "iter_wise" } },
+            "unified": { "pools": { "main": "iter_wise" }, "optional_blocks": ["kv_store"] },
+            "pd":      { "pools": { "prefill": "iter_wise", "decode": "iter_wise" }, "optional_blocks": ["kv_store"] },
             "afd":     { "pools": { "attn": "layer_wise_attn", "ffn": "layer_wise_ffn" } },
         },
         "providers": {
@@ -64,6 +64,9 @@ pub fn list_params() -> Value {
         "arch_common": params(ModelSpec::PARAMS),
         "group_common": params(GroupSpec::<(), ()>::PARAMS),
         "pool_common": params(PoolSpec::<(), ()>::PARAMS),
+        "optional_blocks": {
+            "kv_store": params(crate::orchestrator::config::KvStorePoolSpec::PARAMS),
+        },
         "common": {
             "workload": params(WorkloadSpec::PARAMS),
             "io":       params(IoSpec::PARAMS),

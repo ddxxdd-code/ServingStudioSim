@@ -9,7 +9,12 @@ mod local_prefill_decode_admission;
 mod placement;
 mod policy;
 mod prefill_handoff_admission;
+mod remote_cache_prefill_decode_admission;
+mod remote_cache_prefill_handoff_admission;
+mod remote_prefill_state;
 mod token_budget;
+pub(crate) use remote_cache_prefill_decode_admission::RemoteCachePrefillDecodeAdmission;
+pub(crate) use remote_cache_prefill_handoff_admission::RemoteCachePrefillHandoffAdmission;
 
 pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
@@ -37,6 +42,13 @@ pub trait IterAdmission<K: KvStore> {
     );
     fn queued_requests(&self) -> u32;
     fn cancel_pending(&mut self, request: RequestId) -> bool;
+}
+
+/// The remote shell owns transfer submission and feeds landed reads to admission.
+pub(crate) trait RemoteKvAdmission<K: KvStore>: IterAdmission<K> {
+    fn drain_lookups(&mut self, context: &WorkerContext, events: &mut Vec<Self::Event>);
+    fn take_read(&mut self) -> Option<(RequestId, crate::worker::types::RemoteReadPlan)>;
+    fn read_landed(&mut self, kv: &mut K, req: RequestId, now: Time);
 }
 
 pub trait SlotPipelineAdmission<K: KvStore> {

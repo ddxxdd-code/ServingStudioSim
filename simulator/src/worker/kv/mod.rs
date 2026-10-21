@@ -17,6 +17,7 @@ mod shared;
 pub use full_attn::FullAttnKv;
 pub use hybrid_gdn::HybridGdnKv;
 pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
+pub(crate) use shared::prefix_cache::{PrefixCache, PrefixCacheMutation, PrefixCacheMutationKind};
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
@@ -216,4 +217,23 @@ pub trait SlotPipelineKv: KvStore {
 pub trait HandoffKv: IterWorkerKv {
     fn hold(&mut self, partition: PartitionId, request: RequestId, kv_tokens: u64);
     fn complete_handoff(&mut self, request: RequestId, now: Time);
+}
+
+/// Remote-prefix landing and completion-time source ownership on one KV ledger.
+pub trait RemotePrefixKv: PrefixKv + HandoffKv {
+    fn install_remote_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session: u32,
+        tokens: u64,
+        now: Time,
+    );
+    /// Move resident/prefilled bytes to held ownership, without double counting.
+    fn hold_for_push(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session: SessionInput,
+    ) -> u64;
 }

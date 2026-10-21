@@ -73,6 +73,7 @@ use crate::timing::kernels::{P2pInterKernel, P2pInterKernelInput};
 /// to reverse-recover a non-KV worker's role through `comm_groups`.
 #[derive(Clone, Debug, Serialize)]
 pub struct GpuInfo {
+    pub device_kind: DeviceKind,
     pub id: u16,
     pub name: String,
     pub pool: u16,
@@ -80,12 +81,20 @@ pub struct GpuInfo {
     pub pool_tag: String,
 }
 
+/// Host DRAM endpoints share the transfer registry but are not compute GPUs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    Gpu,
+    HostMemory,
+}
+
 /// Where a transfer's per-link time comes from. `Kernel` is the profiled
 /// inter-node p2p curve (production); `Analytic` is a constant per-link bandwidth
 /// (`bytes_per_ms`) used as the unit-test seam / a bridge-free fallback.
 pub enum CostSource {
     Kernel(P2pInterKernel),
-    Analytic { bytes_per_ms: f64 },
+    Analytic { bytes_per_ms: f64, latency: Time },
 }
 
 impl CostSource {
@@ -93,6 +102,16 @@ impl CostSource {
     pub fn analytic(gbps: f64) -> Self {
         CostSource::Analytic {
             bytes_per_ms: (gbps * 1e6).max(f64::MIN_POSITIVE),
+            latency: Time::ZERO,
+        }
+    }
+
+    /// RDMA alpha/beta curve, including setup latency once per transfer.
+    pub fn analytic_with_latency(gbps: f64, latency: Time) -> Self {
+        assert!(gbps.is_finite() && gbps > 0.0, "bandwidth must be positive");
+        Self::Analytic {
+            bytes_per_ms: gbps * 1e6,
+            latency,
         }
     }
 
@@ -103,9 +122,10 @@ impl CostSource {
                 let leaf = k.eval(&P2pInterKernelInput { message_size_bytes });
                 Time::from_ms(leaf.m.time_ms.max(0.0) as f64)
             }
-            CostSource::Analytic { bytes_per_ms } => {
-                Time::from_ms(message_size_bytes as f64 / bytes_per_ms)
-            }
+            CostSource::Analytic {
+                bytes_per_ms,
+                latency,
+            } => *latency + Time::from_ms(message_size_bytes as f64 / bytes_per_ms),
         }
     }
 
@@ -117,7 +137,7 @@ impl CostSource {
     /// (α = 0). This is the cost a gather pays **once**, not per source.
     fn latency(&self) -> Time {
         match self {
-            CostSource::Analytic { .. } => Time::ZERO,
+            CostSource::Analytic { latency, .. } => *latency,
             CostSource::Kernel(_) => {
                 // 2^10 = the p2p_inter sweep floor (see p2p_inter.rs sweep_grid).
                 let b0 = 1024u64;
@@ -174,6 +194,8 @@ pub struct GpuCluster {
     /// bandwidth (see [`CostSource`]).
     #[serde(skip)]
     cost: CostSource,
+    #[serde(skip)]
+    host_cost: Option<CostSource>,
     /// The `gpu_cluster` stream writer, attached once a log dir is available
     /// ([`attach_logger`](GpuCluster::attach_logger)). `None` for tests and
     /// no-log runs — `submit_transfer` then records nothing. One writer for the
@@ -205,6 +227,7 @@ impl GpuCluster {
             gpus: Vec::new(),
             groups: Vec::new(),
             cost,
+            host_cost: None,
             logger: None,
             kv_caps: Vec::new(),
         }
@@ -221,6 +244,11 @@ impl GpuCluster {
             Ok(l) => self.logger = Some(l),
             Err(e) => tracing::warn!("failed to open gpu_cluster log: {e:#}"),
         }
+    }
+
+    /// Host transfers use the configured RDMA curve; GPU-only paths keep theirs.
+    pub fn set_host_transfer_cost(&mut self, cost: CostSource) {
+        self.host_cost = Some(cost);
     }
 
     /// Register `n` contiguous-id GPUs owned by `(pool, worker_id)`, all sharing
@@ -240,6 +268,7 @@ impl GpuCluster {
         let base = self.gpus.len() as u16;
         for offset in 0..n {
             self.gpus.push(GpuInfo {
+                device_kind: DeviceKind::Gpu,
                 id: base + offset,
                 name: name.to_string(),
                 pool,
@@ -248,6 +277,19 @@ impl GpuCluster {
             });
         }
         base
+    }
+
+    /// Register a dedicated DRAM node in the same dense endpoint id space.
+    pub fn allocate_host(&mut self, pool: u16, worker_id: u16, name: &str) -> u16 {
+        let base = self.allocate(pool, worker_id, 1, name, "kv_store");
+        self.gpus[usize::from(base)].device_kind = DeviceKind::HostMemory;
+        base
+    }
+
+    /// Send-side queueing delay, read by the store placement policy.
+    pub fn send_backlog(&self, gid: u16, now: Time) -> Time {
+        let free = self.groups[usize::from(gid)].send_free;
+        free.max(now) - now
     }
 
     /// Record the KV-pool token `capacity` of `(pool_tag, pool, worker_id,
@@ -295,7 +337,10 @@ impl GpuCluster {
     }
 
     pub fn num_gpus(&self) -> usize {
-        self.gpus.len()
+        self.gpus
+            .iter()
+            .filter(|device| device.device_kind == DeviceKind::Gpu)
+            .count()
     }
 
     pub fn num_groups(&self) -> usize {
@@ -362,8 +407,18 @@ impl GpuCluster {
         }
         let send_per_link = (bytes as f64 / s.count as f64).round() as u64;
         let recv_per_link = (bytes as f64 / r.count as f64).round() as u64;
-        let send_dur = self.cost.link_time(send_per_link);
-        let recv_dur = self.cost.link_time(recv_per_link);
+        let host_endpoint = [s.base, r.base].iter().any(|base| {
+            self.gpus
+                .get(*base as usize)
+                .is_some_and(|device| device.device_kind == DeviceKind::HostMemory)
+        });
+        let cost = if host_endpoint {
+            self.host_cost.as_ref().unwrap_or(&self.cost)
+        } else {
+            &self.cost
+        };
+        let send_dur = cost.link_time(send_per_link);
+        let recv_dur = cost.link_time(recv_per_link);
         // Slower side bounds the collective; faster side is held throttled at
         // the bottleneck pace, so both links stay busy for the same window.
         let transfer_dur = send_dur.max(recv_dur);
@@ -518,6 +573,23 @@ pub type SharedGpuCluster = Rc<RefCell<GpuCluster>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_curve_includes_latency_without_changing_gpu_transfers() {
+        let mut c = GpuCluster::new(CostSource::analytic(1.0));
+        let gpu = c.allocate(0, 0, 2, "test", "main");
+        let host = c.allocate_host(2, 0, "DRAM");
+        let g0 = c.register_comm_group(gpu, 1, "main", 0);
+        let g1 = c.register_comm_group(gpu + 1, 1, "main", 1);
+        let h = c.register_comm_group(host, 1, "kv_store", 0);
+        c.set_host_transfer_cost(CostSource::analytic_with_latency(0.5, Time::from_us(50)));
+        assert_eq!(c.num_gpus(), 2);
+        let gpu_end = c.submit_transfer(Time::ZERO, g0, g1, 1_000_000, "test", "");
+        assert_eq!(gpu_end, Time::from_ms(1.0));
+        let host_end = c.submit_transfer(Time::ZERO, g0, h, 1_000_000, "test", "");
+        assert_eq!(host_end, Time::from_ms(3.05));
+        assert_eq!(c.send_backlog(g0, Time::from_ms(1.0)), Time::from_us(2050));
+    }
 
     /// Build a fresh cluster at 1 GB/s analytic per-link cost. The reporting
     /// `gpus` list is irrelevant to timing tests, so we skip `allocate`.

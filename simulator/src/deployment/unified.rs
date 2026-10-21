@@ -35,6 +35,9 @@ use crate::worker::{
 };
 
 use super::Deployment;
+use crate::orchestrator::config::KvStorePoolSpec;
+use crate::orchestrator::impls::kv_store_flows::KvStoreUnifiedFlow;
+use crate::worker::workers::remote_cache_iter::build_remote_cache_unified_worker;
 
 pub struct UnifiedDeployment;
 
@@ -55,6 +58,18 @@ impl Deployment for UnifiedDeployment {
             pool.groups.len()
         );
         let g = &pool.groups[0];
+        let remote = matches!(g.worker, IterWorkerSel::RemoteCacheUnified { .. });
+        ensure!(
+            remote == cfg.kv_store.is_some(),
+            "unified: kv_store requires worker remote_cache_unified, and vice versa"
+        );
+        if let Some(spec) = &cfg.kv_store {
+            spec.validate(1)?;
+        }
+        ensure!(
+            !remote || !matches!(g.arch, IterArchSel::Qwen36Local { .. }),
+            "remote cache currently supports full-attention KV only, not recurrent snapshots"
+        );
 
         // Model dims load from JSON (arch-independent, §4); `sim_num_layers` /
         // `num_layers` truncation must apply BEFORE build_configs. Loaded per-arm
@@ -87,6 +102,16 @@ impl Deployment for UnifiedDeployment {
                 // bindings. See `ssm_checkpoint_interval_tokens` below.
                 ..
             }
+            | IterWorkerSel::RemoteCacheUnified {
+                attn_gpu_memory_gb,
+                gpu_time_multiplier,
+                max_batch_tokens,
+                pending_order,
+                prefix_cache_mode,
+                prefix_cache_policy,
+                prefix_cache_max_gpu_memory_gb,
+                ..
+            }
             | IterWorkerSel::HpUnified {
                 attn_gpu_memory_gb,
                 gpu_time_multiplier,
@@ -107,10 +132,24 @@ impl Deployment for UnifiedDeployment {
             IterWorkerSel::ChunkedPrefill { .. } => {
                 bail!("unified: chunked_prefill worker not wired yet")
             }
-            IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
+            IterWorkerSel::PdPrefill { .. }
+            | IterWorkerSel::PdDecode { .. }
+            | IterWorkerSel::RemoteCachePdPrefill { .. }
+            | IterWorkerSel::RemoteCachePdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
             }
         };
+        let max_inflight_remote_reads = match g.worker {
+            IterWorkerSel::RemoteCacheUnified {
+                max_inflight_remote_reads,
+                ..
+            } => max_inflight_remote_reads,
+            _ => 16,
+        };
+        ensure!(
+            max_inflight_remote_reads > 0,
+            "max_inflight_remote_reads must be positive"
+        );
         let prefix_cache = resolve_prefix_cache_config(
             "unified",
             prefix_cache_mode,
@@ -119,6 +158,7 @@ impl Deployment for UnifiedDeployment {
             attn_gpu_memory_gb,
         )?;
         let worker_config = WorkerConfig {
+            max_inflight_remote_reads,
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
             log_output_token_times: cfg.io.log_output_token_times,
             log_stage_transitions: cfg.io.log_stage_transitions,
@@ -173,7 +213,8 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_flow(
+                    cfg.kv_store.as_ref(),
                     model,
                     store,
                     worker_config,
@@ -181,14 +222,15 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_qwen36_hybrid_worker,
-                ))
+                )
             }
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::dense(
                     model_spec, &gpu_name, MODEL_NAME, bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_flow(
+                    cfg.kv_store.as_ref(),
                     model,
                     store,
                     worker_config,
@@ -196,14 +238,15 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_barebone_worker,
-                ))
+                )
             }
             IterArchSel::Llama3DenseTp { tp_size, .. } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::dense_tp(
                     model_spec, *tp_size, &gpu_name, MODEL_NAME, bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_flow(
+                    cfg.kv_store.as_ref(),
                     model,
                     store,
                     worker_config,
@@ -211,7 +254,7 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_barebone_worker,
-                ))
+                )
             }
             IterArchSel::Llama3DpAttnTpFfn {
                 attn_tp_size,
@@ -227,7 +270,8 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_flow(
+                    cfg.kv_store.as_ref(),
                     model,
                     store,
                     worker_config,
@@ -235,7 +279,7 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_hp_worker,
-                ))
+                )
             }
             IterArchSel::Qwen3MoeDpAttnEpFfn {
                 attn_tp_size,
@@ -261,7 +305,8 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_flow(
+                    cfg.kv_store.as_ref(),
                     model,
                     store,
                     worker_config,
@@ -269,7 +314,7 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_hp_worker,
-                ))
+                )
             }
             IterArchSel::Qwen3MoeFp8DpAttnEpFfn {
                 attn_tp_size,
@@ -295,7 +340,8 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_flow(
+                    cfg.kv_store.as_ref(),
                     model,
                     store,
                     worker_config,
@@ -303,7 +349,7 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_hp_worker,
-                ))
+                )
             }
             IterArchSel::Qwen3VllmMoeDpAttnEpFfn {
                 attn_tp_size,
@@ -329,7 +375,8 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_flow(
+                    cfg.kv_store.as_ref(),
                     model,
                     store,
                     worker_config,
@@ -337,7 +384,7 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_hp_worker,
-                ))
+                )
             }
             IterArchSel::Glm52VllmDsaMoe {
                 ep_size,
@@ -361,7 +408,8 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_flow(
+                    cfg.kv_store.as_ref(),
                     model,
                     store,
                     worker_config,
@@ -369,7 +417,7 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_hp_worker,
-                ))
+                )
             }
             IterArchSel::Glm52DsaMoe {
                 ep_size,
@@ -393,7 +441,8 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_flow(
+                    cfg.kv_store.as_ref(),
                     model,
                     store,
                     worker_config,
@@ -401,7 +450,7 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_hp_worker,
-                ))
+                )
             }
         }
     }
@@ -413,7 +462,7 @@ const MODEL_NAME: &str = "unified";
 /// The dense / dense_tp archs run on the single-group barebone worker.
 fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
-        IterWorkerSel::Barebone { .. } => Ok(()),
+        IterWorkerSel::Barebone { .. } | IterWorkerSel::RemoteCacheUnified { .. } => Ok(()),
         other => bail!("unified: this arch requires worker `barebone`, got {other:?}"),
     }
 }
@@ -433,7 +482,7 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
 /// DP-attention and MoE archs run on the multi-group hp_unified worker.
 fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
-        IterWorkerSel::HpUnified { .. } => Ok(()),
+        IterWorkerSel::HpUnified { .. } | IterWorkerSel::RemoteCacheUnified { .. } => Ok(()),
         other => {
             bail!("unified: this DP-attention/MoE arch requires worker `hp_unified`, got {other:?}")
         }
@@ -444,6 +493,7 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
 /// model `M` and worker `W`; `build_fn` is the chosen worker's `new`. The returned
 /// `Box<dyn Flow>` is the only `dyn` erasure point.
 fn assemble_flow<M, W>(
+    kv_store: Option<&KvStorePoolSpec>,
     model: Arc<M>,
     store: SharedRequests,
     worker_config: WorkerConfig,
@@ -451,12 +501,31 @@ fn assemble_flow<M, W>(
     gpu_name: String,
     dp_cfg: SimpleDpConfig,
     build_fn: WorkerBuildFn<M, W>,
-) -> Box<dyn Flow>
+) -> anyhow::Result<Box<dyn Flow>>
 where
     M: IterwiseUnifiedModel,
     W: IterWorker<Event = crate::worker::WorkerEventCommon> + 'static,
     W::Msg: From<crate::common::RequestId>,
 {
+    if let Some(spec) = kv_store {
+        let bytes = model.total_kv_bytes_per_token();
+        spec.validate(bytes)?;
+        let net_log = log_dir.clone();
+        let factory = UnifiedWorkerFactory::new(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            "main",
+            build_remote_cache_unified_worker::<M>,
+        );
+        let mut flow = KvStoreUnifiedFlow::new(&dp_cfg.dp_pool, &factory, spec, bytes);
+        if let Some(dir) = net_log {
+            flow.attach_logger(&dir);
+        }
+        return Ok(Box::new(flow));
+    }
     let factory = UnifiedWorkerFactory::new(
         model,
         store,
@@ -466,7 +535,7 @@ where
         "main",
         build_fn,
     );
-    Box::new(SimpleDpFlow::new(dp_cfg, factory))
+    Ok(Box::new(SimpleDpFlow::new(dp_cfg, factory)))
 }
 
 fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {

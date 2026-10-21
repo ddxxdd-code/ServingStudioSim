@@ -705,3 +705,8 @@ uv run python -m launcher alignment analyze logs/<experiment>/analyze.yaml
 
 See skill `operate-run-simulation` for preset/sweep authoring conventions and dated log
 dirs.
+
+## Distributed KV cache
+
+See [distributed KV](../doc/distributed_kv.md) for the opt-in DRAM pool, remote worker selectors,
+push/read ownership, PD relay, capacity and logging contracts.

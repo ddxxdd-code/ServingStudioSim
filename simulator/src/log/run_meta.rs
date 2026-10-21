@@ -14,6 +14,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::common::StageVocab;
+use crate::worker::gpu_cluster::DeviceKind;
 use crate::worker::GpuCluster;
 
 // v5 adds `stage_vocab` (deployment + `code → "category:detail"` names, decoding
@@ -25,7 +26,9 @@ use crate::worker::GpuCluster;
 // array. Append-only; the analyzer reads by field name and never asserts the version,
 // so older readers are unaffected and older logs (null ffn tag) still parse via the
 // analyzer's legacy `comm_groups` fallback.
-const SCHEMA_VERSION: u32 = 5;
+// v6 distinguishes host-memory endpoints in `devices`; GPU-only consumers
+// retain the filtered `gpus` / `gpu_ids` views.
+const SCHEMA_VERSION: u32 = 6;
 
 /// Write `<log_dir>/raw/run_meta.json` from the run's [`GpuCluster`]'s GPU
 /// registry. Emits the flat per-GPU list, a derived worker→gpu grouping (each
@@ -49,7 +52,9 @@ pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster, stage_vocab: StageVo
         let entry = by_worker
             .entry((g.pool, g.worker_id))
             .or_insert_with(|| (Vec::new(), g.pool_tag.as_str()));
-        entry.0.push(g.id);
+        if g.device_kind == DeviceKind::Gpu {
+            entry.0.push(g.id);
+        }
     }
 
     // Per-worker KV-pool capacities (static token counts), grouped by the same
@@ -101,7 +106,8 @@ pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster, stage_vocab: StageVo
                 "gid": gid,
                 "base": base,
                 "count": count,
-                "gpu_ids": (base..base + count).collect::<Vec<u16>>(),
+                "gpu_ids": (base..base + count).filter(|id| cluster.gpus[*id as usize].device_kind == DeviceKind::Gpu).collect::<Vec<u16>>(),
+                "device_ids": (base..base + count).collect::<Vec<u16>>(),
                 "owner_pool": owner_pool,
                 "owner_worker_id": owner_worker_id,
             })
@@ -120,11 +126,38 @@ pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster, stage_vocab: StageVo
     let meta = json!({
         "schema_version": SCHEMA_VERSION,
         "num_gpus": cluster.num_gpus(),
-        "gpus": cluster.gpus,
+        "gpus": cluster.gpus.iter().filter(|g| g.device_kind == DeviceKind::Gpu).collect::<Vec<_>>(),
+        "devices": cluster.gpus,
         "workers": workers,
         "comm_groups": comm_groups,
         "stage_vocab": stage_vocab,
     });
     std::fs::write(raw.join("run_meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::UnifiedStage;
+    use crate::worker::gpu_cluster::CostSource;
+
+    #[test]
+    fn host_endpoints_are_not_reported_as_compute_gpus() {
+        let mut cluster = GpuCluster::new(CostSource::analytic(1.0));
+        cluster.allocate(0, 0, 2, "test", "main");
+        let host = cluster.allocate_host(2, 0, "CPU DRAM");
+        cluster.register_comm_group(host, 1, "kv_store", 0);
+        let dir = tempfile::tempdir().unwrap();
+        write_run_meta(dir.path(), &cluster, UnifiedStage::VOCAB).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("raw/run_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["num_gpus"], 2);
+        assert_eq!(meta["gpus"].as_array().unwrap().len(), 2);
+        assert_eq!(meta["devices"][2]["device_kind"], "host_memory");
+        assert_eq!(meta["comm_groups"][0]["gpu_ids"], json!([]));
+        assert_eq!(meta["comm_groups"][0]["device_ids"], json!([2]));
+        assert_eq!(meta["workers"][1]["gpu_ids"], json!([]));
+    }
 }

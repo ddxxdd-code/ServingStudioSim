@@ -13,6 +13,28 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema};
 
+/// Remote storage receipts and router write-placement decisions.
+pub fn kv_store_event_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("sequence", DataType::UInt64, false),
+        Field::new("time_ms", DataType::Float64, false),
+        Field::new("store_worker", DataType::UInt16, false),
+        Field::new("request_id", DataType::UInt32, false),
+        Field::new("session_id", DataType::UInt32, false),
+        Field::new("operation", DataType::Utf8, false),
+        Field::new("reason", DataType::Utf8, false),
+        Field::new("entry_tokens_before", DataType::UInt64, false),
+        Field::new("entry_tokens_after", DataType::UInt64, false),
+        Field::new("cache_used_before", DataType::UInt64, false),
+        Field::new("cache_used_after", DataType::UInt64, false),
+        Field::new("requested_tokens", DataType::UInt64, false),
+        Field::new("hit_tokens", DataType::UInt64, false),
+        Field::new("placement_policy", DataType::Utf8, true),
+        Field::new("send_backlog_ms", DataType::Float64, true),
+        Field::new("occupancy_ratio", DataType::Float64, true),
+    ]))
+}
+
 /// Legacy ref-style scalar envelope helper. The current writer uses
 /// [`cost_log_schema`] below; do not infer the live parquet columns from this
 /// compatibility surface.
@@ -357,6 +379,7 @@ pub const ALL_STREAMS: &[&str] = &[
     "kv_snapshot",
     "network_event",
     "prefix_cache_event",
+    "kv_store_event",
     "request_state",
     "request_slo",
 ];

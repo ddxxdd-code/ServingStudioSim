@@ -13,6 +13,7 @@
 
 pub mod cost_logger;
 pub mod kv_sampler;
+pub(crate) mod kv_store_logger;
 pub mod network_logger;
 pub mod parquet_writer;
 pub mod prefix_cache_logger;

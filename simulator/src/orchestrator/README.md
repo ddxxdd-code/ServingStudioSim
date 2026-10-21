@@ -125,3 +125,8 @@ same shared `GpuCluster`.
 - L5 owns queues that are local lifecycle/cadence state and all KV mutation.
 - Deployment owns legal arch/worker pairing and concrete assembly.
 - L7 owns the global tick loop and sees no pool/worker internals.
+
+## Distributed KV cache
+
+See [distributed KV](../../../doc/distributed_kv.md) for the opt-in DRAM pool, remote worker selectors,
+push/read ownership, PD relay, capacity and logging contracts.

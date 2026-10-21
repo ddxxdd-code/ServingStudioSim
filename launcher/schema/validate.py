@@ -184,6 +184,9 @@ def _walk_schema(config: dict, registry: Registry, *, defer_placeholders: bool) 
         return [f"unknown deployment {deployment!r}; known: {known}"]
 
     errors: list[str] = []
+    for block in registry.deployments[deployment].get("optional_blocks", []):
+        if block in config and config[block] is not None and not isinstance(config[block], dict):
+            errors.append(f"{block}: expected a mapping or null")
     for path in unknown_keys(registry, config):
         errors.append(f"unknown key {path!r} for deployment {deployment!r}")
     _check_structure(errors, config, registry, deployment)

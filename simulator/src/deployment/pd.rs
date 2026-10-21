@@ -35,6 +35,10 @@ use crate::worker::{
 };
 
 use super::Deployment;
+use crate::orchestrator::config::KvStorePoolSpec;
+use crate::orchestrator::impls::kv_store_flows::KvStorePdFlow;
+use crate::worker::workers::remote_cache_iter::build_remote_cache_pd_prefill_worker;
+use crate::worker::workers::remote_pd_decode::build_remote_cache_pd_decode_worker;
 
 pub struct PdDeployment;
 
@@ -55,6 +59,15 @@ impl Deployment for PdDeployment {
 
         ensure_pd_prefill(&pg.worker)?;
         ensure_pd_decode(&dg.worker)?;
+        let remote_prefill = matches!(pg.worker, IterWorkerSel::RemoteCachePdPrefill { .. });
+        let remote_decode = matches!(dg.worker, IterWorkerSel::RemoteCachePdDecode { .. });
+        ensure!(
+            remote_prefill == remote_decode && remote_prefill == cfg.kv_store.is_some(),
+            "pd: kv_store requires both remote_cache_pd_prefill and remote_cache_pd_decode"
+        );
+        if let Some(spec) = &cfg.kv_store {
+            spec.validate(1)?;
+        }
 
         // Prefill and decode must point at the same model config path for the
         // handed-off KV to be meaningful. The arch match below decides which
@@ -121,7 +134,8 @@ impl Deployment for PdDeployment {
                         bridge,
                     )?)
                 };
-                Ok(assemble_pd_flow(
+                assemble_pd_flow(
+                    cfg.kv_store.as_ref(),
                     prefill_model,
                     decode_model,
                     store,
@@ -133,7 +147,7 @@ impl Deployment for PdDeployment {
                     prefill_cfg,
                     decode_cfg,
                     cost,
-                ))
+                )
             }
             // Cross-arch PD: TP prefill hands off to a DP-attention decode. Same
             // llama3 weights, only the parallel layout differs (the KV is logically
@@ -169,7 +183,8 @@ impl Deployment for PdDeployment {
                         bridge,
                     )?)
                 };
-                Ok(assemble_pd_flow(
+                assemble_pd_flow(
+                    cfg.kv_store.as_ref(),
                     prefill_model,
                     decode_model,
                     store,
@@ -181,7 +196,7 @@ impl Deployment for PdDeployment {
                     prefill_cfg,
                     decode_cfg,
                     cost,
-                ))
+                )
             }
             (p, d) => bail!(
                 "pd: unsupported prefill/decode arch pairing \
@@ -208,14 +223,14 @@ fn single_group<'a>(
 
 fn ensure_pd_prefill(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
-        IterWorkerSel::PdPrefill { .. } => Ok(()),
+        IterWorkerSel::PdPrefill { .. } | IterWorkerSel::RemoteCachePdPrefill { .. } => Ok(()),
         other => bail!("pd: prefill pool requires worker `pd_prefill`, got {other:?}"),
     }
 }
 
 fn ensure_pd_decode(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
-        IterWorkerSel::PdDecode { .. } => Ok(()),
+        IterWorkerSel::PdDecode { .. } | IterWorkerSel::RemoteCachePdDecode { .. } => Ok(()),
         other => bail!("pd: decode pool requires worker `pd_decode`, got {other:?}"),
     }
 }
@@ -228,7 +243,15 @@ fn worker_config(
     kv_log_stride: u32,
 ) -> anyhow::Result<WorkerConfig> {
     let (attn_gpu_memory_gb, gpu_time_multiplier, prefix_cache) = match worker {
-        IterWorkerSel::PdPrefill {
+        IterWorkerSel::RemoteCachePdPrefill {
+            attn_gpu_memory_gb,
+            gpu_time_multiplier,
+            prefix_cache_mode,
+            prefix_cache_policy,
+            prefix_cache_max_gpu_memory_gb,
+            ..
+        }
+        | IterWorkerSel::PdPrefill {
             attn_gpu_memory_gb,
             gpu_time_multiplier,
             prefix_cache_mode,
@@ -245,7 +268,11 @@ fn worker_config(
                 *attn_gpu_memory_gb,
             )?,
         ),
-        IterWorkerSel::PdDecode {
+        IterWorkerSel::RemoteCachePdDecode {
+            attn_gpu_memory_gb,
+            gpu_time_multiplier,
+        }
+        | IterWorkerSel::PdDecode {
             attn_gpu_memory_gb,
             gpu_time_multiplier,
         } => (
@@ -272,7 +299,27 @@ fn worker_config(
             )?,
         ),
     };
+    let (max_inflight_remote_reads, max_batch_tokens, pending_order) = match worker {
+        IterWorkerSel::RemoteCachePdPrefill {
+            max_inflight_remote_reads,
+            max_batch_tokens,
+            pending_order,
+            ..
+        } => (
+            *max_inflight_remote_reads,
+            *max_batch_tokens,
+            *pending_order,
+        ),
+        _ => (16, None, crate::worker::PendingOrderKind::default()),
+    };
+    ensure!(
+        max_inflight_remote_reads > 0,
+        "max_inflight_remote_reads must be positive"
+    );
     Ok(WorkerConfig {
+        max_inflight_remote_reads,
+        max_batch_tokens,
+        pending_order,
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
         log_stage_transitions,
@@ -300,6 +347,7 @@ fn pool_cfg(
 /// `PdDecodeWorker`. The returned `Box<dyn Flow>` is the only `dyn` erasure point.
 #[allow(clippy::too_many_arguments)]
 fn assemble_pd_flow<MP, MD>(
+    kv_store: Option<&KvStorePoolSpec>,
     prefill_model: Arc<MP>,
     decode_model: Arc<MD>,
     store: SharedRequests,
@@ -311,7 +359,7 @@ fn assemble_pd_flow<MP, MD>(
     prefill_cfg: SimpleDpPoolConfig,
     decode_cfg: SimpleDpPoolConfig,
     cost: CostSource,
-) -> Box<dyn Flow>
+) -> anyhow::Result<Box<dyn Flow>>
 where
     MP: IterwiseUnifiedModel + 'static,
     MD: IterwiseUnifiedModel + 'static,
@@ -319,6 +367,38 @@ where
     // Kept for the post-build `attach_logger` — `log_dir` itself is moved into the
     // two worker factories below (each opens its own per-worker `cost_log`).
     let net_log_dir = log_dir.clone();
+    if let Some(spec) = kv_store {
+        let bytes = prefill_model.total_kv_bytes_per_token();
+        ensure!(
+            bytes == decode_model.total_kv_bytes_per_token(),
+            "PD relay KV layouts must match"
+        );
+        spec.validate(bytes)?;
+        let pf = UnifiedWorkerFactory::new(
+            prefill_model,
+            store.clone(),
+            prefill_wc,
+            log_dir.clone(),
+            prefill_gpu_name,
+            "prefill",
+            build_remote_cache_pd_prefill_worker::<MP>,
+        );
+        let df = UnifiedWorkerFactory::new(
+            decode_model,
+            store,
+            decode_wc,
+            log_dir,
+            decode_gpu_name,
+            "decode",
+            build_remote_cache_pd_decode_worker::<MD>,
+        );
+        let mut flow = KvStorePdFlow::new(&prefill_cfg, &pf, &decode_cfg, &df, spec, bytes, cost);
+        if let Some(dir) = net_log_dir {
+            flow.attach_logger(&dir);
+        }
+        return Ok(Box::new(flow));
+    }
+
     let prefill_factory: UnifiedWorkerFactory<MP, PdPrefillWorker<MP>> = UnifiedWorkerFactory::new(
         prefill_model,
         std::rc::Rc::clone(&store),
@@ -350,7 +430,7 @@ where
     if let Some(dir) = net_log_dir.as_deref() {
         flow.cluster().borrow_mut().attach_logger(dir);
     }
-    Box::new(flow)
+    Ok(Box::new(flow))
 }
 
 /// Build the PD KV-transfer cost source: the profiled `p2p_inter` curve for the

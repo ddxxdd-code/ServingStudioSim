@@ -1,8 +1,9 @@
 //! Session-scoped retained KV for autoregressive prefix reuse.
 //!
 //! Entries are count-only because traces carry token counts, not token content.
-//! A lookup is destructive: retained KV ownership moves to the admitted request,
-//! so this cache never models inter-request sharing or ref-counted prefix pages.
+//! Local admission uses destructive `take`; a remote store uses `copy` and may
+//! pin a relay entry until its receiver consumes it. Neither path models pages
+//! or general reference counting.
 //!
 //! ## Reuse quantum
 //!
@@ -110,6 +111,7 @@ impl PrefixCacheConfig {
 
 #[derive(Clone, Copy, Debug)]
 struct PrefixEntry {
+    pinned: bool,
     tokens: u64,
     insertion_sequence: u64,
     last_access_sequence: u64,
@@ -244,10 +246,41 @@ impl PrefixCache {
             .map(|entry| {
                 entry
                     .tokens
-                    .min(self.floor_to_quantum(u64::from(requested_tokens)))
-                    as u32
+                    .min(self.floor_to_quantum(u64::from(requested_tokens))) as u32
             })
             .unwrap_or(0)
+    }
+
+    /// Read without transferring ownership; refresh replacement-policy history.
+    pub(crate) fn copy(&mut self, session_id: u32, requested_tokens: u32) -> u32 {
+        let hit = self.peek(session_id, requested_tokens);
+        if hit > 0 {
+            let sequence = self.take_sequence();
+            let entry = self.entries.get_mut(&session_id).unwrap();
+            entry.last_access_sequence = sequence;
+            entry.frequency = entry.frequency.saturating_add(1);
+        }
+        hit
+    }
+
+    pub(crate) fn set_pinned(&mut self, session_id: u32, pinned: bool) {
+        if let Some(entry) = self.entries.get_mut(&session_id) {
+            entry.pinned = pinned;
+        }
+    }
+
+    pub(crate) fn is_pinned(&self, session_id: u32) -> bool {
+        self.entries
+            .get(&session_id)
+            .is_some_and(|entry| entry.pinned)
+    }
+
+    pub(crate) fn pinned_charge(&self) -> u64 {
+        self.entries
+            .values()
+            .filter(|entry| entry.pinned)
+            .map(|entry| self.charge_of(entry.tokens))
+            .sum()
     }
 
     /// Move one retained session into an active request.
@@ -286,6 +319,13 @@ impl PrefixCache {
         return_metadata: Option<PrefixCacheReturnMetadata>,
     ) -> PrefixCacheInsertResult {
         let mut mutations = Vec::new();
+        // A relay cannot be replaced until its consumer releases the pin.
+        if self.is_pinned(session_id) {
+            return PrefixCacheInsertResult {
+                mutations,
+                retained_tokens: 0,
+            };
+        }
         if let Some(mutation) =
             self.remove_with_receipt(session_id, PrefixCacheMutationKind::SameSessionReplacement)
         {
@@ -295,7 +335,10 @@ impl PrefixCache {
         mutations.extend(self.shrink_to(effective_capacity));
         // Only whole snapshots are resumable, so a tail shorter than one quantum
         // is dropped rather than retained as unusable KV.
-        let retained_tokens = self.largest_fitting_length(tokens, effective_capacity);
+        let retained_tokens = self.largest_fitting_length(
+            tokens,
+            effective_capacity.saturating_sub(self.pinned_charge()),
+        );
         if retained_tokens == 0 {
             return PrefixCacheInsertResult {
                 mutations,
@@ -322,6 +365,7 @@ impl PrefixCache {
         self.entries.insert(
             session_id,
             PrefixEntry {
+                pinned: false,
                 tokens: retained_tokens,
                 insertion_sequence,
                 last_access_sequence: sequence,
@@ -361,27 +405,22 @@ impl PrefixCache {
     }
 
     fn victim(&self) -> Option<u32> {
+        let eligible = || self.entries.iter().filter(|(_, entry)| !entry.pinned);
         match self.policy {
-            PrefixCachePolicy::Lru => self
-                .entries
-                .iter()
+            PrefixCachePolicy::Lru => eligible()
                 .min_by_key(|(session_id, entry)| (entry.last_access_sequence, **session_id)),
-            PrefixCachePolicy::Fifo => self
-                .entries
-                .iter()
+            PrefixCachePolicy::Fifo => eligible()
                 .min_by_key(|(session_id, entry)| (entry.insertion_sequence, **session_id)),
-            PrefixCachePolicy::Lfu => self.entries.iter().min_by_key(|(session_id, entry)| {
+            PrefixCachePolicy::Lfu => eligible().min_by_key(|(session_id, entry)| {
                 (entry.frequency, entry.insertion_sequence, **session_id)
             }),
-            PrefixCachePolicy::LargestFirst => {
-                self.entries.iter().min_by_key(|(session_id, entry)| {
-                    (
-                        std::cmp::Reverse(entry.tokens),
-                        entry.insertion_sequence,
-                        **session_id,
-                    )
-                })
-            }
+            PrefixCachePolicy::LargestFirst => eligible().min_by_key(|(session_id, entry)| {
+                (
+                    std::cmp::Reverse(entry.tokens),
+                    entry.insertion_sequence,
+                    **session_id,
+                )
+            }),
         }
         .map(|(session_id, _)| *session_id)
     }
@@ -460,7 +499,8 @@ mod tests {
 
     #[test]
     fn take_transfers_ownership_instead_of_sharing() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache =
+            PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
         cache.insert(7, 80, 100, None);
         assert_eq!(cache.take(7, 50).hit_tokens, 50);
         assert_eq!(cache.peek(7, 50), 0);
@@ -469,7 +509,8 @@ mod tests {
 
     #[test]
     fn lru_evicts_the_oldest_retained_session() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache =
+            PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
         cache.insert(1, 60, 100, None);
         cache.insert(2, 60, 100, None);
         assert_eq!(cache.peek(1, 60), 0);
@@ -478,7 +519,8 @@ mod tests {
 
     #[test]
     fn physical_slack_can_shrink_below_the_configured_ceiling() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Fifo, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache =
+            PrefixCache::new(100, PrefixCachePolicy::Fifo, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
         cache.insert(1, 40, 100, None);
         cache.insert(2, 40, 100, None);
         cache.shrink_to(40);
@@ -503,7 +545,12 @@ mod tests {
 
     #[test]
     fn largest_first_evicts_the_biggest_retained_session() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::LargestFirst, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache = PrefixCache::new(
+            100,
+            PrefixCachePolicy::LargestFirst,
+            TOKEN_QUANTUM,
+            NO_EXTRA_CHARGE,
+        );
         cache.insert(1, 70, 100, None);
         cache.insert(2, 20, 100, None);
         cache.insert(3, 30, 100, None);
@@ -514,7 +561,8 @@ mod tests {
 
     #[test]
     fn mutation_receipts_form_an_exact_occupancy_replay() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache =
+            PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
         let first_insert = cache.insert(1, 60, 100, None);
         let second_insert = cache.insert(2, 60, 100, None);
         let take = cache.take(2, 40);

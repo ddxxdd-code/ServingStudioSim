@@ -152,3 +152,8 @@ path), with a `"null"` fallback if serialization fails — never panicking the r
   with ZSTD).
 - **Consumer (downstream):** the standalone `analyzer` crate reads these parquet
   streams + JSON sidecars back (see `analyzer/README.md`).
+
+## Distributed KV cache
+
+See [distributed KV](../../../doc/distributed_kv.md) for the opt-in DRAM pool, remote worker selectors,
+push/read ownership, PD relay, capacity and logging contracts.

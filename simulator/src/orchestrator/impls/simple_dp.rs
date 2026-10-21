@@ -104,6 +104,13 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         }
     }
 
+    /// A protocol reply may start a transfer overlapping ongoing compute.
+    /// Existing direct-link callers retain their compute-bound wakeup behavior.
+    pub(crate) fn route_msg_now(&mut self, worker_id: WorkerId, msg: W::Msg) {
+        self.route_msg_to(worker_id, msg);
+        self.worker_wakeup_times[worker_id.0 as usize] = Time::ZERO;
+    }
+
     fn choose_worker_idx(&mut self) -> usize {
         match self.placement {
             DpPlacementPolicy::LeastQueued => self.choose_least_queued_idx(),

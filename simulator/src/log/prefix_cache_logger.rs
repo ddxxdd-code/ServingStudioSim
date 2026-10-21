@@ -38,6 +38,7 @@ pub enum PrefixCacheEvictionReason {
 /// Why an active request returned its context to the retained cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixCacheRetentionReason {
+    RemoteRead,
     RequestComplete,
     HandoffComplete,
     NoCacheCapacity,
@@ -75,6 +76,7 @@ impl PrefixCacheEventKind {
             }
             Self::Retain(PrefixCacheRetentionReason::RequestComplete) => "request-complete",
             Self::Retain(PrefixCacheRetentionReason::HandoffComplete) => "handoff-complete",
+            Self::Retain(PrefixCacheRetentionReason::RemoteRead) => "remote-read",
             Self::Retain(PrefixCacheRetentionReason::NoCacheCapacity) => "no-cache-capacity",
         }
     }

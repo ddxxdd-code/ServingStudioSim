@@ -21,6 +21,55 @@ use crate::log::schemas::{
 };
 use crate::timing::SlotInput;
 
+#[derive(Default)]
+pub(crate) struct KvStoreEventEntry {
+    pub sequence: u64,
+    pub time_ms: f64,
+    pub store_worker: u16,
+    pub request_id: u32,
+    pub session_id: u32,
+    pub operation: &'static str,
+    pub reason: &'static str,
+    pub entry_tokens_before: u64,
+    pub entry_tokens_after: u64,
+    pub cache_used_before: u64,
+    pub cache_used_after: u64,
+    pub requested_tokens: u64,
+    pub hit_tokens: u64,
+    pub placement_policy: Option<&'static str>,
+    pub send_backlog_ms: Option<f64>,
+    pub occupancy_ratio: Option<f64>,
+}
+pub(crate) fn kv_store_event_to_record_batch(rows: &[KvStoreEventEntry]) -> Result<RecordBatch> {
+    macro_rules! col {
+        ($ty:ident, $field:ident) => {
+            Arc::new($ty::from(rows.iter().map(|r| r.$field).collect::<Vec<_>>()))
+                as arrow_array::ArrayRef
+        };
+    }
+    Ok(RecordBatch::try_new(
+        crate::log::schemas::kv_store_event_schema(),
+        vec![
+            col!(UInt64Array, sequence),
+            col!(Float64Array, time_ms),
+            col!(UInt16Array, store_worker),
+            col!(UInt32Array, request_id),
+            col!(UInt32Array, session_id),
+            col!(StringArray, operation),
+            col!(StringArray, reason),
+            col!(UInt64Array, entry_tokens_before),
+            col!(UInt64Array, entry_tokens_after),
+            col!(UInt64Array, cache_used_before),
+            col!(UInt64Array, cache_used_after),
+            col!(UInt64Array, requested_tokens),
+            col!(UInt64Array, hit_tokens),
+            col!(StringArray, placement_policy),
+            col!(Float64Array, send_backlog_ms),
+            col!(Float64Array, occupancy_ratio),
+        ],
+    )?)
+}
+
 /// One `request_state` row — an **aggregate** over the admitted set at one
 /// snapshot tick (`logging_time_ms`), not a per-request row. `*_tokens_cum` are
 /// the cumulative prefill/decode token totals across all admitted requests; the
