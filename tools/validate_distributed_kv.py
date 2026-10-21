@@ -31,6 +31,7 @@ def audit_protocol(
     require([r["sequence"] for r in rows] == list(range(len(rows))), "event sequence gap")
     by_req = {r["request_id"]: r for r in requests}
     pins, cache, reserves, reads, completed = {}, {}, {}, {}, set()
+    pushes = {}
     transfers = []
     for row in rows:
         op, req = row["operation"], row["request_id"]
@@ -38,9 +39,22 @@ def audit_protocol(
         key = (store, row["session_id"])
         if op == "pin":
             require(key not in pins, "relay pinned twice")
+            push = pushes.get((store, req))
+            require(
+                push is not None and push["transfer_end_ms"] <= row["time_ms"],
+                "relay pinned before push lands",
+            )
             pins[key] = req
         elif op == "unpin":
             require(pins.pop(key, None) == req, "stale/unmatched unpin")
+            read = reads.get(req)
+            require(
+                read is not None
+                and read["store_worker"] == store
+                and read["destination_pool"] == "decode"
+                and read["transfer_end_ms"] <= row["time_ms"],
+                "relay unpinned before matching read lands",
+            )
         elif op in ("retain", "evict"):
             require(op != "evict" or key not in pins, "pinned entry evicted")
             before, after = row["cache_used_before"], row["cache_used_after"]
@@ -68,6 +82,7 @@ def audit_protocol(
                     reserves.get((store, req), row["sequence"]) < row["sequence"],
                     "push submitted before reservation",
                 )
+                pushes[(store, req)] = row
             else:
                 reads[req] = row
                 if row["destination_pool"] == "decode":
@@ -140,7 +155,18 @@ def audit_run(run: Path) -> dict:
         summary["sim_ms"] == max(r["logging_time"] for r in requests), "foreground horizon changed"
     )
     meta = read_json(run / "raw/run_meta.json")
-    for path in (run / "raw/kv_snapshot").glob("*.parquet"):
+    snapshot_paths = list((run / "raw/kv_snapshot").glob("*.parquet"))
+    expected_snapshots = {
+        f"worker_{worker['pool_tag']}_{worker['worker_id']}.parquet"
+        for worker in meta["workers"]
+        if worker["pool_tag"] != "kv_store" and worker.get("kv_pools")
+    }
+    require(bool(expected_snapshots), "no compute KV workers in metadata")
+    require(
+        expected_snapshots <= {path.name for path in snapshot_paths},
+        "missing compute KV snapshot stream",
+    )
+    for path in snapshot_paths:
         table = pq.ParquetFile(path).read()
         require(
             {"held_kv", "non_cache_kv"} <= set(table.column_names), "missing held/non-cache metrics"
@@ -151,13 +177,15 @@ def audit_run(run: Path) -> dict:
                 "invalid independent KV maxima",
             )
     event_file = run / "raw/kv_store_event.parquet"
-    if not event_file.exists():
-        return {"run": str(run), "requests": len(requests), "remote": False}
     capacities = {
         w["worker_id"]: sum(p["capacity_tokens"] for p in w["kv_pools"])
         for w in meta["workers"]
         if w["pool_tag"] == "kv_store"
     }
+    if not capacities:
+        require(not event_file.exists(), "store events without store workers in metadata")
+        return {"run": str(run), "requests": len(requests), "remote": False}
+    require(event_file.is_file(), "missing remote store event stream")
     result = audit_protocol(
         pq.ParquetFile(event_file).read().to_pylist(),
         requests,

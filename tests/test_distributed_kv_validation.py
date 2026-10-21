@@ -7,7 +7,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from tools.validate_distributed_kv import audit_protocol, compare_store_off
+from tools.validate_distributed_kv import audit_protocol, audit_run, compare_store_off
 
 
 def protocol():
@@ -33,7 +33,7 @@ def protocol():
             entry_tokens_before=0,
             entry_tokens_after=80,
         ),
-        dict(common, operation="pin"),
+        dict(common, operation="pin", time_ms=2.0),
         dict(
             common,
             operation="transfer",
@@ -45,7 +45,7 @@ def protocol():
             source_pool="kv_store",
             destination_pool="decode",
         ),
-        dict(common, operation="unpin"),
+        dict(common, operation="unpin", time_ms=3.0),
         dict(common, operation="request-complete", time_ms=4.0),
     ]
     for i, row in enumerate(rows):
@@ -90,6 +90,8 @@ def test_protocol_audit_accepts_balanced_relay():
         ("capacity", "capacity exceeded"),
         ("reservation", "before reservation"),
         ("early_decode", "before read lands"),
+        ("early_pin", "before push lands"),
+        ("early_unpin", "before matching read lands"),
         ("stale_unpin", "stale/unmatched"),
         ("receipt", "conservation"),
         ("endpoint", "endpoint pool"),
@@ -104,6 +106,10 @@ def test_protocol_audit_rejects_corruption(fault, message):
         rows[0]["operation"] = "placement"
     elif fault == "early_decode":
         requests[0]["stage_times_ms"] = [2.0]
+    elif fault == "early_pin":
+        rows[3]["time_ms"] = 1.5
+    elif fault == "early_unpin":
+        rows[5]["time_ms"] = 2.5
     elif fault == "stale_unpin":
         rows[5]["request_id"] = 9
     elif fault == "receipt":
@@ -114,6 +120,45 @@ def test_protocol_audit_rejects_corruption(fault, message):
         rows[-1]["time_ms"] = 5.0
     with pytest.raises(ValueError, match=message):
         audit_protocol(rows, requests, network, capacities)
+
+
+@pytest.mark.parametrize(
+    "missing, message",
+    [
+        ("kv_store_event.parquet", "missing remote store event stream"),
+        ("kv_snapshot/worker_decode_0.parquet", "missing compute KV snapshot stream"),
+    ],
+)
+def test_completed_marker_cannot_hide_missing_required_streams(tmp_path, missing, message):
+    rows, requests, network, capacities = protocol()
+    requests[0]["completed"] = True
+    raw = tmp_path / "raw"
+    (raw / "kv_snapshot").mkdir(parents=True)
+    (tmp_path / ".complete").touch()
+    (tmp_path / "summary.json").write_text(json.dumps(dict(sim_ms=4.0)))
+    workers = [dict(worker_id=0, pool_tag="decode", kv_pools=[dict(capacity_tokens=100)])]
+    workers += [
+        dict(worker_id=store, pool_tag="kv_store", kv_pools=[dict(capacity_tokens=capacity)])
+        for store, capacity in capacities.items()
+    ]
+    (raw / "run_meta.json").write_text(json.dumps(dict(workers=workers)))
+    for name, records in [
+        ("request_slo.parquet", requests),
+        ("kv_store_event.parquet", rows),
+        ("gpu_cluster.parquet", network),
+    ]:
+        # Explicit union: protocol rows are sparse and Arrow otherwise infers
+        # column names from only the first row.
+        keys = sorted(set().union(*(row.keys() for row in records)))
+        pq.write_table(pa.table({key: [r.get(key) for r in records] for key in keys}), raw / name)
+    pq.write_table(
+        pa.table(dict(active_kv=[80], held_kv=[0], non_cache_kv=[80])),
+        raw / "kv_snapshot/worker_decode_0.parquet",
+    )
+    assert audit_run(tmp_path)["remote"]
+    (raw / missing).unlink()
+    with pytest.raises(ValueError, match=message):
+        audit_run(tmp_path)
 
 
 def test_equivalence_allows_only_documented_additions(tmp_path):

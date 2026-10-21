@@ -270,7 +270,10 @@ uv run python tools/validate_distributed_kv.py pair <direct-run> <remote-run>
 ```
 
 The audit replays capacity receipts, reservations, pin identities, read/decode
-dependencies, transfer endpoints and foreground completion. CI exercises these
+dependencies, transfer endpoints and foreground completion. It checks that relay
+pins follow push landing and unpins follow the matching decode read landing.
+It requires the compute KV streams and, when metadata lists store workers, the
+store-event stream; a completion marker cannot hide missing logs. CI exercises these
 checks with valid and deliberately corrupted evidence; the profile-backed
 performance matrix remains a separate gate requiring a populated profile DB.
 The pair command verifies workload/model/placement equality and compares
@@ -337,3 +340,8 @@ DeepGEMM dependency installation because `CUDA_HOME` is absent. A CUDA/profile
 host must complete those gates before claiming full issue acceptance. The new
 GitHub workflow is committed and its commands passed locally; a hosted CI run
 requires pushing the branch.
+
+The CPU CI commands also passed in a separate Python environment containing
+only pytest, PyArrow, PyYAML and asteval (no Torch or Transformers). Subsequent
+audit hardening passed 13 Python tests, including missing-stream and early
+pin/unpin counterexamples, and all 37 existing runs passed the stronger audit.
