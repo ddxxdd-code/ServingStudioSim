@@ -38,6 +38,8 @@ pub(crate) struct KvStoreEventEntry {
     pub hit_tokens: u64,
     pub placement_policy: Option<&'static str>,
     pub send_backlog_ms: Option<f64>,
+    pub recv_backlog_ms: Option<f64>,
+    pub backlog_weight_per_ms: Option<f64>,
     pub occupancy_ratio: Option<f64>,
     pub reserved_tokens: Option<u64>,
     pub pinned_tokens: Option<u64>,
@@ -86,6 +88,8 @@ pub(crate) fn kv_store_event_to_record_batch(rows: &[KvStoreEventEntry]) -> Resu
             col!(UInt64Array, local_hit_tokens),
             col!(UInt64Array, remote_hit_tokens),
             col!(UInt64Array, background_writes),
+            col!(Float64Array, recv_backlog_ms),
+            col!(Float64Array, backlog_weight_per_ms),
         ],
     )?)
 }
@@ -545,6 +549,10 @@ pub struct KvSnapshotEntry {
     pub active_kv: u64,
     /// Prefix-cache component captured at the same submit that set `active_kv`.
     pub retained_prefix_kv: u64,
+    /// Independent window maximum of transfer-source held KV.
+    pub held_kv: u64,
+    /// Independent window maximum of resident + held KV, excluding retained cache.
+    pub non_cache_kv: u64,
     /// Peak KV the currently-admitted set will reach as it drains
     /// (the full-attention partition's projected-peak cache) — the "future estimate".
     pub projected_peak: u64,
@@ -567,6 +575,8 @@ pub(crate) fn kv_to_record_batch(
     let retained_prefix: Vec<u64> = entries.iter().map(|e| e.retained_prefix_kv).collect();
     let peak: Vec<u64> = entries.iter().map(|e| e.projected_peak).collect();
     let promised: Vec<u64> = entries.iter().map(|e| e.promised_kv).collect();
+    let held: Vec<u64> = entries.iter().map(|e| e.held_kv).collect();
+    let non_cache: Vec<u64> = entries.iter().map(|e| e.non_cache_kv).collect();
 
     Ok(RecordBatch::try_new(
         kv_snapshot_schema(),
@@ -579,6 +589,8 @@ pub(crate) fn kv_to_record_batch(
             Arc::new(UInt64Array::from(retained_prefix)),
             Arc::new(UInt64Array::from(peak)),
             Arc::new(UInt64Array::from(promised)),
+            Arc::new(UInt64Array::from(held)),
+            Arc::new(UInt64Array::from(non_cache)),
         ],
     )?)
 }

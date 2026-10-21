@@ -457,6 +457,7 @@ mod tests {
             worker: Default::default(),
             replicas: 2,
             dram_gb: 0.000001,
+            backlog_weight_per_ms: 1.0,
             bandwidth_gbps: 0.001,
             latency_us: 100.0,
             placement: KvStorePlacement::RoundRobin,

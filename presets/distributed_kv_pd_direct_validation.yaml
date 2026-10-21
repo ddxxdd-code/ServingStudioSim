@@ -47,3 +47,6 @@ compound:
     no_reuse:
       trace: tests/fixtures/distributed_kv_conversations_no_reuse.csv
       tick: 1
+    load64:
+      trace: tests/fixtures/distributed_kv_load.csv
+      tick: 1

@@ -1,0 +1,36 @@
+# Pair with distributed_kv_unified_direct_validation.yaml; only store/worker differ.
+deployment: unified
+workload:
+  trace_files: ["${trace}"]
+  input_file_format: text-generation-session-execution-v2
+  arrival_mode: trace_timed
+  session_dependency: chained
+  run_to_end: true
+  request_rate: 1.0
+  tick_dt_us: 1
+io:
+  log_dir: logs/distributed_kv_validation/unified_remote/{case}
+pools:
+  main:
+    placement: round-robin
+    groups:
+    - gpu: NVIDIA H200
+      replicas: 2
+      arch:
+        type: llama3_dense
+        model_config: model/config/llama3_8b.json
+      worker:
+        type: remote_cache_unified
+kv_store:
+  worker: distributed_kv_store
+  replicas: 2
+  dram_gb: 64
+  bandwidth_gbps: 25
+  latency_us: 10
+  placement: least-loaded
+  backlog_weight_per_ms: 1.0
+  policy: lru
+compound:
+  case:
+    baseline: {trace: tests/fixtures/distributed_kv.csv}
+    load64: {trace: tests/fixtures/distributed_kv_load.csv}

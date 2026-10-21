@@ -108,8 +108,34 @@ impl<P: PendingOrderPolicy> RemotePrefillState<P> {
             ));
         }
     }
-    pub(super) fn take_read(&mut self) -> Option<(RequestId, RemoteReadPlan)> {
-        self.reads.pop_front()
+    pub(super) fn take_read(&mut self, kv: &impl PrefixKv) -> Option<(RequestId, RemoteReadPlan)> {
+        while let Some((req, plan)) = self.reads.pop_front() {
+            let Some(selected) = self.selected.get_mut(&req) else {
+                continue;
+            };
+            let candidate = selected.candidate;
+            if let Some(partition) = kv.retained_prefix_partition(candidate.session_input) {
+                selected.partition = partition;
+            }
+            let local = kv.preview_prefill_context(
+                selected.partition,
+                candidate.fresh_prompt_tokens,
+                candidate.session_input,
+            );
+            let usable_remote = selected.read_tokens.saturating_sub(u32::from(
+                candidate.fresh_prompt_tokens == 0
+                    && selected.read_tokens == candidate.session_input.declared_prefix_tokens(),
+            ));
+            // Recheck immediately before submission: a local completion may have
+            // grown the prefix while the directory reply or read plan was queued.
+            if local.resident_prefix_tokens() >= usable_remote {
+                selected.read_tokens = 0;
+                self.ready.push_back(req);
+                continue;
+            }
+            return Some((req, plan));
+        }
+        None
     }
     pub(super) fn read_landed(&mut self, kv: &mut impl RemotePrefixKv, req: RequestId, now: Time) {
         let Some(selected) = self.selected.get_mut(&req) else {

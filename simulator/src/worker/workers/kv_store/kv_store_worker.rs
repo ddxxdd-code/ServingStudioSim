@@ -349,4 +349,7 @@ impl KvStoreLoad for KvStoreWorker {
     fn send_backlog(&self, now: Time) -> Time {
         self.cluster.borrow().send_backlog(self.group, now)
     }
+    fn recv_backlog(&self, now: Time) -> Time {
+        self.cluster.borrow().recv_backlog(self.group, now)
+    }
 }

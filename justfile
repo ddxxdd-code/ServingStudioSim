@@ -57,3 +57,13 @@ test-all: test-cpu test-gpu
 # (Re)record per-GPU goldens for throughput + sim-speed on this device.
 update-golden: sync
     uv run --no-sync pytest -m "gpu or bench" --update-golden
+
+# CUDA/profile-independent protocol gate; uses an already prepared CPU env.
+# Includes the real remote-admission always-miss shell equivalence test.
+test-distributed-kv:
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib remote_cache
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib kv_store
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib worker::kv::full_attn
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib log::kv_sampler
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib sim::run
+    uv run --no-sync python -m pytest tests/test_distributed_kv_validation.py -q

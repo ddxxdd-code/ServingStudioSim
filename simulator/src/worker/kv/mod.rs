@@ -244,6 +244,8 @@ pub trait RemotePrefixKv: PrefixKv + HandoffKv {
         session: SessionInput,
         hit: u32,
     ) -> u32;
+    /// Release the source and restore a truncated local copy only while this
+    /// request still owns its return right; later session use revokes that right.
     fn complete_push(&mut self, request: RequestId, now: Time);
     fn cancel_remote(&mut self, request: RequestId, now: Time);
 }

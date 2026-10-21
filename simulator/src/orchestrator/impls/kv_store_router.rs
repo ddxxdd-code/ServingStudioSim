@@ -30,6 +30,7 @@ pub(crate) struct KvStoreRouter {
     pushes: HashMap<RequestId, PendingPush>,
     cancelled: HashSet<RequestId>,
     placement: KvStorePlacement,
+    backlog_weight_per_ms: f64,
     next: usize,
     replies: Vec<KvStoreEvent>,
 }
@@ -62,6 +63,7 @@ impl KvStoreRouter {
             pushes: HashMap::new(),
             cancelled: HashSet::new(),
             placement: spec.placement,
+            backlog_weight_per_ms: spec.backlog_weight_per_ms,
             next: 0,
             replies: Vec::new(),
         }
@@ -127,12 +129,12 @@ impl KvStoreRouter {
         let mut candidates: Vec<_> = (0..count).map(|offset| (start + offset) % count).collect();
         if self.placement == KvStorePlacement::LeastLoaded {
             candidates.sort_by(|&a, &b| {
-                // First-cut heuristic: occupancy ratio + sender backlog in ms.
+                // Explicit heuristic: occupancy ratio + weighted receive backlog.
                 // Capacity is checked authoritatively by each store at reservation.
                 let score = |i: usize| {
                     self.workers[i].used_tokens() as f64
                         / self.workers[i].capacity_tokens().max(1) as f64
-                        + self.workers[i].send_backlog(now).as_ms()
+                        + self.backlog_weight_per_ms * self.workers[i].recv_backlog(now).as_ms()
                 };
                 score(a).total_cmp(&score(b)).then(a.cmp(&b))
             });
@@ -192,6 +194,8 @@ impl KvStoreRouter {
                     KvStorePlacement::SessionHash => "session-hash",
                 }),
                 send_backlog_ms: Some(self.workers[index].send_backlog(now).as_ms()),
+                recv_backlog_ms: Some(self.workers[index].recv_backlog(now).as_ms()),
+                backlog_weight_per_ms: Some(self.backlog_weight_per_ms),
                 occupancy_ratio: Some(
                     self.workers[index].used_tokens() as f64
                         / self.workers[index].capacity_tokens() as f64,
@@ -298,6 +302,7 @@ mod tests {
                 worker: Default::default(),
                 replicas: 2,
                 dram_gb: 0.001,
+                backlog_weight_per_ms: 1.0,
                 bandwidth_gbps: 1.0,
                 latency_us: 1.0,
                 placement: KvStorePlacement::LeastLoaded,
@@ -317,6 +322,7 @@ mod tests {
                 worker: Default::default(),
                 replicas: 1,
                 dram_gb: 0.001,
+                backlog_weight_per_ms: 1.0,
                 bandwidth_gbps: 1.0,
                 latency_us: 0.0,
                 placement: KvStorePlacement::LeastLoaded,
@@ -366,6 +372,7 @@ mod tests {
                 worker: Default::default(),
                 replicas: 2,
                 dram_gb: 0.0000001,
+                backlog_weight_per_ms: 1.0,
                 bandwidth_gbps: 1.0,
                 latency_us: 0.0,
                 placement: KvStorePlacement::SessionHash,
@@ -432,6 +439,7 @@ mod tests {
                 worker: Default::default(),
                 replicas: 1,
                 dram_gb: 0.0000001,
+                backlog_weight_per_ms: 1.0,
                 bandwidth_gbps: 1.0,
                 latency_us: 0.0,
                 placement: KvStorePlacement::LeastLoaded,
@@ -470,6 +478,264 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn stale_directory_lookup_returns_an_ordinary_zero_hit() {
+        let mut router = router();
+        router.directory.insert(
+            7,
+            KvLocation {
+                store: WorkerId(1),
+                tokens: 80,
+            },
+        );
+        router.lookup(WorkerId(3), RequestId(9), 7, 100);
+        assert!(router.wakeups[1].is_some());
+        assert!(matches!(
+            router.tick(Time::ZERO).as_slice(),
+            [KvStoreEvent::LookupResult {
+                store: WorkerId(1),
+                origin: WorkerId(3),
+                req: RequestId(9),
+                resident_tokens: 0,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn concurrent_copies_survive_eviction_and_writeback_during_the_other_read() {
+        use crate::common::{RequestStore, SessionInput};
+        use crate::test_helpers::{text_request, FakeModel};
+        use crate::worker::gpu_cluster::{CostSource, GpuCluster};
+        use crate::worker::types::{
+            RemoteCacheWorkerEvent as Event, RemoteCacheWorkerMsg as Msg, WorkerConfig,
+        };
+        use crate::worker::workers::remote_cache_iter::build_remote_cache_unified_worker;
+        use std::{cell::RefCell, rc::Rc, sync::Arc};
+        // One byte/ms makes both snapshot reads overlap a replacement push.
+        let cluster = Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(
+            0.000001,
+        ))));
+        let requests = Rc::new(RefCell::new(RequestStore::new()));
+        requests.borrow_mut().reserve_slots(3);
+        let mut workers: Vec<_> = (0..2)
+            .map(|id| {
+                let mut req =
+                    text_request(RequestId(id + 1), 10 * (id + 1), 1, Time::from_ms(100.0));
+                req.definition.session = SessionInput::Session {
+                    session_id: 7,
+                    declared_prefix_tokens: 80,
+                    session_start_time: Time::ZERO,
+                };
+                requests.borrow_mut().insert(req);
+                build_remote_cache_unified_worker(
+                    WorkerId(id as u16),
+                    "main",
+                    Arc::new(FakeModel::for_ms(1.0)),
+                    requests.clone(),
+                    WorkerConfig::default(),
+                    None,
+                    PoolId(0),
+                    "test",
+                    cluster.clone(),
+                )
+            })
+            .collect();
+        let seed_gpu = cluster.borrow_mut().allocate(9, 0, 1, "seed", "seed");
+        let seed_gid = cluster
+            .borrow_mut()
+            .register_comm_group(seed_gpu, 1, "seed", 0);
+        let mut router = KvStoreRouter::new(
+            &KvStorePoolSpec {
+                worker: Default::default(),
+                replicas: 1,
+                dram_gb: 0.0000001,
+                bandwidth_gbps: 0.000001,
+                latency_us: 0.0,
+                placement: KvStorePlacement::LeastLoaded,
+                backlog_weight_per_ms: 1.0,
+                policy: PrefixCachePolicy::Lru,
+            },
+            1,
+            &cluster,
+        );
+        router.push(
+            WorkerId(9),
+            RequestId(0),
+            7,
+            80,
+            seed_gid,
+            KvRetention::Shared,
+            Time::ZERO,
+        );
+        router.tick(Time::from_ms(100.0));
+        for (index, worker) in workers.iter_mut().enumerate() {
+            worker.enqueue(Msg::Request(RequestId(index as u32 + 1)));
+            let mut events = Vec::new();
+            worker.tick(Time::from_ms(100.0), &mut events);
+            for event in events {
+                let Event::KvLookup {
+                    worker,
+                    req,
+                    session,
+                    requested_tokens,
+                } = event
+                else {
+                    panic!("lookup expected")
+                };
+                router.lookup(worker, req, session, requested_tokens);
+            }
+        }
+        for event in router.tick(Time::from_ms(100.0)) {
+            let KvStoreEvent::LookupResult {
+                store,
+                origin,
+                req,
+                resident_tokens,
+                store_send_gid,
+            } = event
+            else {
+                panic!("lookup reply expected")
+            };
+            assert_eq!(resident_tokens, 80);
+            workers[origin.0 as usize].enqueue(Msg::KvLookupResult {
+                req,
+                resident_tokens,
+                store_send_gid,
+                store_worker: store,
+            });
+        }
+        for worker in &mut workers {
+            worker.tick(Time::from_ms(100.0), &mut Vec::new());
+        }
+        assert!(requests.borrow()[RequestId(1)]
+            .telemetry
+            .prefix_cache_hit_tokens
+            .is_none());
+        router.push(
+            WorkerId(9),
+            RequestId(99),
+            8,
+            80,
+            seed_gid,
+            KvRetention::Shared,
+            Time::from_ms(101.0),
+        );
+        assert!(
+            !router.directory.contains_key(&7),
+            "source evicted while both reads are in flight"
+        );
+        let mut wrote_during_second_read = false;
+        for ms in 102..650 {
+            let now = Time::from_ms(ms as f64);
+            for event in router.tick(now) {
+                if let KvStoreEvent::PushComplete {
+                    origin,
+                    req,
+                    tokens,
+                    ..
+                } = event
+                {
+                    if req.0 == 1 || req.0 == 2 {
+                        workers[origin.0 as usize].enqueue(Msg::KvPushComplete {
+                            req,
+                            tokens,
+                            at: now,
+                        });
+                    }
+                }
+            }
+            for worker in &mut workers {
+                let mut events = Vec::new();
+                worker.tick(now, &mut events);
+                for event in events {
+                    if let Event::KvPushOffer {
+                        worker,
+                        req,
+                        session,
+                        tokens,
+                        send_gid,
+                        retention,
+                    } = event
+                    {
+                        if req == RequestId(1) {
+                            wrote_during_second_read = requests.borrow()[RequestId(2)]
+                                .telemetry
+                                .prefix_cache_hit_tokens
+                                .is_none();
+                        }
+                        router.push(worker, req, session, tokens, send_gid, retention, now);
+                    }
+                }
+            }
+        }
+        assert!(wrote_during_second_read);
+        for id in 1..=2 {
+            let store = requests.borrow();
+            assert!(store[RequestId(id)].lifecycle.completed);
+            assert_eq!(
+                store[RequestId(id)].telemetry.prefix_cache_hit_tokens,
+                Some(80)
+            );
+            assert_eq!(
+                store[RequestId(id)].progress.prefill_tokens_processed,
+                id * 10
+            );
+        }
+        assert_eq!(router.directory[&7].tokens, 100);
+        assert_eq!(router.pending(), 0);
+    }
+
+    #[test]
+    fn push_placement_uses_configurable_receive_backlog_not_sender_backlog() {
+        // An incoming transfer occupies store 0's receive link; an outgoing
+        // transfer occupies store 1's send link. Equal empty stores isolate cost.
+        for (weight, expected) in [(0.0, 0), (1.0, 1), (10.0, 1)] {
+            let cluster = test_cluster();
+            let gpu = cluster.borrow_mut().allocate(0, 0, 2, "test", "main");
+            let send = cluster.borrow_mut().register_comm_group(gpu, 1, "main", 0);
+            let recv = cluster
+                .borrow_mut()
+                .register_comm_group(gpu + 1, 1, "main", 1);
+            let mut config = KvStorePoolSpec {
+                worker: Default::default(),
+                replicas: 2,
+                dram_gb: 0.001,
+                bandwidth_gbps: 1.0,
+                latency_us: 0.0,
+                placement: KvStorePlacement::LeastLoaded,
+                policy: PrefixCachePolicy::Lru,
+                backlog_weight_per_ms: weight,
+            };
+            for invalid in [-1.0, f64::INFINITY, f64::NAN] {
+                config.backlog_weight_per_ms = invalid;
+                assert!(config.validate(1).is_err());
+            }
+            config.backlog_weight_per_ms = weight;
+            let mut router = KvStoreRouter::new(&config, 1, &cluster);
+            // Construction appends exactly one communication group per store.
+            let store0 = 2;
+            let store1 = 3;
+            cluster
+                .borrow_mut()
+                .submit_transfer(Time::ZERO, send, store0, 1_000_000, "test", "");
+            cluster
+                .borrow_mut()
+                .submit_transfer(Time::ZERO, store1, recv, 1_000_000, "test", "");
+            router.push(
+                WorkerId(0),
+                RequestId(0),
+                7,
+                10,
+                send,
+                KvRetention::Shared,
+                Time::ZERO,
+            );
+            assert_eq!(router.workers[expected].used_tokens(), 10);
+            assert_eq!(router.workers[1 - expected].used_tokens(), 0);
+        }
     }
     #[test]
     fn stale_eviction_cannot_remove_newer_store_copy() {
@@ -514,6 +780,7 @@ mod tests {
                     worker: Default::default(),
                     replicas: 2,
                     dram_gb: 0.0000001,
+                    backlog_weight_per_ms: 1.0,
                     bandwidth_gbps: 1.0,
                     latency_us: 0.0,
                     placement,

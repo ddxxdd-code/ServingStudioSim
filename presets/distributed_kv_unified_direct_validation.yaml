@@ -1,0 +1,26 @@
+deployment: unified
+workload:
+  trace_files: ["${trace}"]
+  input_file_format: text-generation-session-execution-v2
+  arrival_mode: trace_timed
+  session_dependency: chained
+  run_to_end: true
+  request_rate: 1.0
+  tick_dt_us: 1
+io:
+  log_dir: logs/distributed_kv_validation/unified_direct/{case}
+pools:
+  main:
+    placement: round-robin
+    groups:
+    - gpu: NVIDIA H200
+      replicas: 2
+      arch:
+        type: llama3_dense
+        model_config: model/config/llama3_8b.json
+      worker:
+        type: barebone
+compound:
+  case:
+    baseline: {trace: tests/fixtures/distributed_kv.csv}
+    load64: {trace: tests/fixtures/distributed_kv_load.csv}

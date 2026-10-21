@@ -153,8 +153,8 @@ impl<P: PendingOrderPolicy, K: RemotePrefixKv> RemoteKvAdmission<K>
             });
         }
     }
-    fn take_read(&mut self) -> Option<(RequestId, RemoteReadPlan)> {
-        self.state.take_read()
+    fn take_read(&mut self, kv: &K) -> Option<(RequestId, RemoteReadPlan)> {
+        self.state.take_read(kv)
     }
     fn read_landed(&mut self, kv: &mut K, req: RequestId, now: Time) {
         self.state.read_landed(kv, req, now);

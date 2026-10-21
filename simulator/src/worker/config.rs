@@ -46,16 +46,16 @@ const PREFIX_CACHE_MODE_CHOICES: [&str; 2] = ["disabled", "opportunistic"];
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
+fn default_max_remote_reads() -> usize {
+    16
+}
+
 /// serde/param fallback for every worker selector's `gpu_time_multiplier`: 1.0
 /// = no inter-kernel overhead (kernel-folded time IS the wall time), so presets
 /// that omit the field keep their prior behavior. A worker scales the wall time
 /// it advances the clock by as `kernel_time * gpu_time_multiplier` (≥ 1.0);
 /// cost_log / manifest stay pre-scale (pure kernel), so the overhead surfaces as
 /// a gap between iter/section slices in the trace, never inside a kernel slice.
-fn default_max_remote_reads() -> usize {
-    16
-}
-
 fn default_gpu_time_multiplier() -> f64 {
     1.0
 }

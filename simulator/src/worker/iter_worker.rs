@@ -51,6 +51,7 @@ pub trait KvStoreLoad:
     fn capacity_tokens(&self) -> u64;
     fn available_pinned_tokens(&self) -> u64;
     fn send_backlog(&self, now: Time) -> Time;
+    fn recv_backlog(&self, now: Time) -> Time;
 }
 
 /// Extra L6-facing capability required by the AFD attention pool.

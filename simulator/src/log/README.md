@@ -93,11 +93,20 @@ throttle window's `active_kv` peak. Consequently every new-schema row satisfies
 `retained_prefix_kv <= active_kv`, and `active_kv - retained_prefix_kv` is the
 non-prefix committed occupancy represented by that sample.
 
+`held_kv` and `non_cache_kv` are separate running maxima over each throttle
+window. The former counts transfer-held source KV; the latter counts resident
+plus held KV excluding retained prefix entries. They need not peak at the same
+instant as `active_kv`, so do not derive simultaneous components by subtracting
+these independent maxima. Analyzer reports their raw peaks without chart-bin
+averaging; old logs expose these metrics as unavailable.
+
 `prefix_cache_event` is the non-sampled operation replay. A session request that
 successfully reserves KV emits `activate`: `hit` destructively transfers the
 whole retained entry to the active request, while `miss` records a resolved cold
-lookup. Request completion emits `retain`; PD prefill emits it only after the
-decode pull acknowledgement releases held source KV. Cache removals emit
+lookup. Request completion emits `retain`; direct PD prefill emits it after the
+decode pull acknowledgement releases held source KV. Remote push retains an
+evictable copy at offer time and may restore a capacity-truncated copy at ack
+if that session has not been activated or replaced in the meantime. Cache removals emit
 `evict`, with one of `active-kv-pressure`, `replacement-policy`,
 `retention-capacity`, or `same-session-replacement`. A completed session that
 cannot retain any KV still emits `retain/no-cache-capacity` with a zero-sized

@@ -1,0 +1,23 @@
+name: Distributed KV CPU regressions
+on: [pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=bfd
+    steps:
+      - uses: actions/checkout@v7
+      - run: git submodule update --init alignment/load_generator/req-frontend
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          python-version: '3.12'
+      - name: Install CPU-only validation dependencies
+        run: |
+          uv venv
+          uv pip install pytest pyarrow pyyaml asteval
+          cargo install just --locked
+      - name: Protocol, always-miss equivalence, and audit negative tests
+        run: just test-distributed-kv

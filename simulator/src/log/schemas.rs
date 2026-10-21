@@ -42,6 +42,8 @@ pub fn kv_store_event_schema() -> Arc<Schema> {
         Field::new("local_hit_tokens", DataType::UInt64, true),
         Field::new("remote_hit_tokens", DataType::UInt64, true),
         Field::new("background_writes", DataType::UInt64, true),
+        Field::new("recv_backlog_ms", DataType::Float64, true),
+        Field::new("backlog_weight_per_ms", DataType::Float64, true),
     ]))
 }
 
@@ -197,6 +199,9 @@ pub fn kv_snapshot_schema() -> Arc<Schema> {
         Field::new("retained_prefix_kv", DataType::UInt64, false),
         Field::new("projected_peak", DataType::UInt64, false),
         Field::new("promised_kv", DataType::UInt64, false),
+        // Independent window maxima, not components sampled at the total peak.
+        Field::new("held_kv", DataType::UInt64, false),
+        Field::new("non_cache_kv", DataType::UInt64, false),
     ]))
 }
 

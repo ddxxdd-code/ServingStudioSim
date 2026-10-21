@@ -301,6 +301,12 @@ impl GpuCluster {
         free.max(now) - now
     }
 
+    /// Receive-side queueing delay for incoming store placement.
+    pub fn recv_backlog(&self, gid: u16, now: Time) -> Time {
+        let free = self.groups[usize::from(gid)].recv_free;
+        free.max(now) - now
+    }
+
     /// Record the KV-pool token `capacity` of `(pool_tag, pool, worker_id,
     /// group_id)` — a static per-run fact the worker reports at construction, right
     /// after [`allocate`](GpuCluster::allocate). L7 folds these into

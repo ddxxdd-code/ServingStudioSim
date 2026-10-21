@@ -51,6 +51,10 @@ pub struct KvStorePoolSpec {
     #[serde(default)]
     #[param(string, default = "least-loaded", choices = KV_PLACEMENT_CHOICES)]
     pub placement: KvStorePlacement,
+    /// Occupancy-score penalty per millisecond of receive-link backlog.
+    #[serde(default = "default_backlog_weight")]
+    #[param(default = 1.0)]
+    pub backlog_weight_per_ms: f64,
     /// Eviction policy for shared entries only.
     #[serde(default)]
     #[param(string, default = "lru", choices = KV_EVICTION_CHOICES)]
@@ -60,9 +64,17 @@ const KV_PLACEMENT_CHOICES: [&str; 3] = ["least-loaded", "round-robin", "session
 const KV_STORE_WORKER_CHOICES: [&str; 1] = ["distributed_kv_store"];
 const KV_EVICTION_CHOICES: [&str; 4] = ["lru", "fifo", "lfu", "largest-first"];
 
+fn default_backlog_weight() -> f64 {
+    1.0
+}
+
 impl KvStorePoolSpec {
     pub fn validate(&self, bytes_per_token: u64) -> anyhow::Result<()> {
         anyhow::ensure!(self.replicas > 0, "kv_store.replicas must be positive");
+        anyhow::ensure!(
+            self.backlog_weight_per_ms.is_finite() && self.backlog_weight_per_ms >= 0.0,
+            "kv_store.backlog_weight_per_ms must be finite and nonnegative"
+        );
         anyhow::ensure!(
             self.dram_gb.is_finite()
                 && self.dram_gb > 0.0

@@ -41,6 +41,7 @@ kv_store:
   bandwidth_gbps: ${bandwidth}
   latency_us: ${latency}
   placement: ${placement}
+  backlog_weight_per_ms: ${backlog_weight}
   policy: lru
 compound:
   case:
@@ -50,6 +51,7 @@ compound:
       latency: 10
       bandwidth: 25
       placement: least-loaded
+      backlog_weight: 1.0
       reads: 16
       tick: 1
       trace: tests/fixtures/distributed_kv_conversations.csv
@@ -60,8 +62,11 @@ compound:
     bandwidth1: {<<: *baseline, bandwidth: 1}
     round_robin: {<<: *baseline, placement: round-robin}
     session_hash: {<<: *baseline, placement: session-hash}
+    backlog_weight0: {<<: *baseline, backlog_weight: 0.0}
+    backlog_weight10: {<<: *baseline, backlog_weight: 10.0}
     reads1: {<<: *baseline, reads: 1}
     reads32: {<<: *baseline, reads: 32}
     tick10us: {<<: *baseline, tick: 10}
     tick100us: {<<: *baseline, tick: 100}
     no_reuse: {<<: *baseline, trace: tests/fixtures/distributed_kv_conversations_no_reuse.csv}
+    load64: {<<: *baseline, trace: tests/fixtures/distributed_kv_load.csv}

@@ -56,6 +56,8 @@ struct Row {
     time_ms: f64,
     active_kv: f64,
     retained_prefix_kv: f64,
+    held_kv: f64,
+    non_cache_kv: f64,
     projected_peak: f64,
     promised_kv: f64,
 }
@@ -81,6 +83,8 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
     // consumers never mistake compatibility data for a measured zero.
     let has_retained_prefix_breakdown =
         has_column(ctx, KV_SNAPSHOT_TABLE, "retained_prefix_kv").await?;
+    let has_transfer_breakdown = has_column(ctx, KV_SNAPSHOT_TABLE, "held_kv").await?
+        && has_column(ctx, KV_SNAPSHOT_TABLE, "non_cache_kv").await?;
 
     // (pool_tag, group_id) → capacity_tokens. Shards of a pool are symmetric, so
     // one capacity per pool×group; take the max across shards defensively (they
@@ -93,7 +97,7 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
         }
     }
 
-    let rows = collect_rows(ctx, has_retained_prefix_breakdown).await?;
+    let rows = collect_rows(ctx, has_retained_prefix_breakdown, has_transfer_breakdown).await?;
     if rows.is_empty() {
         let reason = "kv_snapshot has no rows to bin";
         return Ok((
@@ -178,6 +182,8 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
                 "retained_prefix_tokens": retained_prefix,
                 "projected_tokens": projected,
                 "promised_tokens": promised,
+                "peak_held_tokens": has_transfer_breakdown.then(|| worker_rows.iter().map(|r| r.held_kv).fold(0.0, f64::max)),
+                "peak_non_cache_tokens": has_transfer_breakdown.then(|| worker_rows.iter().map(|r| r.non_cache_kv).fold(0.0, f64::max)),
             }));
             active_by_worker.push(active);
             retained_prefix_by_worker.push(retained_prefix);
@@ -259,6 +265,10 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
             "peak_projected_max_pct": percentage(peak_projected_max),
             "peak_promised_max_tokens": peak_promised_max,
             "peak_promised_max_pct": percentage(peak_promised_max),
+            // These raw window maxima are never re-binned/averaged: a short
+            // transfer hold must remain visible even inside a coarse chart bin.
+            "peak_held_max_tokens": has_transfer_breakdown.then(|| series_rows.iter().map(|r| r.held_kv).fold(0.0, f64::max)),
+            "peak_non_cache_max_tokens": has_transfer_breakdown.then(|| series_rows.iter().map(|r| r.non_cache_kv).fold(0.0, f64::max)),
         }));
     }
 
@@ -272,6 +282,7 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
             "span_ms": span_ms,
             "has_capacity": !capacity_by_pool.is_empty(),
             "has_retained_prefix_breakdown": has_retained_prefix_breakdown,
+            "has_transfer_breakdown": has_transfer_breakdown,
         },
         "available": true,
         "totals": {
@@ -287,6 +298,7 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
             "unit": "KV tokens (per shard); fraction = tokens / capacity_tokens",
             "has_capacity": !capacity_by_pool.is_empty(),
             "has_retained_prefix_breakdown": has_retained_prefix_breakdown,
+            "has_transfer_breakdown": has_transfer_breakdown,
         },
         "t_start_ms": t_start,
         "t_end_ms": t_end,
@@ -358,15 +370,21 @@ fn bin_mean(
 async fn collect_rows(
     ctx: &SessionContext,
     has_retained_prefix_breakdown: bool,
+    has_transfer_breakdown: bool,
 ) -> Result<Vec<Row>> {
     let retained_prefix_projection = if has_retained_prefix_breakdown {
         "retained_prefix_kv"
     } else {
         "CAST(0 AS BIGINT) AS retained_prefix_kv"
     };
+    let transfer_projection = if has_transfer_breakdown {
+        "held_kv, non_cache_kv"
+    } else {
+        "CAST(0 AS BIGINT) AS held_kv, CAST(0 AS BIGINT) AS non_cache_kv"
+    };
     let sql = format!(
         "SELECT arrow_cast(pool_tag, 'Utf8') AS pool_tag, group_id, worker_id, time_ms, \
-                active_kv, {retained_prefix_projection}, projected_peak, promised_kv \
+                active_kv, {retained_prefix_projection}, projected_peak, promised_kv, {transfer_projection} \
          FROM kv_snapshot"
     );
     let batches = collect(ctx, &sql).await?;
@@ -381,6 +399,8 @@ async fn collect_rows(
         let times_ms = column_f64(col(batch, "time_ms")?)?;
         let active_kv = column_f64(col(batch, "active_kv")?)?;
         let retained_prefix = column_f64(col(batch, "retained_prefix_kv")?)?;
+        let held = column_f64(col(batch, "held_kv")?)?;
+        let non_cache = column_f64(col(batch, "non_cache_kv")?)?;
         let projected_peak = column_f64(col(batch, "projected_peak")?)?;
         let promised = column_f64(col(batch, "promised_kv")?)?;
         for row in 0..batch.num_rows() {
@@ -396,6 +416,8 @@ async fn collect_rows(
                 time_ms: times_ms[row],
                 active_kv: active_kv[row],
                 retained_prefix_kv: retained_prefix[row],
+                held_kv: held[row],
+                non_cache_kv: non_cache[row],
                 projected_peak: projected_peak[row],
                 promised_kv: promised[row],
             });
@@ -420,6 +442,9 @@ fn definitions() -> Value {
         "active_tokens": "resident/committed KV — the CURRENT occupancy, including retained prefix-cache entries",
         "retained_prefix_tokens": "prefix-cache component captured at the same raw submit that set the active_kv throttle-window peak; active - retained_prefix is non-prefix active KV",
         "has_retained_prefix_breakdown": "false for old kv_snapshot logs without the retained_prefix_kv column; their compatibility series is zero-filled and must not be interpreted as a measured zero",
+        "peak_held_max_tokens": "maximum transfer-source held KV of an individual shard over raw throttle-window maxima; null when unavailable",
+        "peak_non_cache_max_tokens": "maximum resident plus held KV of an individual shard, excluding retained prefix cache; independent of the active-peak sample, null when unavailable",
+        "has_transfer_breakdown": "held_kv and non_cache_kv are independent window maxima; do not add them to other columns or infer simultaneous peaks across workers",
         "projected_tokens": "admission gate's FUTURE estimate (each admitted request's full decode horizon); may exceed capacity",
         "promised_tokens": "reserved-but-not-resident KV footprint (admitted, not yet realized)",
         "capacity_tokens": "static per-shard KV token budget from run_meta.json kv_pools; null when KV logging carries no capacity",
@@ -447,4 +472,70 @@ fn unavailable_payload(log_dir: &Path, reason: &str) -> Value {
         "t_end_ms": [],
         "series": [],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Float64Array, RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::{fs::File, sync::Arc};
+
+    #[tokio::test]
+    async fn raw_hold_peaks_are_preserved_and_old_logs_do_not_fabricate_zeroes() {
+        for with_transfer in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let raw = dir.path().join("raw/kv_snapshot");
+            std::fs::create_dir_all(&raw).unwrap();
+            let mut fields = vec![
+                Field::new("pool_tag", DataType::Utf8, false),
+                Field::new("time_ms", DataType::Float64, false),
+            ];
+            let mut columns: Vec<ArrayRef> = vec![
+                Arc::new(StringArray::from(vec!["prefill"; 3])),
+                Arc::new(Float64Array::from(vec![0.0, 0.001, 1.0])),
+            ];
+            for (name, values) in [
+                ("worker_id", vec![0, 0, 0]),
+                ("group_id", vec![0, 0, 0]),
+                ("active_kv", vec![0, 95, 100]),
+                ("retained_prefix_kv", vec![0, 90, 99]),
+                ("projected_peak", vec![0, 95, 100]),
+                ("promised_kv", vec![0, 0, 0]),
+                ("held_kv", vec![0, 70, 50]),
+                ("non_cache_kv", vec![0, 80, 60]),
+            ] {
+                if !with_transfer && matches!(name, "held_kv" | "non_cache_kv") {
+                    continue;
+                }
+                fields.push(Field::new(name, DataType::UInt64, false));
+                columns.push(Arc::new(UInt64Array::from(values)));
+            }
+            let schema = Arc::new(Schema::new(fields));
+            let mut writer = ArrowWriter::try_new(
+                File::create(raw.join("worker_prefill_0.parquet")).unwrap(),
+                schema.clone(),
+                None,
+            )
+            .unwrap();
+            writer
+                .write(&RecordBatch::try_new(schema, columns).unwrap())
+                .unwrap();
+            writer.close().unwrap();
+            let (report, payload) = run_kv_occupancy(&SessionContext::new(), dir.path())
+                .await
+                .unwrap();
+            assert_eq!(report["meta"]["has_transfer_breakdown"], with_transfer);
+            let peak = &report["totals"]["per_series"][0];
+            if with_transfer {
+                assert_eq!(peak["peak_held_max_tokens"], 70.0);
+                assert_eq!(peak["peak_non_cache_max_tokens"], 80.0);
+                assert_eq!(payload["series"][0]["workers"][0]["peak_held_tokens"], 70.0);
+            } else {
+                assert!(peak["peak_held_max_tokens"].is_null());
+                assert!(peak["peak_non_cache_max_tokens"].is_null());
+            }
+        }
+    }
 }

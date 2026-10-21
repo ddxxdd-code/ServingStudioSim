@@ -35,6 +35,74 @@ mod tests {
     use std::{cell::RefCell, rc::Rc, sync::Arc};
 
     #[test]
+    fn local_growth_before_transfer_submission_skips_obsolete_read_and_keeps_affinity() {
+        use crate::worker::kv::RemotePrefixKv;
+        for local_tokens in [80, 100] {
+            let requests = Rc::new(RefCell::new(RequestStore::new()));
+            let mut request = text_request(RequestId(0), 10, 3, Time::ZERO);
+            request.definition.session = SessionInput::Session {
+                session_id: 7,
+                session_start_time: Time::ZERO,
+                declared_prefix_tokens: 150,
+            };
+            requests.borrow_mut().insert(request);
+            let mut worker = build_remote_cache_unified_worker(
+                WorkerId(0),
+                "main",
+                Arc::new(FakeModel {
+                    ms: 1.0,
+                    dp_groups: 2,
+                }),
+                requests.clone(),
+                WorkerConfig::default(),
+                None,
+                PoolId(0),
+                "test",
+                test_cluster(),
+            );
+            worker
+                .iteration
+                .kv_store
+                .install_remote_prefix(RequestId(9), 0, 7, 50, Time::ZERO);
+            worker.enqueue(Msg::Request(RequestId(0)));
+            let mut events = Vec::new();
+            worker.tick(Time::ZERO, &mut events);
+            assert!(matches!(
+                events.as_slice(),
+                [Event::KvLookup {
+                    req: RequestId(0),
+                    ..
+                }]
+            ));
+            worker.enqueue(Msg::KvLookupResult {
+                req: RequestId(0),
+                resident_tokens: 80,
+                // An unnecessary submission would attempt this invalid endpoint.
+                store_send_gid: u16::MAX,
+                store_worker: WorkerId(0),
+            });
+            worker.iteration.kv_store.install_remote_prefix(
+                RequestId(10),
+                1,
+                7,
+                local_tokens,
+                Time::ZERO,
+            );
+            events.clear();
+            worker.tick(Time::ZERO, &mut events);
+            assert!(worker.reads.is_empty());
+            assert_eq!(
+                requests.borrow()[RequestId(0)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(local_tokens as u32)
+            );
+            assert!(worker.iteration.kv_store.has_prefill_admit(1));
+            assert!(!worker.iteration.kv_store.has_prefill_admit(0));
+        }
+    }
+
+    #[test]
     fn selected_lookups_obey_backpressure_and_do_not_reenter_pending() {
         let requests = Rc::new(RefCell::new(RequestStore::new()));
         for id in 0..2 {
@@ -140,7 +208,7 @@ impl<K: IterWorkerKv, A: RemoteKvAdmission<K>, E: IterModelExecution<K>>
     RemoteCacheIterWorker<K, A, E>
 {
     fn advance_reads(&mut self, now: Time) {
-        while let Some((req, plan)) = self.iteration.admission.take_read() {
+        while let Some((req, plan)) = self.iteration.admission.take_read(&self.iteration.kv_store) {
             let end = self.cluster.borrow_mut().submit_transfer(
                 now,
                 plan.store_send_gid,

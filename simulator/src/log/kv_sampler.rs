@@ -15,6 +15,8 @@
 //!     sampling never hides the true occupancy peak (the "current size");
 //!     `retained_prefix_kv` is captured from the same submit that set that peak,
 //!     preserving it as a component of `active_kv` rather than an unrelated max;
+//!   - independent maxima of held and non-cache KV, so retained cache growth
+//!     cannot hide a shorter-lived transfer hold or resident peak;
 //!   - a **stride throttle** — one row per `stride` submits — plus a baseline row
 //!     on the first submit (a t≈0 anchor) and a tail row at [`flush_all`] (the
 //!     endpoint), so the series always has both ends;
@@ -49,6 +51,7 @@ const CHANNEL_CAP: usize = 64;
 pub struct KvSubmit {
     pub active_kv: u64,
     pub retained_prefix_kv: u64,
+    pub held_kv: u64,
     pub projected_peak: u64,
     pub promised_kv: u64,
 }
@@ -63,6 +66,8 @@ struct Slot {
     window_count: u32,
     peak_active: u64,
     retained_prefix_at_peak_active: u64,
+    peak_held: u64,
+    peak_non_cache: u64,
     emitted_any: bool,
     /// Un-emitted window data is buffered (a tail row is owed at flush).
     pending: bool,
@@ -164,6 +169,7 @@ impl KvSampler {
             occupancy.retained_prefix_kv <= occupancy.active_kv,
             "retained prefix KV must be a component of active KV"
         );
+        debug_assert!(occupancy.held_kv <= occupancy.active_kv - occupancy.retained_prefix_kv);
         let stride = self.stride;
         let slot = &mut self.slots[group_id as usize];
         // Keep the prefix component paired with the active sample. Independent
@@ -174,6 +180,10 @@ impl KvSampler {
             slot.peak_active = occupancy.active_kv;
             slot.retained_prefix_at_peak_active = occupancy.retained_prefix_kv;
         }
+        slot.peak_held = slot.peak_held.max(occupancy.held_kv);
+        slot.peak_non_cache = slot
+            .peak_non_cache
+            .max(occupancy.active_kv - occupancy.retained_prefix_kv);
         slot.last_time_ms = now.as_ms();
         slot.last_projected_peak = occupancy.projected_peak;
         slot.last_promised = occupancy.promised_kv;
@@ -191,6 +201,8 @@ impl KvSampler {
             time_ms: slot.last_time_ms,
             active_kv: slot.peak_active,
             retained_prefix_kv: slot.retained_prefix_at_peak_active,
+            held_kv: slot.peak_held,
+            non_cache_kv: slot.peak_non_cache,
             projected_peak: slot.last_projected_peak,
             promised_kv: slot.last_promised,
         };
@@ -198,6 +210,8 @@ impl KvSampler {
         slot.window_count = 0;
         slot.peak_active = 0;
         slot.retained_prefix_at_peak_active = 0;
+        slot.peak_held = 0;
+        slot.peak_non_cache = 0;
         slot.pending = false;
         self.push_row(row);
     }
@@ -278,6 +292,8 @@ impl KvSampler {
                 time_ms: slot.last_time_ms,
                 active_kv: slot.peak_active,
                 retained_prefix_kv: slot.retained_prefix_at_peak_active,
+                held_kv: slot.peak_held,
+                non_cache_kv: slot.peak_non_cache,
                 projected_peak: slot.last_projected_peak,
                 promised_kv: slot.last_promised,
             })
@@ -308,6 +324,7 @@ mod tests {
         KvSubmit {
             active_kv,
             retained_prefix_kv,
+            held_kv: 0,
             projected_peak: active_kv,
             promised_kv: 0,
         }
@@ -394,5 +411,55 @@ mod tests {
             1,
             "baseline only; tail must not duplicate it"
         );
+    }
+
+    #[test]
+    fn held_and_non_cache_peaks_survive_a_larger_retained_cache_peak() {
+        let dir = tempdir().unwrap();
+        let mut sampler = KvSampler::open(dir.path(), "prefill", WorkerId(0), 1, 3).unwrap();
+        for (at, (active, retained, held)) in [
+            (0, 0, 0),
+            (80, 0, 70),
+            (95, 90, 0),
+            (90, 20, 30),
+            (60, 0, 50),
+            (100, 99, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sampler.submit(
+                0,
+                KvSubmit {
+                    held_kv: held,
+                    ..sub(active, retained)
+                },
+                Time::from_us(at as u64),
+            );
+        }
+        sampler.flush_all().unwrap();
+        let batch = ParquetRecordBatchReaderBuilder::try_new(
+            File::open(dir.path().join("raw/kv_snapshot/worker_prefill_0.parquet")).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        let values = |name| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        assert_eq!(values("active_kv"), [0, 95, 100]);
+        assert_eq!(values("retained_prefix_kv"), [0, 90, 99]);
+        assert_eq!(values("held_kv"), [0, 70, 50]);
+        assert_eq!(values("non_cache_kv"), [0, 80, 60]);
     }
 }

@@ -184,7 +184,7 @@ pub fn run_sim(
     let mut watchdog = EveryN::new(ticks(sample_dt));
 
     let mut foreground_end = None;
-    let cause = loop {
+    let outcome = loop {
         // 1. Drain arrivals due by now → Flow inserts into the shared store.
         //    The frontend owns the drain loop, so the whole tick is emptied here.
         frontend.drain_due(clock, |req| flow.on_arrival(req));
@@ -198,7 +198,9 @@ pub fn run_sim(
             logger.record_request_slo(slo_entry(req, clock, &s[req]))?;
         }
 
-        flow.check_health()?;
+        if let Err(error) = flow.check_health() {
+            break Err(error);
+        }
 
         // 2b. Periodic `request_state` snapshot — one AGGREGATE row per tick over
         //     the *admitted* set (`iter_admitted`). The analyzer only ever needs
@@ -239,15 +241,16 @@ pub fn run_sim(
         if exhausted && in_flight == 0 {
             foreground_end.get_or_insert(clock);
             if flow.background_pending() == 0 {
-                break TerminationCause::DrainComplete;
+                break Ok(TerminationCause::DrainComplete);
             }
-            anyhow::ensure!(
-                clock - foreground_end.unwrap() < cfg.stuck_threshold,
-                "distributed KV background drain exceeded stuck_threshold"
-            );
+            if clock - foreground_end.unwrap() >= cfg.stuck_threshold {
+                break Err(anyhow::anyhow!(
+                    "distributed KV background drain exceeded stuck_threshold"
+                ));
+            }
         }
         if foreground_end.is_none() && !cfg.run_to_end && clock >= cfg.duration {
-            break TerminationCause::DurationReached;
+            break Ok(TerminationCause::DurationReached);
         }
 
         // 3b. Stuck watchdog — O(1), no store scan. Progress means a request
@@ -264,7 +267,7 @@ pub fn run_sim(
             } else {
                 idle_for = idle_for + sample_dt;
                 if idle_for >= cfg.stuck_threshold {
-                    break TerminationCause::Stuck;
+                    break Ok(TerminationCause::Stuck);
                 }
             }
         }
@@ -276,8 +279,19 @@ pub fn run_sim(
     // Network/store log timestamps may extend beyond this foreground horizon.
     // Throughput and completion metrics retain the user-visible interval.
     let clock = foreground_end.unwrap_or(clock);
-    finalize(store, logger, clock, last_state_clock)?;
-    logger.flush_all()?;
+    // Preserve the failure census and flush buffered rows before propagating a
+    // protocol error. Even if finalization fails, still attempt the writer flush.
+    let finalization = finalize(store, logger, clock, last_state_clock);
+    let flush = logger.flush_all();
+    if let Err(error) = outcome {
+        if let Err(log_error) = finalization.and(flush) {
+            tracing::warn!("failed to finalize failed-run logs: {log_error:#}");
+        }
+        return Err(error);
+    }
+    finalization?;
+    flush?;
+    let cause = outcome.unwrap();
 
     // End-of-run summary: finished count, then prefill / decode / total token
     // counts each with their own throughput, then sim + wall time. Built into a
@@ -519,6 +533,71 @@ mod tests {
             writeln!(f, "{id},8,{output_len},0.0").unwrap();
         }
         path
+    }
+
+    #[test]
+    fn protocol_failure_finalizes_partial_requests_and_flushes_before_returning() {
+        struct FailedFlow {
+            store: SharedRequests,
+            cluster: crate::worker::SharedGpuCluster,
+        }
+        impl Flow for FailedFlow {
+            fn on_arrival(&mut self, req: crate::common::Request) {
+                self.store.borrow_mut().insert(req);
+            }
+            fn tick(&mut self, _: Time) -> Vec<OrchAction> {
+                Vec::new()
+            }
+            fn check_health(&self) -> anyhow::Result<()> {
+                anyhow::bail!("CapacityExceeded")
+            }
+            fn cluster(&self) -> &crate::worker::SharedGpuCluster {
+                &self.cluster
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let trace = write_trace_with_output_len(dir.path(), 2, 3);
+        let store = Rc::new(RefCell::new(RequestStore::new()));
+        let mut flow = FailedFlow {
+            store: store.clone(),
+            cluster: crate::test_helpers::test_cluster(),
+        };
+        let mut frontend = TraceFrontend::load(
+            &[trace],
+            &InputFileSchema::text_generation_independent(),
+            ArrivalSchedule::trace_timed(1.0).unwrap(),
+            CapacityLimit::unlimited(),
+            SessionDependency::Independent,
+        )
+        .unwrap();
+        let mut logger = LoggerSession::open(dir.path(), true, true).unwrap();
+        let error = run_sim(
+            &mut flow,
+            &store,
+            &mut frontend,
+            &mut logger,
+            &TickCfg::new(10.0, true, 100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("CapacityExceeded"));
+        // The logger is still alive: success cannot depend on Drop flushing.
+        let batches = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(dir.path().join("raw/request_slo.parquet")).unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        let completed = batches[0]
+            .column_by_name("completed")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+        assert_eq!(completed.true_count(), 0);
+        assert!(dir.path().join("raw/request_state.parquet").exists());
     }
 
     fn write_trace(dir: &std::path::Path, n: u32) -> PathBuf {

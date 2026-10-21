@@ -112,7 +112,7 @@ impl PrefixCacheConfig {
 #[derive(Clone, Copy, Debug)]
 struct PrefixEntry {
     /// Which request fetched this entry. Other requests see it as a local hit.
-    remote_reader: Option<crate::common::RequestId>,
+    remote_reader: Option<(crate::common::RequestId, u32)>,
     pinned: bool,
     tokens: u64,
     insertion_sequence: u64,
@@ -183,12 +183,17 @@ pub(crate) struct PrefixCache {
 }
 
 impl PrefixCache {
-    pub(crate) fn mark_remote_read(&mut self, session: u32, req: crate::common::RequestId) {
+    pub(crate) fn mark_remote_read(
+        &mut self,
+        session: u32,
+        req: crate::common::RequestId,
+        local_tokens: u32,
+    ) {
         if let Some(entry) = self.entries.get_mut(&session) {
-            entry.remote_reader = Some(req);
+            entry.remote_reader = Some((req, local_tokens));
         }
     }
-    pub(crate) fn remote_reader(&self, session: u32) -> Option<crate::common::RequestId> {
+    pub(crate) fn remote_reader(&self, session: u32) -> Option<(crate::common::RequestId, u32)> {
         self.entries.get(&session).and_then(|e| e.remote_reader)
     }
 
