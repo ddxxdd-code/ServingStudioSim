@@ -38,7 +38,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-
 from fixtures.gen_throughput_trace import DEFAULT_N, DEFAULT_SEED, write_trace
 
 # Fixed config — any change to the preset templates below invalidates the
@@ -57,7 +56,6 @@ workload:
   request_rate: 150.0
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
   run_to_end: true
 pools:
   main:
@@ -78,7 +76,6 @@ workload:
   request_rate: 150.0
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
   run_to_end: true
 pools:
   prefill:

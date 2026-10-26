@@ -30,13 +30,72 @@ pub struct SingleGemmKernelInput {
 
 pub struct SingleGemmSpec;
 
+/// Largest `m` the hybrid-bucket grid measures; beyond it the cache extrapolates.
+const HYBRID_BUCKET_M_MAX: u32 = 8192;
+
+/// `m` axis for a GEMM autotuned per FlashInfer hybrid token bucket
+/// (`flashinfer_mxfp8`'s `mm_mxfp8`, `flashinfer_fp8_tensor`'s `bmm_fp8`).
+///
+/// `get_hybrid_num_tokens_buckets` yields powers of two to 256, step 256 to
+/// 2048, step 512 to 4096, then powers of two, and a runtime `m` maps UP to its
+/// bucket (`map_to_hybrid_bucket_uncapped`), so the tactic is constant on each
+/// `(b_prev, b]` and may switch between `b` and `b + 1`. The axis measures every
+/// bucket `b` and `b + 1`, so linear interpolation never spans a tactic switch,
+/// plus mid-bucket points where a bucket is wider than 128 rows (tile-count
+/// steps inside one tactic).
+fn hybrid_bucket_m_axis() -> Vec<f64> {
+    let buckets: Vec<u32> = (0..=8)
+        .map(|i| 1u32 << i)
+        .chain((512..=2048).step_by(256))
+        .chain((2560..=4096).step_by(512))
+        .chain([HYBRID_BUCKET_M_MAX])
+        .collect();
+    let mut m: Vec<u32> = buckets
+        .iter()
+        .flat_map(|&b| [b, b + 1])
+        .chain((384..=2048).step_by(256))
+        .chain((2304..=4096).step_by(512))
+        .chain((4608..=HYBRID_BUCKET_M_MAX).step_by(512))
+        .filter(|&v| v <= HYBRID_BUCKET_M_MAX)
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
+/// `m` axis for `flashinfer_fp8_tensor`: the hybrid-bucket axis plus every
+/// multiple of 64 up to its top.
+///
+/// Its bucket winner is often a cuBLASLt or CUTLASS kernel whose tile count
+/// steps with the actual `m`, not the bucket, so time inside one wide bucket is
+/// a staircase (steps every 64-256 rows on B200). A step-8 scan of two
+/// projection shapes cut the mean linear-interpolation error from 2.7-3.3%
+/// (bucket points only) to 2.0%.
+fn fp8_tensor_m_axis() -> Vec<f64> {
+    let mut m: Vec<u32> = hybrid_bucket_m_axis()
+        .into_iter()
+        .map(|v| v as u32)
+        .chain((64..=HYBRID_BUCKET_M_MAX).step_by(64))
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
 impl KernelSpec for SingleGemmSpec {
     type Config = SingleGemmKernelConfig;
     type Input = SingleGemmKernelInput;
 
     const KIND: KernelKind = "single_gemm";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if config.dtype == DType::Mxfp8E4m3 {
+            return SweepGrid::new(vec![hybrid_bucket_m_axis()]);
+        }
+        // A mixed backend list keeps the generic axis below.
+        if config.backends.as_slice() == ["flashinfer_fp8_tensor"] {
+            return SweepGrid::new(vec![fp8_tensor_m_axis()]);
+        }
         // Dense decode routinely evaluates GEMMs below the shared token axis'
         // m=32 floor. Keep those points measured instead of extrapolating the
         // first [32, 64] segment into the scheduler's common 1..16 batches.
@@ -201,5 +260,79 @@ mod tests {
 
         assert_eq!(&grid.axes()[0][..6], &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0]);
         assert_eq!(grid.axes()[0].len(), 68);
+    }
+
+    fn mxfp8_cfg() -> SingleGemmKernelConfig {
+        SingleGemmKernelConfig {
+            backends: vec!["flashinfer_mxfp8"],
+            gpu_name: "NVIDIA B200".to_string(),
+            n: 1792.into(),
+            k: 5120.into(),
+            dtype: DType::Mxfp8E4m3,
+        }
+    }
+
+    /// FlashInfer rounds `m` up to its hybrid tuning bucket, so a tactic switch
+    /// sits between bucket `b` and `b + 1`. Missing either side makes the
+    /// linear cache interpolate across two different kernels.
+    #[test]
+    fn mxfp8_grid_brackets_every_flashinfer_tuning_bucket() {
+        let grid = SingleGemmSpec::sweep_grid(&mxfp8_cfg());
+        let axis = &grid.axes()[0];
+        let has = |v: u32| axis.contains(&(v as f64));
+        let buckets = [
+            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2560, 3072,
+            3584, 4096, 8192,
+        ];
+        for b in buckets {
+            assert!(has(b), "bucket {b} missing");
+            if b < 8192 {
+                assert!(has(b + 1), "first m past bucket {b} missing");
+            }
+        }
+        assert!(axis.windows(2).all(|w| w[0] < w[1]), "axis must be strictly increasing");
+        assert_eq!(axis.first(), Some(&1.0));
+        assert_eq!(axis.last(), Some(&8192.0));
+        assert_eq!(axis.len(), 58);
+    }
+
+    /// Per-tensor FP8 `bmm_fp8(backend="auto")` is tuned per the same hybrid
+    /// buckets, so its axis must bracket every bucket; block-scaled DeepGEMM
+    /// shares the `fp8_e4m3` dtype but no tuner, and a mixed backend list must
+    /// not inherit one backend's axis.
+    #[test]
+    fn fp8_tensor_axis_brackets_buckets_and_follows_the_backend() {
+        let fp8 = |backends: Vec<&'static str>| SingleGemmKernelConfig {
+            backends,
+            gpu_name: "NVIDIA B200".to_string(),
+            n: 16384.into(),
+            k: 5120.into(),
+            dtype: DType::Fp8E4m3,
+        };
+        let hybrid = SingleGemmSpec::sweep_grid(&mxfp8_cfg());
+        let generic = SingleGemmSpec::sweep_grid(&fp8(vec!["deepgemm"]));
+        let tensor = SingleGemmSpec::sweep_grid(&fp8(vec!["flashinfer_fp8_tensor"]));
+        let axis = &tensor.axes()[0];
+        assert!(hybrid.axes()[0].iter().all(|m| axis.contains(m)));
+        assert!(axis.windows(2).all(|w| w[0] < w[1] && w[1] - w[0] <= 64.0));
+        assert_eq!(axis.last(), Some(&8192.0));
+        assert!(axis.len() <= 500);
+        assert_ne!(generic.axes(), tensor.axes());
+        assert_eq!(
+            SingleGemmSpec::sweep_grid(&fp8(vec!["flashinfer_fp8_tensor", "deepgemm"])).axes(),
+            generic.axes()
+        );
+    }
+
+    #[test]
+    fn mxfp8_enumerate_forwards_the_python_wire_schema() {
+        let cfg = mxfp8_cfg();
+        let grid = SingleGemmSpec::sweep_grid(&cfg);
+        let payloads = SingleGemmSpec::enumerate(&cfg, &grid, "flashinfer_mxfp8");
+        assert_eq!(payloads.len(), grid.axes()[0].len());
+        let fields = payloads[0].fields();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields.get("dtype"), Some(&Value::from("mxfp8_e4m3")));
+        assert_eq!(fields.get("backend"), Some(&Value::from("flashinfer_mxfp8")));
     }
 }

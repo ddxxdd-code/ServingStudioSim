@@ -2,14 +2,18 @@
 //!
 //! `simulator list-params` prints the JSON produced here; the launcher writes it
 //! to `target/<profile>/deployment_schema.json` and walks a concrete config
-//! against it (new-interface-design §11). It is NOT a cartesian product of
+//! against it (L7 design). It is NOT a cartesian product of
 //! (deployment × arch × worker) — it publishes the structure:
 //!   - `deployments`: each deployment's pool roles → contract class;
 //!   - `providers`: per contract class, each arch/worker tag's params;
 //!   - `arch_common`: the model fields every arch tag carries;
 //!   - `group_common`: the flat fields every group carries (gpu / replicas);
 //!   - `pool_common`: the flat fields every pool carries (placement);
-//!   - `common`: run-global workload / io params.
+//!   - `common`: run-global workload / io params;
+//!   - `predict_cases`: per `timing-predict` arch selector, the fields of one
+//!     case. `groups`: a case is `{groups: [...]}`, each group these fields;
+//!     `case`: a case is an object of these fields. How many groups a model
+//!     takes is the model's (`cost-trees` gives it as `predict.groups`).
 //!
 //! This module only *arranges* — every param's defaults / choices / cache-key
 //! flag is *derived from the config types themselves*: `#[derive(ParamStruct)]`
@@ -22,10 +26,14 @@
 use serde_json::{json, Map, Value};
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec};
+use crate::arch::contract::FfnArchInput;
 use crate::deployment::config::{IoSpec, WorkloadSpec};
 use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::schema::ParamDef;
-use crate::worker::config::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel};
+use crate::timing_predict::{PredictGroup, SpeculativePredictGroup};
+use crate::worker::config::{
+    AttnWorkerSel, FfnWorkerSel, IterWorkerSel, KvAccountingSpec, KvAdmissionSpec,
+};
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
 fn params(p: &[ParamDef]) -> Value {
@@ -34,20 +42,37 @@ fn params(p: &[ParamDef]) -> Value {
 
 /// Turn a layer's `(tag, params)` schema slice into `{ tag: { "params": [...] } }`.
 fn providers(schema: &[(&str, &[ParamDef])]) -> Value {
+    providers_with_flattened(schema, &[])
+}
+
+/// Add params from selector components flattened into provider tags; a tag
+/// may take several components.
+fn providers_with_flattened(
+    schema: &[(&str, &[ParamDef])],
+    flattened: &[(&str, &[ParamDef])],
+) -> Value {
     let mut m = Map::new();
     for (tag, p) in schema {
-        m.insert(tag.to_string(), json!({ "params": params(p) }));
+        let mut provider_params = p.to_vec();
+        for (_, extra) in flattened.iter().filter(|(owner, _)| owner == tag) {
+            provider_params.extend_from_slice(extra);
+        }
+        m.insert(
+            tag.to_string(),
+            json!({ "params": params(&provider_params) }),
+        );
     }
     Value::Object(m)
 }
 
-/// Build the full `list-params` registry JSON (new-interface-design §11.1).
+/// Build the full `list-params` registry JSON.
 pub fn list_params() -> Value {
     json!({
         "deployments": {
             "unified": { "pools": { "main": "iter_wise" }, "optional_blocks": ["kv_store"] },
             "pd":      { "pools": { "prefill": "iter_wise", "decode": "iter_wise" }, "optional_blocks": ["kv_store"] },
             "afd":     { "pools": { "attn": "layer_wise_attn", "ffn": "layer_wise_ffn" } },
+            "pp":      { "pools": { "stage": "iter_wise" } },
         },
         "providers": {
             "arch": {
@@ -56,8 +81,24 @@ pub fn list_params() -> Value {
                 "layer_wise_ffn":  providers(FfnArchSel::SCHEMA),
             },
             "worker": {
-                "iter_wise":       providers(IterWorkerSel::SCHEMA),
-                "layer_wise_attn": providers(AttnWorkerSel::SCHEMA),
+                "iter_wise":       providers_with_flattened(
+                    IterWorkerSel::SCHEMA,
+                    &[
+                        ("barebone", KvAccountingSpec::PARAMS),
+                        ("hp_unified", KvAccountingSpec::PARAMS),
+                        ("chunked_prefill", KvAccountingSpec::PARAMS),
+                        ("chunked_prefill", KvAdmissionSpec::PARAMS),
+                        ("speculative", KvAccountingSpec::PARAMS),
+                        ("speculative", KvAdmissionSpec::PARAMS),
+                        ("pipeline_chunked_prefill", KvAccountingSpec::PARAMS),
+                        ("pd_prefill", KvAccountingSpec::PARAMS),
+                        ("pd_decode", KvAccountingSpec::PARAMS),
+                    ],
+                ),
+                "layer_wise_attn": providers_with_flattened(
+                    AttnWorkerSel::SCHEMA,
+                    &[("disagg_attn", KvAccountingSpec::PARAMS)],
+                ),
                 "layer_wise_ffn":  providers(FfnWorkerSel::SCHEMA),
             },
         },
@@ -71,12 +112,81 @@ pub fn list_params() -> Value {
             "workload": params(WorkloadSpec::PARAMS),
             "io":       params(IoSpec::PARAMS),
         },
+        "predict_cases": {
+            "iter":             {"groups": params(PredictGroup::PARAMS)},
+            "speculative_iter": {"groups": params(SpeculativePredictGroup::PARAMS)},
+            "attn":             {"groups": params(PredictGroup::PARAMS)},
+            "ffn":              {"case": params(FfnArchInput::PARAMS)},
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each `timing-predict` selector publishes its case fields, typed as the
+    /// case structs deserialize them: `[a, b]` pairs as `int_pair_list`.
+    #[test]
+    fn predict_cases_list_each_selectors_case_fields() {
+        let cases = &list_params()["predict_cases"];
+        let fields = |selector: &str, key: &str| -> Vec<(String, String)> {
+            cases[selector][key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{selector}.{key}"))
+                .iter()
+                .map(|p| {
+                    (
+                        p["name"].as_str().unwrap().into(),
+                        p["type"].as_str().unwrap().into(),
+                    )
+                })
+                .collect()
+        };
+        let pair = |n: &str, t: &str| (n.to_string(), t.to_string());
+        let group = vec![
+            pair("prefill_chunk_pairs", "int_pair_list"),
+            pair("decode_kv_lens", "int_list"),
+            pair("decode_count", "int"),
+            pair("average_decode_length", "int"),
+        ];
+        assert_eq!(fields("iter", "groups"), group);
+        assert_eq!(fields("attn", "groups"), group);
+        assert_eq!(
+            fields("speculative_iter", "groups"),
+            [
+                pair("prefill_chunk_pairs", "int_pair_list"),
+                pair("decode_requests", "int_pair_list"),
+            ]
+        );
+        assert_eq!(
+            fields("ffn", "case"),
+            [pair("tokens_per_group", "int_list")]
+        );
+    }
+
+    /// The group's GPU and an arch's routing pick kernels, so the launcher's
+    /// cache-key dedup must tell configs apart by them.
+    #[test]
+    fn gpu_and_routing_affect_the_kernel_cache() {
+        let schema = list_params();
+        let gpu = schema["group_common"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "gpu")
+            .expect("gpu in group_common");
+        assert_eq!(gpu["affects_cache"], true);
+        for providers in schema["providers"]["arch"].as_object().unwrap().values() {
+            for (tag, provider) in providers.as_object().unwrap() {
+                for param in provider["params"].as_array().unwrap() {
+                    if matches!(param["name"].as_str(), Some("routing" | "routing_seed")) {
+                        assert_eq!(param["affects_cache"], true, "{tag}.{}", param["name"]);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn registry_advertises_tp_size_on_dense_tp() {
@@ -168,15 +278,10 @@ mod tests {
                 .any(|param| param["name"] == "max_concurrency"),
             "max_concurrency is exposed independently of arrival_mode"
         );
-        let session_dependency = workload
-            .iter()
-            .find(|param| param["name"] == "session_dependency")
-            .expect("session_dependency is exposed");
-        assert_eq!(
-            session_dependency["choices"],
-            json!(["independent", "chained"])
-        );
-        assert!(workload.iter().all(|param| param["name"] != "replay_mode"));
+        // The trace decides whether rounds chain.
+        for retired in ["replay_mode", "session_dependency"] {
+            assert!(workload.iter().all(|param| param["name"] != retired));
+        }
     }
 
     #[test]
@@ -217,5 +322,43 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .starts_with("prefix_cache_")));
+    }
+
+    #[test]
+    fn iter_worker_schemas_include_flattened_kv_admission_spec() {
+        let schema = list_params();
+        for worker in ["chunked_prefill", "speculative"] {
+            check_flattened_kv_admission_spec(&schema, worker);
+        }
+    }
+
+    fn check_flattened_kv_admission_spec(schema: &serde_json::Value, worker: &str) {
+        let params = schema["providers"]["worker"]["iter_wise"][worker]["params"]
+            .as_array()
+            .expect("worker params are an array");
+        let policy = params
+            .iter()
+            .find(|param| param["name"] == "kv_admission_policy")
+            .expect("flattened KV admission policy is exposed");
+        assert_eq!(policy["default"], "full-footprint");
+        assert_eq!(
+            policy["choices"],
+            json!(["full-footprint", "bounded-future"])
+        );
+        for name in [
+            "kv_page_size",
+            "kv_max_future_tokens",
+            "kv_initial_new_token_ratio",
+            "kv_minimum_new_token_ratio",
+            "kv_new_token_ratio_decay_steps",
+            "kv_retract_decode_steps",
+            "decode_retraction_policy",
+        ] {
+            assert_eq!(
+                params.iter().filter(|param| param["name"] == name).count(),
+                1,
+                "flattened parameter {name} must appear exactly once"
+            );
+        }
     }
 }

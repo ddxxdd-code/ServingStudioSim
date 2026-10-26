@@ -8,8 +8,7 @@ orchestrator (1:1), the pool topology, and each pool's contract class (which arc
 scheduling logic of its own.
 
 This is the practical, code-matching reference; the code is the ground truth.
-For the layer overview see `doc/detailed_design/L6.md`; the archived config-tree
-design intent is `old-doc/new-interface-design.md`.
+For the layer overview see `doc/detailed_design/L6.md`.
 
 ## The `Deployment` trait + dispatch
 
@@ -29,6 +28,7 @@ the deserialized config to its deployment's `build`:
 | `unified` | **wired** — `UnifiedDeployment::build` |
 | `pd` | **wired** — `PdDeployment::build` for the supported prefill/decode arch pairings |
 | `afd` | **wired** — `AfdDeployment::build` for Qwen3 attention/FFN disaggregation |
+| `pp` | **wired** — `PpDeployment::build` for `glm52_vllm_nvfp4_pp_dsa_moe` + `pipeline_chunked_prefill` (chunked prefill + decode): one `stage` pool whose workers are the stages of `replicas` pipelines |
 
 ## The config shape (`config.rs`)
 
@@ -37,7 +37,7 @@ embeds the run-global specs and fixes which **pool roles** exist:
 
 ```jsonc
 { "deployment": "unified",
-  "workload": { trace_files, arrival_mode, session_dependency,
+  "workload": { trace_files, arrival_mode,
                 duration_ms, run_to_end, request_rate, max_concurrency },
   "io":       { log_dir, log_level, quiet, force_cache_build },
   "pools":    { "main": { placement, groups: [ { gpu, replicas, arch, worker } ] } } }
@@ -64,13 +64,15 @@ embeds the run-global specs and fixes which **pool roles** exist:
    `sim_num_layers` / `num_layers` truncation **before** config build.
 3. Build a `WorkerConfig` (`attn_kv_bytes` from the worker tag's
    `attn_gpu_memory_gb`, plus hot-path logging controls from `io`). The worker is
-   itself a tagged enum (`IterWorkerSel`): `Barebone` and `HpUnified` are wired
-   for `unified`; `ChunkedPrefill` parses but bails (`not wired yet`), and the PD
-   worker tags are rejected here because they belong to the `pd` deployment.
+   itself a tagged enum (`IterWorkerSel`): ordinary recipes include `Barebone`,
+   `HpUnified`, and `ChunkedPrefill`. `Speculative` selects the separate
+   draft/verify execution contract. PD worker tags belong to the `pd` deployment.
 4. **Select the arch by its explicit tag** — the wired unified arms are
    `Llama3Dense`, `Llama3DenseTp`, `Llama3DpAttnTpFfn`, `Qwen3MoeDpAttnEpFfn`,
-   `Qwen3MoeFp8DpAttnEpFfn`, `Qwen3VllmMoeDpAttnEpFfn`, `Glm52DsaMoe`, and
-   `Glm52VllmDsaMoe`. Dispatch is provider-first, *not* a
+   `Qwen3MoeFp8DpAttnEpFfn`, `Qwen3VllmMoeDpAttnEpFfn`, and
+   `Glm52VllmDsaMoe`, plus the explicit NVFP4 provider variants.
+   `Glm52VllmNvfp4DsaMoeSpeculative` requires the `Speculative` worker with the
+   same draft depth; it has its own L4 identity. Dispatch is provider-first, *not* a
    `tp_size` dispatch. Each arm runs the L4 cascade
    `build_configs → resolve_configs → build` with its resolved parallel layout,
    producing a concrete model type `M`.
@@ -82,7 +84,7 @@ That `Box<dyn Flow>` is the **single `dyn` erasure point** — each concrete mod
 monomorphizes its own flow, so the per-iter cost path stays `dyn`-free.
 
 GLM-5.2 pairs with the existing `hp_unified` recipe. Its attention is TP1 local,
-so the L4 model reports one attention-DP group per EP rank; `FullAttnKv` creates
+so the L4 model reports one attention-DP group per EP rank; `KvCacheStore` creates
 one independent sticky KV partition for each group and `UnifiedIterExecution`
 emits one matching `ArchGroupInput`. The worker shell, admission and selection
 policy, request lifecycle, event ownership, and `SimpleDpFlow` remain the same as

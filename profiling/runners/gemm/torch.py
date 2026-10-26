@@ -40,9 +40,6 @@ def profile_single_gemm(
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for the torch GEMM runner") from exc
 
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch GEMM runner")
-
     try:
         torch_dtype = dtype.torch()
         a = torch.randn(m, k, dtype=torch_dtype, device="cuda")
@@ -51,9 +48,10 @@ def profile_single_gemm(
         def kernel():
             return torch.mm(a, b)
 
-        # Timer.cupti read-displaces L2 before each logical launch and excludes
-        # the reduction kernel from the returned GEMM-only duration.
-        time_ms = Timer.cupti(kernel)
+        # A logical GEMM can be an overlapping split-K producer/reduction
+        # assembly on Blackwell. Price its GPU-active union, not the sum of
+        # concurrent physical launches.
+        time_ms = Timer.cupti(kernel, interval_union=True)
         energy_j = Energy.perf(
             kernel,
             warmup=5,
@@ -95,9 +93,6 @@ def profile_single_gemm_linear(
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for the torch_linear backend") from exc
 
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch_linear backend")
-
     try:
         torch_dtype = dtype.torch()
         activations = torch.randn(m, k, dtype=torch_dtype, device="cuda")
@@ -106,8 +101,8 @@ def profile_single_gemm_linear(
         def kernel():
             return functional.linear(activations, weight)
 
-        # Time the canonical model-weight layout through the shared CUPTI timer.
-        time_ms = Timer.cupti(kernel)
+        # Match alignment's effective-duration boundary for split-K assemblies.
+        time_ms = Timer.cupti(kernel, interval_union=True)
         energy_j = Energy.perf(
             kernel,
             warmup=5,
@@ -148,9 +143,6 @@ def profile_grouped_gemm(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for the torch grouped-GEMM runner") from exc
-
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch grouped-GEMM runner")
 
     total_m = sum(batches)
     if total_m == 0:

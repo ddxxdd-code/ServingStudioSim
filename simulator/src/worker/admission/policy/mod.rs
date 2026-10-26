@@ -98,6 +98,11 @@ impl PendingOrderPolicy for PendingOrder {
     }
 
     #[inline]
+    fn push_front(&mut self, candidate: AdmissionCandidate, context: &mut Self::Context) {
+        dispatch!(self, inner => inner.push_front(candidate, context))
+    }
+
+    #[inline]
     fn refresh_head(&mut self, resident_prefix_tokens: &mut dyn FnMut(AdmissionCandidate) -> u32) {
         dispatch!(self, inner => inner.refresh_head(resident_prefix_tokens))
     }
@@ -156,6 +161,9 @@ pub struct AdmissionCandidate {
     /// enqueued), so it stays an upper bound, which is what lets
     /// [`PendingOrderPolicy::refresh_head`] reconcile just the head.
     pub resident_prefix_tokens: u32,
+    /// True when this queue entry came from decode retraction and must
+    /// re-prefill its emitted-output context without resetting TTFT.
+    pub retracted: bool,
 }
 
 impl AdmissionCandidate {
@@ -196,7 +204,30 @@ impl EnqueueSequence {
             session_input,
             conversation_start_time,
             resident_prefix_tokens,
+            retracted: false,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn freeze_retracted(
+        &mut self,
+        request_id: RequestId,
+        fresh_prompt_tokens: u32,
+        remaining_output_tokens: u32,
+        session_input: SessionInput,
+        conversation_start_time: Time,
+        resident_prefix_tokens: u32,
+    ) -> AdmissionCandidate {
+        let mut candidate = self.freeze(
+            request_id,
+            fresh_prompt_tokens,
+            remaining_output_tokens,
+            session_input,
+            conversation_start_time,
+            resident_prefix_tokens,
+        );
+        candidate.retracted = true;
+        candidate
     }
 }
 
@@ -205,6 +236,12 @@ pub trait PendingOrderPolicy {
     type Context;
 
     fn push(&mut self, candidate: AdmissionCandidate, context: &mut Self::Context);
+
+    /// Return a preempted request ahead of every waiting one. Default: a
+    /// policy that ranks on its own key has no front, so this is `push`.
+    fn push_front(&mut self, candidate: AdmissionCandidate, context: &mut Self::Context) {
+        self.push(candidate, context);
+    }
 
     /// Reconcile the head with live KV state before the lifecycle reads it.
     /// `resident_prefix_tokens` re-answers what `AdmissionCandidate` froze at

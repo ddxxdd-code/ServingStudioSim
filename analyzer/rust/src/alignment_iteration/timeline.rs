@@ -39,14 +39,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{ensure, Context, Result};
 use datafusion::prelude::SessionContext;
+use rayon::prelude::*;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::Path;
 
+use super::barrier;
 use super::host::{self, HostWindow};
 use super::{
-    interval_union_ns, kernel_name_index, leaf_scales, load_inventory, load_sim_cases,
-    measure_iteration, measured_gpu_cycles_ms, occurrence_ns, read_json, single_iter_manifest,
-    CaseMapDoc, CompiledInventory, IterationMeasurement, MeasuredIteration, ParsedTrace, SimCase,
+    duty_cycle_recommendation, encode_record, interval_union_ns, kernel_name_index, leaf_scales,
+    load_inventory, load_sim_cases, measure_iteration, measured_gpu_cycles_ms,
+    measured_path_fields, occurrence_ns, parsed_trace, physical_kernel_rows,
+    pooled_gpu_time_multiplier, read_json, screen_duty_cycle_outliers, single_iter_manifest,
+    CaseMapDoc, CompiledInventory, DutyCycleSample, EncodedRecord, IterationMeasurement,
+    JsonlShardWriter, MeasuredIteration, PhysicalKernelRow, SimCase,
 };
 use crate::alignment_input;
 use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
@@ -57,7 +63,7 @@ use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
 const MAX_ITERATIONS: usize = 32;
 
 /// Sibling of the payload holding one iteration's full detail per line.
-const ITERATION_DETAIL_FILE: &str = "alignment_timeline_iterations.jsonl";
+const ITERATION_DETAIL_FILE: &str = "alignment_timeline_iterations.jsonl.zst";
 
 /// The phase whose folded kernel program identifies an iteration's shape. The
 /// other phases (preprocess / sample / bookkeep …) are the same few kernels
@@ -78,7 +84,7 @@ const SELECTION_RULE: &str = "every iteration in the capture, in iteration order
 
 const ANCHOR_RULE: &str = "min kernel start over the reference rank. Deliberately the same \
      expression `measured_gpu_cycle_ms` uses to bound a GPU iteration, so the sim \
-     lane's left edge and the duty-cycle denominator agree by construction. It is \
+     lane's left edge and the measured cycle boundary agree by construction. It is \
      an assumption about where a modelled iteration begins, not a measurement.";
 
 /// One iteration reduced to the scalars the selection rule needs. Cheap enough to
@@ -92,6 +98,7 @@ struct IterationSummary {
     measured_ms: f64,
     simulated_ms: f64,
     relative_diff_pct: f64,
+    pdl_wait_under_collective_ms: f64,
 }
 
 impl IterationSummary {
@@ -126,9 +133,62 @@ impl Selection {
     }
 }
 
+/// Freeze logical display-name ids before parallel iteration serialization.
+/// Physical capture ids remain unchanged; the no-physical-id sentinel must
+/// never reach a browser as an imprecise JavaScript number.
+struct TimelineNames {
+    dictionary: BTreeMap<u64, String>,
+    physical_ids: BTreeSet<u64>,
+    logical_ids: BTreeMap<String, u64>,
+}
+
+impl TimelineNames {
+    fn new(physical: &BTreeMap<u64, &str>, logical: BTreeSet<String>) -> Result<Self> {
+        const MAX_JSON_INTEGER: u64 = (1_u64 << 53) - 1;
+        ensure!(
+            physical.keys().all(|id| *id <= MAX_JSON_INTEGER),
+            "physical kernel name id exceeds JavaScript's exact integer range"
+        );
+        let mut dictionary: BTreeMap<_, _> = physical
+            .iter()
+            .map(|(id, name)| (*id, (*name).to_string()))
+            .collect();
+        let mut logical_ids = BTreeMap::new();
+        let mut candidate = 0;
+        for name in logical {
+            while dictionary.contains_key(&candidate) {
+                candidate += 1;
+            }
+            ensure!(candidate <= MAX_JSON_INTEGER, "timeline name ids exhausted");
+            dictionary.insert(candidate, name.clone());
+            logical_ids.insert(name, candidate);
+        }
+        Ok(Self {
+            dictionary,
+            logical_ids,
+            physical_ids: physical.keys().copied().collect(),
+        })
+    }
+
+    fn resolve(&self, source_id: u64, name: &str) -> Result<u64> {
+        if source_id == u64::MAX {
+            return self
+                .logical_ids
+                .get(name)
+                .copied()
+                .with_context(|| format!("unregistered logical kernel name {name:?}"));
+        }
+        ensure!(
+            self.physical_ids.contains(&source_id),
+            "unknown physical kernel name id {source_id}"
+        );
+        Ok(source_id)
+    }
+}
+
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_kernel_align(log_dir)?;
-    let measured: ParsedTrace = read_json(&input.parsed_nsys)?;
+    let measured = parsed_trace(&input.parsed_nsys)?;
     let case_map: CaseMapDoc = read_json(&input.timing_predict_case_map)?;
     ensure!(
         case_map.schema_version == 1,
@@ -170,38 +230,73 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // Pass one: the scalars the selection needs, for every case. This repeats
     // `alignment-iteration`'s measured reduction rather than reading its report,
     // because a subject may not depend on another subject's output.
-    let mut summaries = Vec::with_capacity(case_map.cases.len());
-    for joined in &case_map.cases {
-        let measured_iter = measured_by_id
-            .get(&joined.measured_iteration)
-            .with_context(|| {
+    //
+    // The body is a pure function of one case, so it runs in parallel. `map` +
+    // ordered `collect` rather than a shared accumulator: the two vectors stay
+    // in case-map order, which is what `screen_duty_cycle_outliers` sums over,
+    // so the pooled multiplier is bit-identical to the serial version. On a
+    // 10,707-iteration capture this is the whole subject's cost.
+    let pass_one: Vec<((DutyCycleSample, IterationSummary), BTreeSet<String>)> = case_map
+        .cases
+        .par_iter()
+        .map(|joined| {
+            let measured_iter = measured_by_id
+                .get(&joined.measured_iteration)
+                .with_context(|| {
+                    format!(
+                        "case {} points to missing measured iteration {}",
+                        joined.case_index, joined.measured_iteration
+                    )
+                })?;
+            let sim = sim_cases.get(&joined.case_index).with_context(|| {
                 format!(
-                    "case {} points to missing measured iteration {}",
-                    joined.case_index, joined.measured_iteration
+                    "missing timing-predict cost row for case {}",
+                    joined.case_index
                 )
             })?;
-        let sim = sim_cases.get(&joined.case_index).with_context(|| {
-            format!(
-                "missing timing-predict cost row for case {}",
-                joined.case_index
-            )
-        })?;
-        let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
-        let measured_ms = critical_path_ms(&measurement);
-        summaries.push(IterationSummary {
-            case_index: joined.case_index,
-            iteration_id: measured_iter.iteration,
-            stage: joined.stage.clone(),
-            iteration_type: measured_iter.iteration_type.clone(),
-            identity_sequence: inventory
-                .sequence_id(IDENTITY_PHASE, measured_iter.iteration)
-                .unwrap_or("")
-                .to_string(),
-            measured_ms,
-            simulated_ms: sim.total_ms,
-            relative_diff_pct: relative_pct(sim.total_ms - measured_ms, measured_ms),
-        });
-    }
+            let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
+            let path = barrier::barrier_path(&measurement)
+                .with_context(|| format!("measured iteration {}", measured_iter.iteration))?;
+            let measured_ms = path.critical_path_ns() as f64 / 1e6;
+            let sample = DutyCycleSample {
+                iteration: measured_iter.iteration,
+                stage: joined.stage.clone(),
+                measured_gpu_cycle_ms: gpu_cycles_ms.get(&measured_iter.iteration).copied(),
+                measured_ms,
+                measured_busy_union_ms: measurement.busy_union_ms,
+                jit_stall_ms: measured_iter.jit_stall_ns as f64 / 1.0e6,
+                jit_module_loads: measured_iter.jit_module_loads,
+            };
+            let summary = IterationSummary {
+                case_index: joined.case_index,
+                iteration_id: measured_iter.iteration,
+                stage: joined.stage.clone(),
+                iteration_type: measured_iter.iteration_type.clone(),
+                identity_sequence: inventory
+                    .sequence_id(IDENTITY_PHASE, measured_iter.iteration)
+                    .unwrap_or("")
+                    .to_string(),
+                measured_ms,
+                simulated_ms: sim.total_ms,
+                relative_diff_pct: relative_pct(sim.total_ms - measured_ms, measured_ms),
+                pdl_wait_under_collective_ms: path.pdl_wait_under_collective_ns as f64 / 1e6,
+            };
+            let logical_names = measurement
+                .kernels
+                .iter()
+                .filter(|(_, item)| item.name_id == u64::MAX)
+                .map(|(_, item)| item.name.clone())
+                .collect();
+            Ok(((sample, summary), logical_names))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let (samples_and_summaries, logical_names): (Vec<_>, Vec<_>) = pass_one.into_iter().unzip();
+    let (duty_cycle_samples, summaries): (Vec<_>, Vec<_>) =
+        samples_and_summaries.into_iter().unzip();
+    let timeline_names =
+        TimelineNames::new(&kernel_names, logical_names.into_iter().flatten().collect())?;
     ensure!(!summaries.is_empty(), "alignment case map is empty");
 
     // The pooled duty-cycle correction, over EVERY iteration — not just the ones
@@ -209,19 +304,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // rather than read from its report, because a subject may not depend on
     // another subject's output; the sim lane's `x duty` bar is meaningless if the
     // two disagree.
-    let mut sum_measured_gpu_cycle_ms = 0.0;
-    let mut sum_measured_ms_with_cycle = 0.0;
-    for summary in &summaries {
-        if let Some(cycle_ms) = gpu_cycles_ms.get(&summary.iteration_id) {
-            sum_measured_gpu_cycle_ms += cycle_ms;
-            sum_measured_ms_with_cycle += summary.measured_ms;
-        }
-    }
-    let gpu_time_multiplier = if sum_measured_ms_with_cycle > 0.0 {
-        sum_measured_gpu_cycle_ms / sum_measured_ms_with_cycle
-    } else {
-        1.0
-    };
+    let (multiplier_excluded_iterations, sum_measured_gpu_cycle_ms, sum_measured_ms) =
+        screen_duty_cycle_outliers(&duty_cycle_samples);
+    let raw_gpu_time_multiplier =
+        pooled_gpu_time_multiplier(sum_measured_gpu_cycle_ms, sum_measured_ms);
+    let (gpu_time_multiplier, duty_cycle_unavailable_reason) =
+        duty_cycle_recommendation(raw_gpu_time_multiplier);
 
     let selected = select_iterations(&summaries, input.timeline_iterations.as_deref())?;
     eprintln!(
@@ -281,58 +369,68 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .map(|window| (window.iteration_id, window.anchor_ns))
         .collect();
 
-    // Pass two: the full detail. Each iteration's detail is serialized straight
-    // into the shard buffer rather than collected, so peak memory is one
-    // iteration and not the whole capture.
+    // Pass two: build independent selected iterations in bounded parallel
+    // chunks, then write their already-serialized lines in selection order.
+    let mut detail_writer = JsonlShardWriter::create(log_dir, ITERATION_DETAIL_FILE)?;
     let mut index_iterations = Vec::with_capacity(selected.len());
     let mut report_iterations = Vec::with_capacity(selected.len());
-    let mut detail_bytes: Vec<u8> = Vec::new();
     let mut byte_ranges = serde_json::Map::new();
+    let mut decoded_lengths = serde_json::Map::new();
     let mut used_name_ids = BTreeSet::new();
-    for (index, reason) in &selected {
-        let summary = &summaries[*index];
-        let measured_iter = measured_by_id[&summary.iteration_id];
-        let sim = &sim_cases[&summary.case_index];
-        let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
-        let reference = reference_device_id
-            .or_else(|| measurement.device_ids.first().copied())
-            .context("measured iteration has no device ids")?;
-
-        let built = build_iteration(
-            summary,
-            *reason,
-            &measurement,
-            sim,
-            &inventory,
-            manifest,
-            &scales,
-            reference,
-            time_origin_ns,
-            gpu_cycles_ms.get(&summary.iteration_id).copied(),
-            gpu_time_multiplier,
-            host_anchors
-                .get(&summary.iteration_id)
-                .map(|anchor_ns| HostContext {
-                    anchor_ns: *anchor_ns,
-                    rows: host_timeline
-                        .as_ref()
-                        .and_then(|timeline| timeline.iteration(summary.iteration_id)),
-                }),
-            &mut used_name_ids,
-        )?;
-        let line = serde_json::to_vec(&built.detail)?;
-        byte_ranges.insert(
-            summary.iteration_id.to_string(),
-            json!([detail_bytes.len(), line.len()]),
-        );
-        detail_bytes.extend_from_slice(&line);
-        detail_bytes.push(b'\n');
-        index_iterations.push(built.index);
-        // The report is the read-by-a-person half, and a person cannot read two
-        // thousand iterations. It keeps the ones the selection distinguished;
-        // the payload keeps everything, seekable.
-        if *reason != Selection::FullCapture {
-            report_iterations.push(built.report);
+    for chunk in selected.chunks(super::MEASURE_CHUNK) {
+        let outputs = chunk
+            .par_iter()
+            .map(|(index, reason)| -> Result<TimelineOutput> {
+                let summary = &summaries[*index];
+                let measured_iter = measured_by_id[&summary.iteration_id];
+                let sim = &sim_cases[&summary.case_index];
+                let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
+                let reference = reference_device_id
+                    .or_else(|| measurement.device_ids.first().copied())
+                    .context("measured iteration has no device ids")?;
+                let built = build_iteration(
+                    summary,
+                    *reason,
+                    &measurement,
+                    sim,
+                    &inventory,
+                    manifest,
+                    &scales,
+                    reference,
+                    time_origin_ns,
+                    gpu_cycles_ms.get(&summary.iteration_id).copied(),
+                    gpu_time_multiplier,
+                    host_anchors
+                        .get(&summary.iteration_id)
+                        .map(|anchor_ns| HostContext {
+                            anchor_ns: *anchor_ns,
+                            rows: host_timeline
+                                .as_ref()
+                                .and_then(|timeline| timeline.iteration(summary.iteration_id)),
+                        }),
+                    &timeline_names,
+                )?;
+                Ok(TimelineOutput {
+                    iteration_id: summary.iteration_id,
+                    record: encode_record(built.detail)?,
+                    index: built.index,
+                    report: (*reason != Selection::FullCapture).then_some(built.report),
+                    used_name_ids: built.used_name_ids,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        for output in outputs {
+            let (offset, length) = detail_writer.write_record(&output.record)?;
+            let iteration_id = output.iteration_id.to_string();
+            decoded_lengths.insert(iteration_id.clone(), json!(output.record.decoded_len));
+            byte_ranges.insert(iteration_id, json!([offset, length]));
+            index_iterations.push(output.index);
+            if let Some(report) = output.report {
+                report_iterations.push(report);
+            }
+            used_name_ids.extend(output.used_name_ids);
         }
     }
 
@@ -350,7 +448,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .collect();
     let kernel_name_dictionary: BTreeMap<String, &str> = used_name_ids
         .iter()
-        .filter_map(|id| kernel_names.get(id).map(|name| (id.to_string(), *name)))
+        .filter_map(|id| {
+            timeline_names
+                .dictionary
+                .get(id)
+                .map(|name| (id.to_string(), name.as_str()))
+        })
         .collect();
 
     // The cost manifest verbatim, so the renderer rebuilds the nested tree with
@@ -378,7 +481,15 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "reference_device_id": reported_reference_device_id,
         // Kernel-only sim time scaled by this is wall-clock GPU time, which is
         // what the sim lane's `x duty` bar draws against the measured GPU cycle.
+        "raw_gpu_time_multiplier": raw_gpu_time_multiplier,
         "recommended_gpu_time_multiplier": gpu_time_multiplier,
+        "duty_cycle_available": gpu_time_multiplier.is_some(),
+        "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
+        "multiplier_excluded_iterations": multiplier_excluded_iterations,
+        "pdl_wait_under_collective_ms": summaries
+            .iter()
+            .map(|summary| summary.pdl_wait_under_collective_ms)
+            .sum::<f64>(),
         "iterations_available": summaries.len(),
         // Two different counts on purpose: the payload indexes every iteration,
         // the report writes up the distinguished ones.
@@ -407,16 +518,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "iterations": report_iterations,
         "definitions": definitions,
     });
-    // The detail shard is written here rather than returned, because the
-    // subject contract is one report and one payload. Doing it before the
-    // payload is returned means an index can never name a shard that the caller
-    // failed to write.
-    let detail_path = crate::io::payload_path(log_dir, ITERATION_DETAIL_FILE);
-    if let Some(parent) = detail_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&detail_path, &detail_bytes)
-        .with_context(|| format!("write {}", detail_path.display()))?;
+    // The detail shard is flushed here rather than returned, because the subject
+    // contract is one report and one payload. Doing it before the payload is
+    // returned means an index can never name a shard whose tail is still in a
+    // buffer.
+    let (detail_file, detail_path) = detail_writer.finish(log_dir)?;
     println!("wrote {}", detail_path.display());
 
     let payload = json!({
@@ -428,32 +534,14 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "slot_multiplicity": scales,
         "iterations": index_iterations,
         "iteration_detail": {
-            "file": ITERATION_DETAIL_FILE,
-            "encoding": "one JSON object per line, in the order of `iterations`",
+            "file": detail_file,
+            "encoding": super::ZSTD_FRAMES,
             "byte_ranges": byte_ranges,
+            "decoded_lengths": decoded_lengths,
         },
         "definitions": definitions,
     });
     Ok((report, payload))
-}
-
-/// The headline measured duration: every occurrence reduced across its ranks,
-/// then summed. Identical to `alignment-iteration`'s `measured_ms` — including
-/// the float summation ORDER, which is why the mapped and unmapped halves are
-/// accumulated separately and added at the end. Two subjects that disagree in the
-/// last ulp about the same quantity are a bug report waiting to happen.
-fn critical_path_ms(measurement: &IterationMeasurement) -> f64 {
-    let mut mapped_ms = 0.0;
-    let mut unmapped_ms = 0.0;
-    for (_, item) in &measurement.kernels {
-        let duration_ms = occurrence_ns(&item.launches, item.synchronizing) as f64 / 1e6;
-        if item.operation.is_some() {
-            mapped_ms += duration_ms;
-        } else {
-            unmapped_ms += duration_ms;
-        }
-    }
-    mapped_ms + unmapped_ms
 }
 
 /// Label every iteration, distinguishing the ones worth opening first.
@@ -597,14 +685,95 @@ struct HostContext<'a> {
     rows: Option<&'a host::IterationHost>,
 }
 
-/// One iteration, in the three shapes it is read in.
+/// One iteration's finished output, carried back from the parallel build to the
+/// serial writer. Holds the already-serialized detail line rather than the
+/// `Value` it came from, so the tree is dropped on the worker that built it.
+struct TimelineOutput {
+    iteration_id: u64,
+    record: EncodedRecord,
+    index: Value,
+    report: Option<Value>,
+    used_name_ids: BTreeSet<u64>,
+}
+
+/// One line of the timeline detail shard, typed for the reason
+/// `super::PhysicalKernelRow` gives. Field order is the old `json!` key order.
+#[derive(Serialize)]
+struct TimelineDetail<'a> {
+    iteration_id: u64,
+    case_index: u64,
+    stage: &'a str,
+    iteration_type: &'a str,
+    identity_sequence: &'a str,
+    selected_as: &'static str,
+    anchor_ns: Option<i64>,
+    gpu_span_ns: Option<(i64, i64)>,
+    measured_gpu_cycle_ms: Option<f64>,
+    simulated_gpu_cycle_ms: Option<f64>,
+    measured: MeasuredBlock<'a>,
+    simulated: SimulatedBlock<'a>,
+    operation_totals: Vec<Value>,
+    host: Option<Value>,
+    /// The reference rank's occupancy, as the report row states it: the
+    /// wall-clock card reads these numbers rather than re-deriving them from
+    /// the intervals above.
+    reference_rank: &'a Value,
+}
+
+#[derive(Serialize)]
+struct MeasuredBlock<'a> {
+    critical_path_ms: f64,
+    busy_union_ms: f64,
+    kernels: Vec<TimelineKernelRow<'a>>,
+    segments: Vec<Value>,
+    barriers: Vec<Value>,
+    /// The barrier-path scalars except `measured_ms`, which the block already
+    /// carries as `critical_path_ms`.
+    #[serde(flatten)]
+    path_fields: serde_json::Map<String, Value>,
+}
+
+#[derive(Serialize)]
+struct SimulatedBlock<'a> {
+    total_ms: f64,
+    slot_ms: &'a [f64],
+    slot_op: Vec<Value>,
+}
+
+/// `ov` per launch: overlap, same-stream, and cross-stream ns, stream id, partners.
+type OverlapCell<'a> = (u64, u64, u64, Option<u64>, &'a Vec<(usize, u64)>);
+/// `iv` per launch: device, start and end relative to the time origin,
+/// correlation id, track.
+type IntervalCell = (i64, i64, i64, Option<u64>, usize);
+
+#[derive(Serialize)]
+struct TimelineKernelRow<'a> {
+    ph: &'a str,
+    row: &'a str,
+    name_id: u64,
+    cat: &'a str,
+    op: Option<&'a str>,
+    operation_ordinal: Option<usize>,
+    physical_kernels: Vec<PhysicalKernelRow<'a>>,
+    sync: bool,
+    occ_ns: u64,
+    crit_ms: f64,
+    path_ms: f64,
+    ov: Vec<OverlapCell<'a>>,
+    iv: Vec<IntervalCell>,
+}
+
 struct BuiltIteration {
-    /// Everything, one line of the detail shard.
-    detail: Value,
+    /// Everything, one serialized line of the detail shard.
+    detail: Vec<u8>,
     /// The analyst-facing numbers, including the ranked gaps.
     report: Value,
     /// The scalars a picker needs before it fetches anything.
     index: Value,
+    /// Physical kernel-name ids this iteration referenced. Returned rather than
+    /// pushed into a caller-owned set so the build can run off the serial path;
+    /// the caller unions them, and a `BTreeSet` union is order-insensitive.
+    used_name_ids: BTreeSet<u64>,
 }
 
 /// The reference rank's kernel span, straight from the parsed ranges.
@@ -649,50 +818,82 @@ fn build_iteration(
     reference_device_id: i64,
     time_origin_ns: u64,
     measured_gpu_cycle_ms: Option<f64>,
-    gpu_time_multiplier: f64,
+    gpu_time_multiplier: Option<f64>,
     host_context: Option<HostContext<'_>>,
-    used_name_ids: &mut BTreeSet<u64>,
+    timeline_names: &TimelineNames,
 ) -> Result<BuiltIteration> {
-    let simulated_gpu_cycle_ms = sim.total_ms * gpu_time_multiplier;
+    let mut used_name_ids: BTreeSet<u64> = BTreeSet::new();
+    let simulated_gpu_cycle_ms = gpu_time_multiplier.map(|multiplier| sim.total_ms * multiplier);
     let offset = |ns: u64| (ns as i64) - (time_origin_ns as i64);
 
     // ---- measured -----------------------------------------------------------
+    let path = barrier::barrier_path(measurement)?;
+    let overlaps = barrier::launch_overlaps(measurement);
     let mut measured_operation_ms: BTreeMap<&str, f64> = BTreeMap::new();
     let mut measured_operation_rows: BTreeMap<&str, usize> = BTreeMap::new();
     let mut kernel_rows = Vec::with_capacity(measurement.kernels.len());
-    for (_, item) in &measurement.kernels {
+    for (kernel_index, (_, item)) in measurement.kernels.iter().enumerate() {
         let occurrence = occurrence_ns(&item.launches, item.synchronizing);
         if let Some(operation) = &item.operation {
             *measured_operation_ms.entry(operation.as_str()).or_default() +=
-                occurrence as f64 / 1e6;
+                path.kernel_critical_ns[kernel_index] as f64 / 1e6;
             *measured_operation_rows
                 .entry(operation.as_str())
                 .or_default() += 1;
         }
-        used_name_ids.insert(item.name_id);
-        let mut launches: Vec<_> = item.launches.clone();
-        launches.sort_by_key(|launch| (launch.device_id, launch.start_ns));
-        kernel_rows.push(json!({
-            "ph": item.phase,
-            "row": item.row_id,
-            "name_id": item.name_id,
-            "cat": item.category,
-            "op": item.operation,
-            "sync": item.synchronizing,
-            "occ_ns": occurrence,
-            "iv": launches
+        used_name_ids.extend(
+            item.physical_kernels
+                .keys()
+                .map(|identity| identity.name_id),
+        );
+        let name_id = timeline_names.resolve(item.name_id, &item.name)?;
+        used_name_ids.insert(name_id);
+        let mut order: Vec<usize> = (0..item.launches.len()).collect();
+        order.sort_by_key(|&index| {
+            (
+                item.launches[index].device_id,
+                item.launches[index].start_ns,
+            )
+        });
+        kernel_rows.push(TimelineKernelRow {
+            ph: &item.phase,
+            row: &item.row_id,
+            name_id,
+            cat: &item.category,
+            op: item.operation.as_deref(),
+            operation_ordinal: item.operation_ordinal,
+            physical_kernels: physical_kernel_rows(item),
+            sync: item.synchronizing,
+            occ_ns: occurrence,
+            crit_ms: path.kernel_critical_ns[kernel_index] as f64 / 1e6,
+            path_ms: path.kernel_on_path_ns[kernel_index] as f64 / 1e6,
+            ov: order
                 .iter()
-                .map(|launch| {
-                    json!([
+                .map(|&index| {
+                    let overlap = &overlaps[kernel_index][index];
+                    (
+                        overlap.overlap_ns,
+                        overlap.same_stream_ns,
+                        overlap.cross_stream_ns,
+                        item.launches[index].stream_id,
+                        &overlap.partners,
+                    )
+                })
+                .collect(),
+            iv: order
+                .iter()
+                .map(|&index| {
+                    let launch = &item.launches[index];
+                    (
                         launch.device_id,
                         offset(launch.start_ns),
                         offset(launch.end_ns),
                         launch.correlation_id,
                         launch.track_index,
-                    ])
+                    )
                 })
-                .collect::<Vec<_>>(),
-        }));
+                .collect(),
+        });
     }
 
     // ---- simulated ----------------------------------------------------------
@@ -773,60 +974,106 @@ fn build_iteration(
         );
     }
 
+    let path_fields = measured_path_fields(&path);
+    let block_path_fields = path_fields
+        .iter()
+        .filter(|(key, _)| key.as_str() != "measured_ms")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let measured_block = MeasuredBlock {
+        critical_path_ms: summary.measured_ms,
+        busy_union_ms: measurement.busy_union_ms,
+        kernels: kernel_rows,
+        segments: path
+            .segments
+            .iter()
+            .map(|segment| {
+                json!({
+                    "start_ns": offset(segment.start_ns),
+                    "end_ns": offset(segment.end_ns),
+                    "winner": segment.winner,
+                    "busy_ns_by_device": segment
+                        .busy_ns_by_device
+                        .iter()
+                        .map(|(device, ns)| (device.to_string(), *ns))
+                        .collect::<BTreeMap<_, _>>(),
+                    "idle_internal_ns": segment.idle_internal_ns,
+                    "idle_boundary_ns": segment.idle_boundary_ns,
+                    "gating_device_id": segment.gating_device_id,
+                    "gating_gap_ns": segment.gating_gap_ns,
+                })
+            })
+            .collect::<Vec<_>>(),
+        barriers: path
+            .barriers
+            .iter()
+            .map(|barrier| {
+                json!({
+                    "positions": barrier.positions,
+                    "enter_ns": offset(barrier.enter_ns),
+                    "exit_ns": offset(barrier.exit_ns),
+                    "net_ns": barrier.net_ns,
+                    "skew_ns": barrier.skew_ns,
+                    "last_exit_device": barrier.last_exit_device,
+                })
+            })
+            .collect::<Vec<_>>(),
+        path_fields: block_path_fields,
+    };
+
     let occupancy = reference.occupancy();
+    let reference_rank =
+        reference.report(&occupancy, reference_device_id, measurement, time_origin_ns);
     let host_rows = host_context.and_then(|context| context.rows);
-    let detail = json!({
-        "iteration_id": summary.iteration_id,
-        "case_index": summary.case_index,
-        "stage": summary.stage,
-        "iteration_type": summary.iteration_type,
-        "identity_sequence": summary.identity_sequence,
-        "selected_as": reason.label(),
-        "anchor_ns": anchor_ns.map(offset),
-        "gpu_span_ns": reference
+    let detail = serde_json::to_vec(&TimelineDetail {
+        iteration_id: summary.iteration_id,
+        case_index: summary.case_index,
+        stage: &summary.stage,
+        iteration_type: &summary.iteration_type,
+        identity_sequence: &summary.identity_sequence,
+        selected_as: reason.label(),
+        anchor_ns: anchor_ns.map(offset),
+        gpu_span_ns: reference
             .span
-            .map(|(start, end)| json!([offset(start), offset(end)])),
-        "measured_gpu_cycle_ms": measured_gpu_cycle_ms,
-        "simulated_gpu_cycle_ms": simulated_gpu_cycle_ms,
-        "measured": {
-            "critical_path_ms": summary.measured_ms,
-            "busy_union_ms": measurement.busy_union_ms,
-            "kernels": kernel_rows,
+            .map(|(start, end)| (offset(start), offset(end))),
+        measured_gpu_cycle_ms,
+        simulated_gpu_cycle_ms,
+        measured: measured_block,
+        simulated: SimulatedBlock {
+            total_ms: sim.total_ms,
+            slot_ms: &sim.slot_ms,
+            slot_op: slot_operations,
         },
-        "simulated": {
-            "total_ms": sim.total_ms,
-            "slot_ms": sim.slot_ms,
-            "slot_op": slot_operations,
-        },
-        "operation_totals": operation_totals,
+        operation_totals,
         // Absent when the capture carries no host sidecar, which is a different
         // fact from "the CPU did nothing" and must not render as an empty lane.
-        "host": host_rows.map(host::IterationHost::value),
-    });
+        host: host_rows.map(host::IterationHost::value),
+        reference_rank: &reference_rank,
+    })?;
 
-    let report = json!({
+    let mut report = json!({
         "iteration_id": summary.iteration_id,
         "case_index": summary.case_index,
         "stage": summary.stage,
         "iteration_type": summary.iteration_type,
         "identity_sequence": summary.identity_sequence,
         "selected_as": reason.label(),
-        "measured_ms": summary.measured_ms,
         "simulated_ms": summary.simulated_ms,
         "delta_ms": summary.simulated_ms - summary.measured_ms,
         "relative_diff_pct": summary.relative_diff_pct,
         "measured_gpu_cycle_ms": measured_gpu_cycle_ms,
-        "simulated_gpu_cycle_ms": measured_gpu_cycle_ms.map(|_| simulated_gpu_cycle_ms),
-        "gpu_cycle_delta_ms": measured_gpu_cycle_ms.map(|cycle| simulated_gpu_cycle_ms - cycle),
+        "simulated_gpu_cycle_ms": measured_gpu_cycle_ms.and(simulated_gpu_cycle_ms),
+        "gpu_cycle_delta_ms": measured_gpu_cycle_ms
+            .zip(simulated_gpu_cycle_ms)
+            .map(|(cycle, simulated_cycle)| simulated_cycle - cycle),
         "measured_busy_union_ms": measurement.busy_union_ms,
         "measured_rows": measurement.kernels.len(),
-        "reference_rank": reference.report(
-            &occupancy,
-            reference_device_id,
-            measurement,
-            time_origin_ns,
-        ),
+        "reference_rank": reference_rank,
     });
+    report
+        .as_object_mut()
+        .expect("report row is an object")
+        .extend(path_fields);
 
     // The picker's row. Everything here is a scalar the reader sorts or filters
     // on before choosing what to fetch; anything per-kernel stays in the shard.
@@ -839,6 +1086,7 @@ fn build_iteration(
         "selected_as": reason.label(),
         "anchor_ns": anchor_ns.map(offset),
         "measured_ms": summary.measured_ms,
+        "critical_rank_switches": path.critical_rank_switches,
         "simulated_ms": summary.simulated_ms,
         "relative_diff_pct": summary.relative_diff_pct,
         "measured_gpu_cycle_ms": measured_gpu_cycle_ms,
@@ -854,6 +1102,7 @@ fn build_iteration(
         detail,
         report,
         index,
+        used_name_ids,
     })
 }
 
@@ -1037,6 +1286,15 @@ impl ReferenceRank {
         crossing.sort_by(|left, right| {
             (right.end_ns - right.start_ns).cmp(&(left.end_ns - left.start_ns))
         });
+        let phases: Vec<_> = measurement
+            .phase_summaries
+            .iter()
+            .filter(|summary| summary.device_id == device_id)
+            .collect();
+        // Phase extents can overlap when two phases interleave on the device,
+        // so what no phase covers is taken against their union.
+        let phase_spans: Vec<(u64, u64)> = phases.iter().map(|summary| summary.span_ns).collect();
+        let inter_phase_ms = (span_ms - interval_union_ns(&phase_spans) as f64 / 1e6).max(0.0);
         json!({
             "device_id": device_id,
             "span_ms": span_ms,
@@ -1044,13 +1302,24 @@ impl ReferenceRank {
             "idle_ms": idle_ms,
             "idle_fraction": occupancy.idle_fraction(),
             "gap_count": self.gaps.len(),
+            // Every gap, in span order, so the lane draws these rather than
+            // re-deriving them from the launches.
+            "gaps_ns": self
+                .gaps
+                .iter()
+                .map(|gap| {
+                    [
+                        (gap.start_ns as i64) - (time_origin_ns as i64),
+                        (gap.end_ns as i64) - (time_origin_ns as i64),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+            "inter_phase_ms": inter_phase_ms,
             // Per phase, because a whole-iteration idle figure is dominated by
             // the host time BETWEEN phases, which is a different fact from a
             // stall inside the forward pass.
-            "phases": measurement
-                .phase_summaries
+            "phases": phases
                 .iter()
-                .filter(|summary| summary.device_id == device_id)
                 .map(|summary| {
                     let phase_span_ms = (summary.span_ns.1 - summary.span_ns.0) as f64 / 1e6;
                     json!({
@@ -1098,23 +1367,165 @@ fn definitions() -> Value {
         "gpu_span_ns": "reference rank's [first kernel start, last kernel end]. The correlated kernel span, NOT the NVTX range: under CUDA graphs the range can close before its own kernels finish",
         "measured.kernels[].iv": "one [device_id, start_ns, end_ns, correlation_id, track_index] per rank launch of this kernel position, unreduced. Bubbles are the complement of the union of these over the span, and must be computed from these raw intervals rather than from drawn geometry; correlation_id is the NSYS launch identity used to connect the CUDA API lane",
         "measured.kernels[].iv[4]": "the concurrent CUDA stream (track) this launch ran on, 0 being the one that opened the range. Launches on different tracks of one device overlap in wall time, so a single lane per device would draw them as if they had been serial: give each (device, track) its own lane. A single-stream capture has track 0 only and draws exactly as before",
-        "measured.kernels[].occ_ns": "this occurrence's cross-rank critical-path contribution (independent = slowest rank's duration; synchronizing collective = max(end) - max(start)). Their sum is measured.critical_path_ms",
+        "measured.kernels[].occ_ns": "this occurrence's cross-rank reduction retained for audit",
+        "measured.kernels[].crit_ms": "this position's share of measured.critical_path_ms under the barrier model; these sum to it exactly. path_ms is its segment winners' clipped launch durations",
+        "measured.kernels[].ov": "one [overlap_ns, same_stream_ns, cross_stream_ns, stream_id, partners] per entry of iv, in the same order. overlap_ns is the intersection with the union of every other launch on the same device; same/cross restrict that to launches on this launch's stream or on others. partners is [[position, ns], ...] naming each overlapping position by its index in measured.kernels. A shared stretch appears on both sides of a pair. same_stream_ns may be griddepcontrol.wait residency (PDL)",
+        "measured.segments": "the windows between barriers, in time order: [start_ns, end_ns], the winning rank (largest busy union), every rank's busy ns, the winner's idle split, and the gating rank (last to arrive at the closing barrier, or last to finish for the final window) with its own non-busy ns",
+        "measured.barriers": "one per maximal run of consecutive synchronizing positions: the positions, last arrival (enter_ns), last exit (exit_ns), net_ns on the path, skew_ns off it, and the rank that left last",
         "simulated.slot_ms": "per-slot UNIT time. Feed these to the cost-tree unfold and let Scale{n} repeat them; critical-path-attributed times would render a losing Max branch as a zero-width leaf",
         "slot_multiplicity": "each slot's exact CostTree Scale multiplicity; folded workload = slot_ms x slot_multiplicity. Shared by every iteration because the tree shape is static",
         "operation_totals": "the ONLY sound join between the two lanes. occurrence_ratio is a counting ratio (3 measured kernels priced as 1 modelled leaf), never a per-kernel correspondence",
         "reference_rank.idle_ms": "span_ms - busy_ms over the reference rank's correlated kernels; this is the bubble budget the GPU lane draws",
+        "reference_rank.gaps_ns": "every stretch of the reference rank's span with no kernel on it, as [start_ns, end_ns] in span order, capture-relative like gpu_span_ns; the complement of its launches' union inside gpu_span_ns",
+        "reference_rank.inter_phase_ms": "span_ms not covered by any phase's kernel span on the reference rank: the GPU waiting on the host between phases",
+        "reference_rank": "carried on every timeline detail row as well as on the report row, so the wall-clock card reads the reference rank's occupancy and gaps instead of re-deriving them",
         "selected_as": "why this iteration is in the file: group_median (a typical member of its kernel program), global_max_error / global_min_error (the capture's extremes), or manifest_override",
         "host.nvtx": "per thread, one [start_ns, duration_ns, string_id, depth] per NVTX range overlapping this iteration's host window. start_ns is anchor-relative like host.window_ns, NOT capture-relative like gpu_span_ns and the measured kernel intervals — the host block keeps small numbers because there are millions of these rows. Depth is measured containment on that thread, not an assumed outer/inner split",
         "host.api": "per thread, one [start_ns, duration_ns, string_id, class_index, correlation_id] per CUDA runtime call, anchor-relative like host.nvtx. class_index indexes meta.host_timeline.api_classes; correlation_id is the NSYS launch identity used to connect this call to one measured kernel; a thread between two calls is unaccounted for, not idle — the capture carries no CPU sampling",
         "host.window_ns": "this iteration's host window, anchor-relative. Wider than the GPU span on both sides, and overlapping its neighbours' — that overlap is the pipelining, see meta.host_timeline.window_rule",
         "iterations": "one summary row per emitted iteration — the scalars a picker sorts on. Every per-kernel and per-host-event field lives in the detail shard instead",
-        "iteration_detail.byte_ranges": "iteration_id -> [byte offset, byte length] into the sibling .jsonl. Read that range and parse it as one JSON object; the whole file is never needed at once",
+        "iteration_detail.byte_ranges": "iteration_id -> [byte offset, byte length] into the sibling .jsonl.zst. The range is one zstd frame (`encoding: zstd-frames`) that decodes to decoded_lengths[iteration_id] bytes: one JSON object and its newline. The whole file is never needed at once, and `zstd -d` turns it into plain JSONL",
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn logical_timeline_names_are_exact_and_do_not_replace_physical_ids() {
+        let physical = std::collections::BTreeMap::from([(0, "a"), (2, "b")]);
+        let names = super::TimelineNames::new(
+            &physical,
+            std::collections::BTreeSet::from(["joined-ranks".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(names.resolve(2, "b").unwrap(), 2);
+        let logical = names.resolve(u64::MAX, "joined-ranks").unwrap();
+        assert_eq!(logical, 1);
+        assert_eq!(names.dictionary[&logical], "joined-ranks");
+        assert!(names.resolve(logical, "missing physical id").is_err());
+        assert!(names.resolve(u64::MAX, "unregistered").is_err());
+    }
     use super::*;
+
+    const MS: u64 = 1_000_000;
+
+    /// One kernel occurrence: `(phase, operation, [(device, start, end)])`.
+    fn occurrence(
+        phase: &str,
+        operation: &str,
+        launches: &[(i64, u64, u64)],
+    ) -> (String, super::super::IterationKernelAggregate) {
+        let launches: Vec<_> = launches
+            .iter()
+            .map(
+                |&(device_id, start_ns, end_ns)| super::super::KernelLaunch {
+                    device_id,
+                    start_ns,
+                    end_ns,
+                    correlation_id: None,
+                    track_index: 0,
+                    stream_id: None,
+                },
+            )
+            .collect();
+        (
+            operation.to_owned(),
+            super::super::IterationKernelAggregate {
+                phase: phase.to_owned(),
+                name: format!("{operation}_kernel"),
+                operation: Some(operation.to_owned()),
+                device_ids: launches.iter().map(|launch| launch.device_id).collect(),
+                launches,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn phase(
+        device_id: i64,
+        phase: &str,
+        span_ns: (u64, u64),
+        busy_ms: f64,
+    ) -> super::super::PhaseSummary {
+        super::super::PhaseSummary {
+            device_id,
+            phase: phase.to_owned(),
+            busy_union_ms: busy_ms,
+            kernel_sum_ms: busy_ms,
+            kernel_count: 1,
+            span_ns,
+        }
+    }
+
+    /// preprocess 0-1 ms, forward 3-5 and 6-8 ms then 8.5-10 ms postprocess on
+    /// rank 0; rank 1 runs through rank 0's forward hole.
+    fn reference_rank_report() -> Value {
+        let measurement = IterationMeasurement {
+            kernels: vec![
+                occurrence("preprocess", "embed", &[(0, 0, MS)]),
+                occurrence(
+                    "forward",
+                    "kv_cache_append",
+                    &[(0, 3 * MS, 5 * MS), (1, 5 * MS, 6 * MS)],
+                ),
+                occurrence("forward", "attention", &[(0, 6 * MS, 8 * MS)]),
+                occurrence("postprocess", "sample", &[(0, 17 * MS / 2, 10 * MS)]),
+            ],
+            inventory_kernels: Vec::new(),
+            phase_summaries: vec![
+                phase(0, "preprocess", (0, MS), 1.0),
+                phase(0, "forward", (3 * MS, 8 * MS), 4.0),
+                phase(0, "postprocess", (17 * MS / 2, 10 * MS), 1.5),
+                phase(1, "forward", (5 * MS, 6 * MS), 1.0),
+            ],
+            device_ids: BTreeSet::from([0, 1]),
+            busy_union_ms: 0.0,
+            track_intervals: BTreeMap::new(),
+        };
+        let reference = ReferenceRank::of(&measurement, 0);
+        reference.report(&reference.occupancy(), 0, &measurement, 0)
+    }
+
+    #[test]
+    fn reference_rank_splits_the_span_into_phase_kernel_time_and_host_time() {
+        let report = reference_rank_report();
+        assert_eq!(report["span_ms"], 10.0);
+        assert_eq!(report["busy_ms"], 6.5);
+        assert_eq!(report["idle_ms"], 3.5);
+        // 1-3 ms and 8-8.5 ms lie in no phase's span.
+        assert_eq!(report["inter_phase_ms"], 2.5);
+        assert_eq!(report["gap_count"], 3);
+        // In span order; none before the first launch or after the last.
+        assert_eq!(
+            report["gaps_ns"],
+            json!([[MS, 3 * MS], [5 * MS, 6 * MS], [8 * MS, 17 * MS / 2]])
+        );
+        let phases = report["phases"].as_array().unwrap();
+        assert_eq!(
+            phases
+                .iter()
+                .map(|phase| phase["phase"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["preprocess", "forward", "postprocess"]
+        );
+        assert_eq!(phases[1]["busy_ms"], 4.0);
+        assert_eq!(phases[1]["idle_ms"], 1.0);
+        assert_eq!(phases[1]["idle_fraction"], 0.2);
+    }
+
+    #[test]
+    fn reference_rank_gaps_name_their_edges_and_ignore_peer_ranks() {
+        let report = reference_rank_report();
+        // Rank 1's kernel fills 5-6 ms on its own rank, not on the reference.
+        let forward_gaps = report["phases"][1]["largest_gaps"].as_array().unwrap();
+        assert_eq!(forward_gaps.len(), 1);
+        assert_eq!(forward_gaps[0]["start_ns"], 5 * MS);
+        assert_eq!(forward_gaps[0]["duration_us"], 1000.0);
+        assert_eq!(forward_gaps[0]["after"]["operation"], "kv_cache_append");
+        assert_eq!(forward_gaps[0]["before"]["operation"], "attention");
+        let crossing = report["largest_inter_phase_gaps"].as_array().unwrap();
+        assert_eq!(crossing[0]["duration_us"], 2000.0);
+    }
 
     fn summary(iteration_id: u64, kind: &str, sequence: &str, relative: f64) -> IterationSummary {
         IterationSummary {
@@ -1126,6 +1537,7 @@ mod tests {
             measured_ms: 1.0,
             simulated_ms: 1.0 + relative / 100.0,
             relative_diff_pct: relative,
+            pdl_wait_under_collective_ms: 0.0,
         }
     }
 

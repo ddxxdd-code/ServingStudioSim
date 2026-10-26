@@ -7,45 +7,112 @@
 pub mod build;
 pub mod config;
 pub mod contract;
-pub mod glm52_dsa_moe;
+pub mod deepseek_v41_vllm;
+pub mod deepseek_v4_vllm;
+pub mod glm52_model_cfg;
+pub mod glm52_sglang_nvfp4_tp_dsa_moe;
 pub mod glm52_vllm_dsa_moe;
+pub mod glm52_vllm_nvfp4_dp_attn_dsa_moe;
+pub mod glm52_vllm_nvfp4_dsa_moe;
+pub mod glm52_vllm_nvfp4_pp_dsa_moe;
+pub mod glm53_flash_vllm_fp8_dp_attn_ep_moe;
+pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
+pub mod glm53_flash_vllm_fp8_pp_kda_dsa_moe;
+pub mod inkling_model_cfg;
+pub mod inkling_vllm_nvfp4_rel_attn_moe;
+pub mod glm53_vllm_nvfp4_dsa_moe_dflash2;
+pub mod kv_layout;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
 pub mod llama3_dp_attn_tp_ffn;
+pub mod mimo_v2_model_cfg;
+pub mod mimo_v2_vllm_fp8_swa_moe;
 pub mod model_cfg;
 pub mod moe_model_cfg;
+pub mod qwen35_model_cfg;
+pub mod qwen35_vllm_nvfp4_gdn_dense;
+pub mod qwen36_local;
+pub mod qwen4_exp_model_cfg;
+pub mod qwen4_exp_vllm_nvfp4_gdn_qsa_moe;
 pub mod qwen3_attn_layerwise;
 pub mod qwen3_ffn_moe_layerwise;
 pub mod qwen3_fp8_ffn_moe_layerwise;
 pub mod qwen3_moe_dp_attn_ep_ffn;
 pub mod qwen3_moe_fp8_dp_attn_ep_ffn;
 pub mod qwen3_vllm_moe_dp_attn_ep_ffn;
-pub mod qwen36_local;
 
 pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 pub use contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
-    IterwiseUnifiedModel, UnifiedArchInput,
+    IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
+    SpeculativeUnifiedModel, UnifiedArchInput,
 };
-pub use glm52_dsa_moe::{
-    Glm52DsaMoeConfigs, Glm52DsaMoeModel, Glm52DsaMoeParallel, Glm52DsaMoeResolved, Glm52ModelCfg,
-    Glm52MtpMode,
+pub use deepseek_v41_vllm::{
+    DeepseekV41ModelCfg, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,
+    DeepseekV41VllmResolved,
+};
+pub use deepseek_v4_vllm::{
+    DeepseekV4ModelCfg, DeepseekV4VllmConfigs, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DeepseekV4VllmResolved,
+};
+pub use glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
+pub use glm52_sglang_nvfp4_tp_dsa_moe::{
+    Glm52SglangNvfp4TpDsaMoeConfigs, Glm52SglangNvfp4TpDsaMoeModel,
+    Glm52SglangNvfp4TpDsaMoeParallel, Glm52SglangNvfp4TpDsaMoeResolved,
 };
 pub use glm52_vllm_dsa_moe::{
     Glm52VllmDsaMoeConfigs, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmDsaMoeResolved,
 };
+pub use glm52_vllm_nvfp4_dp_attn_dsa_moe::{
+    Glm52VllmNvfp4DpAttnConfigs, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
+    Glm52VllmNvfp4DpAttnResolved,
+};
+pub use glm52_vllm_nvfp4_dsa_moe::{
+    Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
+    Glm52VllmNvfp4DsaMoeResolved, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+};
+pub use glm52_vllm_nvfp4_pp_dsa_moe::{
+    Glm52VllmNvfp4PpConfigs, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
+    Glm52VllmNvfp4PpResolved, Glm52VllmNvfp4PpStageModel,
+};
+pub use glm53_flash_vllm_fp8_kda_dsa_moe::{
+    Glm53FlashKernelPath, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmModel,
+    Glm53FlashVllmParallel,
+};
+pub use glm53_flash_vllm_fp8_pp_kda_dsa_moe::{
+    Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmFp8PpStageModel,
+};
+pub use glm53_vllm_nvfp4_dsa_moe_dflash2::{
+    Dflash2DraftResolved, Glm53VllmNvfp4DsaMoeDflash2Model,
+};
+pub use inkling_model_cfg::{InklingExpertPrecision, InklingModelCfg};
+pub use inkling_vllm_nvfp4_rel_attn_moe::{
+    InklingExpertDemand, InklingVllmConfigs, InklingVllmModel, InklingVllmParallel,
+    InklingVllmResolved,
+};
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};
 pub use llama3_dp_attn_tp_ffn::{DpAttnTpFfnParallel, Llama3DpAttnTpFfnModel};
+pub use mimo_v2_model_cfg::{MimoV2AttnShape, MimoV2ModelCfg};
+pub use mimo_v2_vllm_fp8_swa_moe::{
+    MimoV2VllmConfigs, MimoV2VllmModel, MimoV2VllmParallel, MimoV2VllmResolved,
+};
 pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
+pub use qwen35_model_cfg::{Qwen35LinearPrecision, Qwen35Mixer, Qwen35ModelCfg, Qwen35Precisions};
+pub use qwen35_vllm_nvfp4_gdn_dense::{
+    Qwen35VllmConfigs, Qwen35VllmModel, Qwen35VllmParallel, Qwen35VllmResolved,
+};
+pub use qwen36_local::{
+    Qwen36LocalConfigs, Qwen36LocalModel, Qwen36LocalParallel, Qwen36LocalResolved, Qwen36ModelCfg,
+};
+pub use qwen4_exp_model_cfg::{Qwen4ExpMixer, Qwen4ExpModelCfg};
+pub use qwen4_exp_vllm_nvfp4_gdn_qsa_moe::{
+    Qwen4ExpVllmConfigs, Qwen4ExpVllmParallel, Qwen4ExpVllmResolved, Qwen4ExpVllmSpeculativeModel,
+};
 pub use qwen3_attn_layerwise::{Qwen3AttnLayerwiseModel, Qwen3AttnParallel};
 pub use qwen3_ffn_moe_layerwise::{Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel};
 pub use qwen3_fp8_ffn_moe_layerwise::{Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel};
 pub use qwen3_moe_dp_attn_ep_ffn::{Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel};
 pub use qwen3_moe_fp8_dp_attn_ep_ffn::{Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel};
 pub use qwen3_vllm_moe_dp_attn_ep_ffn::{Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel};
-pub use qwen36_local::{
-    Qwen36LocalConfigs, Qwen36LocalModel, Qwen36LocalParallel, Qwen36LocalResolved,
-    Qwen36ModelCfg,
-};

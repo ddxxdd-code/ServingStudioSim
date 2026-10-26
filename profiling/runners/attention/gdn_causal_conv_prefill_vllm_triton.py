@@ -16,7 +16,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention._gdn_common import require_exact_gpu
+from profiling.runners.attention._gdn_common import conv_state_dim_first, conv_state_pool
 from profiling.runners.attention.gdn_causal_conv_prefill_torch import (
     _logical_bytes,
     _semantic_flops,
@@ -34,7 +34,10 @@ _CALLABLE_NAME = "causal_conv1d_fn"
 _METADATA_MODULE = "vllm.v1.attention.backends.utils"
 _METADATA_NAME = "compute_causal_conv1d_metadata"
 _KERNEL_NAME = "_causal_conv1d_fwd_kernel"
-_REQUIRED_GPU = "NVIDIA H200"
+# Kernel limit, not a measured set: `_causal_conv1d_fwd_kernel` loads width-5
+# history but its accumulate loop only has width 2, 3 and 4 branches, so W5
+# runs and returns wrong values (vllm/model_executor/layers/mamba/ops/
+# causal_conv1d.py, the `for j in tl.static_range(KERNEL_WIDTH)` loop).
 _SUPPORTED_KERNEL_SIZES = frozenset(range(2, 5))
 _BLOCK_M = 8
 _BLOCK_N = 256
@@ -174,10 +177,6 @@ def _expected_chunk_mapping(
     return batch_ids, offsets
 
 
-def _require_h200(torch: Any) -> None:
-    require_exact_gpu(torch, backend=_BACKEND, required_gpu=_REQUIRED_GPU)
-
-
 def _load_vllm_components() -> tuple[Any, Any]:
     try:
         callable_module = importlib.import_module(_CALLABLE_MODULE)
@@ -200,6 +199,7 @@ def _build_operands(
     metadata_helper: Any,
     *,
     device: Any,
+    state_dim_first: bool = False,
 ) -> _Operands:
     shapes = _operand_shapes(args)
     generator = torch.Generator(device=device)
@@ -218,10 +218,12 @@ def _build_operands(
         dtype=args.dtype.torch(),
         device=device,
     ).uniform_(-0.125, 0.125, generator=generator)
-    state = torch.empty(
+    state = conv_state_pool(
+        torch,
         shapes.state_storage,
         dtype=args.state_dtype.torch(),
         device=device,
+        dim_first=state_dim_first,
     ).uniform_(-0.25, 0.25, generator=generator)
     slot_indices = torch.tensor(
         _valid_slot_indices(args.batch_size), dtype=torch.int32, device=device
@@ -248,7 +250,7 @@ def _build_operands(
         semantic_x=semantic_x,
         packed_x=packed_x,
         weight=weight.contiguous(),
-        state=state.contiguous(),
+        state=state,
         slot_indices=slot_indices,
         query_start_loc_cpu=query_start_loc_cpu,
         query_start_loc_gpu=query_start_loc_gpu,
@@ -438,7 +440,7 @@ def profile_gdn_causal_conv_prefill_vllm_triton(
     dtype: DType | str,
     state_dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile vLLM's fused fresh-prefill convolution on an NVIDIA H200."""
+    """Profile vLLM's fused fresh-prefill convolution."""
     args = _validate_args(
         batch_size,
         sequence_length,
@@ -453,15 +455,19 @@ def profile_gdn_causal_conv_prefill_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_h200(torch)
         fused_callable, metadata_helper = _load_vllm_components()
+        dim_first = conv_state_dim_first()
         device = torch.device("cuda", torch.cuda.current_device())
         guard_args = _guard_args(args)
-        guard_operands = _build_operands(torch, guard_args, metadata_helper, device=device)
+        guard_operands = _build_operands(
+            torch, guard_args, metadata_helper, device=device, state_dim_first=dim_first
+        )
         _check_correctness(torch, fused_callable, guard_operands, guard_args)
         # Build fresh requested-geometry operands after the guard. Packing and
         # metadata setup are complete before either measurement region starts.
-        operands = _build_operands(torch, args, metadata_helper, device=device)
+        operands = _build_operands(
+            torch, args, metadata_helper, device=device, state_dim_first=dim_first
+        )
 
         def kernel() -> Any:
             return _invoke_fused(fused_callable, operands)

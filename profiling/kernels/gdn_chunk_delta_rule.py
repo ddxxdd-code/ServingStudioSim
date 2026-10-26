@@ -1,19 +1,21 @@
-"""Qwen GDN prefill chunked delta rule as ONE fused launch.
+"""GDN prefill chunked delta rule as ONE fused launch.
 
-Distinct kernel kind from the six `gdn_chunk_*` kinds on purpose. Those model
-FLA's Triton realization, which splits the chunked gated delta rule into six
-launches (local cumsum, scaled dot K·Kᵀ, triangular solve, w/u recompute,
-inter-chunk state scan, output). This kind models the realization vLLM actually
-selects on Hopper and Blackwell: FlashInfer's `flashinfer.gdn_prefill.
-chunk_gated_delta_rule`, a single CUTLASS TMA warp-specialized kernel
-(`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`) that keeps every
-intermediate on chip.
+FLA's Triton realization splits the chunked gated delta rule into six launches
+(local cumsum, scaled dot K·Kᵀ, triangular solve, w/u recompute, inter-chunk
+state scan, output). This kind models the realization vLLM actually selects on
+Hopper and Blackwell instead: FlashInfer's `flashinfer.gdn_prefill.
+chunk_gated_delta_rule`, a single kernel that keeps every intermediate on
+chip: a CUTLASS TMA warp-specialized kernel
+(`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`) on SM90 and a persistent
+CuTe DSL kernel (`GatedDeltaNetChunkedKernel`) on SM100. The simulator has no
+kinds for the six Triton launches.
 
 The choice is not a tuning detail. `ChunkGatedDeltaRule._resolve_gdn_prefill_backend`
-picks `flashinfer` for the default `auto` request on any SM90 part with no
-further constraints, so a measured H200 vLLM run never launches the six Triton
-kernels at all. Costing the six-launch path against it over-predicted the
-operation by 110% on a Qwen3.6-35B-A3B-FP8 capture, because the split path
+picks `flashinfer` for the default `auto` request on any SM90 part, and on
+SM100 when the head dim is 128 and CUDA is 13+, so a measured H200 or B200 vLLM
+run never launches the six Triton kernels at all. Costing the six-launch path
+against it over-predicted the operation by 110% on a Qwen3.6-35B-A3B-FP8
+capture, because the split path
 round-trips h/w/u/A through HBM five extra times.
 
 Wire string: ``"gdn_chunk_delta_rule"`` — matches the Rust ``KernelSpec::KIND``
@@ -21,8 +23,8 @@ in ``simulator/src/timing/kernels/gdn_chunk_delta_rule.rs`` and the facade stem
 ``get_gdn_chunk_delta_rule_times`` / ``count_missing_gdn_chunk_delta_rule``.
 
 Chunking is deliberately NOT in the args schema: FlashInfer owns its own chunk
-size internally, so unlike the FLA kinds there is no `num_chunks` the caller
-can choose.
+size internally, so unlike FLA's Triton path there is no `num_chunks` the
+caller can choose.
 
 The second axis is `max_sequence_length`, NOT a sequence count. The inter-chunk
 recurrence is sequential *within* a sequence and independent *across* sequences,
@@ -50,6 +52,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -64,22 +67,68 @@ KIND: str = "gdn_chunk_delta_rule"
 
 @dataclass(frozen=True)
 class GdnChunkDeltaRuleArgs(KernelArgs):
-    num_tokens: int
-    max_sequence_length: int
-    num_key_heads: int
-    num_heads: int
-    key_head_dim: int
-    value_head_dim: int
-    dtype: DType
+    num_tokens: int = arg(unit="tokens", doc="Tokens across the input sequences.")
+    max_sequence_length: int = arg(unit="tokens", doc="Tokens in the longest input sequence.")
+    num_key_heads: int = arg(unit="heads", doc="Key and query heads shared by the output heads.")
+    num_heads: int = arg(unit="heads", doc="Output heads with separate values and states.")
+    key_head_dim: int = arg(unit="elements", doc="Features in each key and query head.")
+    value_head_dim: int = arg(unit="elements", doc="Features in each value and output head.")
+    dtype: DType = arg(doc="Element type of query, key and value inputs.")
+
+
+DOC = KernelDoc(
+    title="Fused chunked delta rule",
+    summary="Compute Gated DeltaNet prefill output and final recurrent states in one launch.",
+    description=(
+        "The chunked gated delta rule of Gated DeltaNet prefill, "
+        "which vLLM on H200 and B200 runs as one FlashInfer kernel: it writes "
+        "every token's output and each sequence's final state. The inputs are "
+        "prepared as vLLM prepares them: queries and keys already L2-normalized"
+        " outside the call, the decay passed already exponentiated, beta in "
+        "FP32. The measurement uses num_tokens / max_sequence_length full "
+        "sequences plus one shorter remainder; FlashInfer picks its chunk "
+        "width."
+    ),
+    category="Attention",
+    subcategory="Gated DeltaNet",
+    formula=(
+        "state = 2·key_head_dim·value_head_dim·num_heads",
+        "intra = 2·64·(num_key_heads·key_head_dim + num_heads·value_head_dim)",
+        "FLOPs = num_tokens·2·(state + intra)",
+        "N = ⌈num_tokens / max_sequence_length⌉",
+        "bytes = 4·num_tokens·num_key_heads·key_head_dim + "
+        "4·num_tokens·num_heads·value_head_dim + 8·num_tokens·num_heads + "
+        "8·N·num_heads·key_head_dim·value_head_dim",
+        "TFLOPS = FLOPs / time",
+        "GB/s = bytes / time",
+    ),
+    default_metric="tflops",
+    method=(
+        f"{CUPTI_METHOD} "
+        "Every launch of the call is counted: FlatKernel on SM90, "
+        "GatedDeltaNetChunkedKernel on SM100. Inputs, gates and sequence "
+        "boundaries are allocated before the capture."
+    ),
+    caveats=(
+        "Each call starts from an all-zero state.",
+        "The 64-token width appears only in the FLOP estimate; bytes count "
+        "minimum logical traffic, not physical traffic.",
+    ),
+    # No separate PyTorch reference exists for this fused kind.
+    reference=None,
+)
 
 
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer",
+        # chunk_gated_delta_rule dispatches by architecture: a CUTLASS kernel on
+        # SM90, the CuTe DSL chunk_gated_delta_rule_sm100 kernel on SM100/SM103
+        # (CUDA 13+, head dim 128). The runner times whichever the call launches.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.gdn_chunk_delta_rule_flashinfer",
@@ -89,6 +138,13 @@ register(
         args_schema=GdnChunkDeltaRuleArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer's chunk_gated_delta_rule call computes output and "
+                "final state in one launch (CUTLASS on SM90, CuTe DSL on SM100)."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/gdn_prefill.py",
+        ),
         subprocess_env="vllm_env",
     )
 )

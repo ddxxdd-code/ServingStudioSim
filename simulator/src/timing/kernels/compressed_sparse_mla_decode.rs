@@ -1,0 +1,221 @@
+//! Compressed sparse FP8 MLA decode graph replay.
+
+use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
+use crate::timing::cache::{CacheKind, Extrapolation};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
+use crate::timing::kernels::kv_compress_store::FP8_DS_MLA_ROW_BYTES;
+use crate::timing::sweep::{Axis, Coords, SweepGrid};
+use crate::timing::{Dim, KernelConfig, SweepCoords};
+
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CompressedSparseMlaDecodeKernelConfig {
+    #[serde(deserialize_with = "de_backends")]
+    pub backends: Vec<&'static str>,
+    pub gpu_name: String,
+    pub num_heads: Dim,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
+    pub value_dim: Dim,
+    pub swa_window: u32,
+    pub extra_index_capacity: u32,
+    pub compress_ratio: u32,
+    #[compute_dtype]
+    pub q_dtype: DType,
+    #[kv_dtype]
+    pub cache_dtype: DType,
+    pub output_dtype: DType,
+    pub planner_mode: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CompressedSparseMlaDecodeKernelInput {
+    pub swa_valid_counts: Vec<u32>,
+    pub extra_valid_counts: Vec<u32>,
+}
+
+impl CompressedSparseMlaDecodeKernelInput {
+    fn work(&self) -> (u32, f64) {
+        assert!(!self.swa_valid_counts.is_empty());
+        assert_eq!(self.swa_valid_counts.len(), self.extra_valid_counts.len());
+        let total = self
+            .swa_valid_counts
+            .iter()
+            .chain(&self.extra_valid_counts)
+            .try_fold(0_u64, |sum, &count| sum.checked_add(u64::from(count)))
+            .expect("selected-row total must fit u64");
+        let batch_size = self.swa_valid_counts.len() as u32;
+        (batch_size, total as f64 / f64::from(batch_size))
+    }
+}
+
+impl SweepCoords for CompressedSparseMlaDecodeKernelInput {
+    fn coords(&self) -> Coords {
+        let (batch_size, mean_valid_rows) = self.work();
+        Coords::new([f64::from(batch_size), mean_valid_rows])
+    }
+
+    fn coord_field_names() -> &'static [&'static str] {
+        &["batch_size", "mean_valid_rows"]
+    }
+}
+
+fn valid_axis(config: &CompressedSparseMlaDecodeKernelConfig) -> Vec<f64> {
+    match config.compress_ratio {
+        1 => Axis::values([1, 32, 64, 96, 128]),
+        4 => Axis::values([128, 160, 192, 256, 384, 512, 640]),
+        128 => Axis::values([1, 64, 128, 160, 192, 256, 384, 512, 640])
+            .into_iter()
+            .filter(|&valid| valid <= f64::from(128 + config.extra_index_capacity))
+            .collect(),
+        ratio => panic!("unsupported compress_ratio {ratio}"),
+    }
+}
+
+fn validate_config(config: &CompressedSparseMlaDecodeKernelConfig) {
+    match config.compress_ratio {
+        1 => assert_eq!(config.extra_index_capacity, 0),
+        4 => assert_eq!(config.extra_index_capacity, 512),
+        128 => assert!(
+            (128..=8192).contains(&config.extra_index_capacity)
+                && config.extra_index_capacity % 128 == 0
+        ),
+        ratio => panic!("unsupported compress_ratio {ratio}"),
+    }
+    assert!(matches!(config.planner_mode.as_str(), "planned" | "reused"));
+}
+
+fn canonical_counts(
+    batch_size: u32,
+    total_valid_per_row: u32,
+    compress_ratio: u32,
+) -> (Vec<u32>, Vec<u32>) {
+    let swa = total_valid_per_row.min(128);
+    let extra = if compress_ratio == 1 {
+        0
+    } else {
+        total_valid_per_row - swa
+    };
+    (
+        vec![swa; batch_size as usize],
+        vec![extra; batch_size as usize],
+    )
+}
+
+/// The profiler's logical bytes: q, each selected cache row and its index, the
+/// per-request valid counts, the output and lse, and the head sinks.
+fn logical_bytes(
+    config: &CompressedSparseMlaDecodeKernelConfig,
+    input: &CompressedSparseMlaDecodeKernelInput,
+) -> f64 {
+    let heads = f64::from(config.num_heads.get());
+    let batch = input.swa_valid_counts.len() as f64;
+    let selected: f64 = input
+        .swa_valid_counts
+        .iter()
+        .chain(&input.extra_valid_counts)
+        .map(|&count| f64::from(count))
+        .sum();
+    let count_arrays = if config.compress_ratio > 1 { 2.0 } else { 1.0 };
+    batch * heads * f64::from(config.head_dim.get()) * f64::from(config.q_dtype.size_bytes())
+        + selected * (f64::from(FP8_DS_MLA_ROW_BYTES) + 4.0)
+        + batch * 4.0 * count_arrays
+        + batch
+            * heads
+            * (f64::from(config.value_dim.get()) * f64::from(config.output_dtype.size_bytes())
+                + 4.0)
+        + heads * 4.0
+}
+
+pub struct CompressedSparseMlaDecodeSpec;
+
+impl KernelSpec for CompressedSparseMlaDecodeSpec {
+    type Config = CompressedSparseMlaDecodeKernelConfig;
+    type Input = CompressedSparseMlaDecodeKernelInput;
+
+    const KIND: KernelKind = "compressed_sparse_mla_decode";
+
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        validate_config(config);
+        SweepGrid::new(vec![
+            Axis::values([1, 2, 4, 8, 16, 32, 64, 128, 256]),
+            valid_axis(config),
+        ])
+    }
+
+    fn cache_kind(_backend: &'static str) -> CacheKind {
+        CacheKind::Cache2DLinear(Extrapolation::Product)
+    }
+
+    /// Past the grid the launch holds its bandwidth: on H200 the last measured
+    /// step along the selected-row axis sits within 21% of its neighbor's
+    /// bandwidth and up to 29% off its TFLOPS; along batch the two agree.
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Bandwidth(logical_bytes(config, input))
+    }
+
+    fn enumerate(
+        config: &Self::Config,
+        grid: &SweepGrid,
+        backend: &'static str,
+    ) -> Vec<ArgsPayload> {
+        grid.expand_2d(|batch_size, total_valid_per_row| {
+            let (swa_valid_counts, extra_valid_counts) = canonical_counts(
+                batch_size as u32,
+                total_valid_per_row as u32,
+                config.compress_ratio,
+            );
+            ArgsPayload::new()
+                .with("backend", backend)
+                .with("swa_valid_counts", swa_valid_counts)
+                .with("extra_valid_counts", extra_valid_counts)
+                .with("num_heads", config.num_heads.get())
+                .with("num_kv_heads", config.num_kv_heads.get())
+                .with("head_dim", config.head_dim.get())
+                .with("value_dim", config.value_dim.get())
+                .with("swa_window", config.swa_window)
+                .with("extra_index_capacity", config.extra_index_capacity)
+                .with("compress_ratio", config.compress_ratio)
+                .with("q_dtype", config.q_dtype.as_str())
+                .with("cache_dtype", config.cache_dtype.as_str())
+                .with("output_dtype", config.output_dtype.as_str())
+                .with("planner_mode", config.planner_mode.clone())
+        })
+    }
+}
+
+register_kernel!(
+    CompressedSparseMlaDecodeKernel,
+    CompressedSparseMlaDecodeSpec
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timing::SweepCoords;
+
+    #[test]
+    fn ragged_counts_project_to_exact_mean_selected_work() {
+        let input = CompressedSparseMlaDecodeKernelInput {
+            swa_valid_counts: vec![128, 64, 32, 16],
+            extra_valid_counts: vec![256, 128, 64, 32],
+        };
+        assert_eq!(&*input.coords(), &[4.0, 180.0]);
+    }
+
+    #[test]
+    fn logical_bytes_match_a_measured_row() {
+        // A profiled H200 row's logged bandwidth x time.
+        let config: CompressedSparseMlaDecodeKernelConfig =
+            serde_json::from_value(serde_json::json!({"gpu_name": "NVIDIA H200", "num_heads": 64, "num_kv_heads": 1, "head_dim": 512, "value_dim": 512, "swa_window": 128, "extra_index_capacity": 512, "compress_ratio": 4, "q_dtype": "bf16", "cache_dtype": "fp8_e4m3", "output_dtype": "bf16", "planner_mode": "planned", "backends": ["vllm_flashmla_fp8_cudagraph"]}))
+            .unwrap();
+        let input = CompressedSparseMlaDecodeKernelInput {
+            swa_valid_counts: vec![128, 128],
+            extra_valid_counts: vec![0, 0],
+        };
+        assert!((logical_bytes(&config, &input) - 413_456.0).abs() < 1e-6);
+    }
+}

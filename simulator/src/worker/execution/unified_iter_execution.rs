@@ -9,8 +9,9 @@ use std::sync::Arc;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{SharedRequests, Time};
 use crate::worker::cost_buffers::CostBuffers;
-use crate::worker::execution::{IterModelExecution, ModelKvLayout};
+use crate::worker::execution::{IterModelExecution, PipelineStageExecution};
 use crate::worker::kv::{IterWorkerKv, PrefixKv};
+use crate::worker::types::IterBatchPlan;
 
 pub struct UnifiedIterExecution<M: IterwiseUnifiedModel> {
     model: Arc<M>,
@@ -26,6 +27,7 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
         &self,
         kv_store: &K,
         _requests: &SharedRequests,
+        batch_plan: &IterBatchPlan,
         out: &mut UnifiedArchInput,
     ) {
         let num_partitions = kv_store.num_partitions();
@@ -38,20 +40,30 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
             group.clear();
             kv_store.visit_prefill_admits(partition, |request| {
                 let resolved_prefill = kv_store.resolved_prefill_context(request);
-                group.prefill_chunk_pairs.push((
-                    resolved_prefill.resident_prefix_tokens(),
-                    resolved_prefill.prefill_tokens_to_compute(),
-                ));
-                group.prefill_tokens += resolved_prefill.prefill_tokens_to_compute();
+                let (prefix_tokens, chunk_tokens) = resolved_prefill.active_chunk();
+                group
+                    .prefill_chunk_pairs
+                    .push((prefix_tokens, chunk_tokens));
+                group.prefill_tokens += chunk_tokens;
             });
-            kv_store.visit_decode_members(partition, |_, current_kv| {
-                group.decode_kv_lens.push(current_kv as u32);
-                group.total_kv_len += current_kv as u32;
-            });
+            if batch_plan.partition_runs_decode(partition) {
+                kv_store.visit_decode_members(partition, |request, current_kv| {
+                    if batch_plan.decode_member_runs(partition, request) {
+                        group.decode_kv_lens.push(current_kv as u32);
+                        group.total_kv_len += current_kv as u32;
+                    }
+                });
+            }
             group.decode_tokens = group.decode_kv_lens.len() as u32;
             group.batch_tokens = group.prefill_tokens + group.decode_tokens;
         }
-        out.tokens_per_source_rank.clear();
+        if num_partitions > 1 {
+            out.tokens_per_source_rank.clear();
+            out.tokens_per_source_rank
+                .extend(out.groups.iter().map(|group| group.batch_tokens));
+        } else {
+            out.tokens_per_source_rank.clear();
+        }
     }
 
     pub(crate) fn evaluate_iteration(
@@ -72,23 +84,23 @@ where
 {
     type Input = UnifiedArchInput;
 
-    fn model_kv_layout(&self) -> ModelKvLayout {
-        ModelKvLayout {
-            total_kv_bytes_per_token: self.model.total_kv_bytes_per_token(),
-            num_attn_shards: self.model.num_attn_shards(),
-        }
-    }
-
     fn build_iteration_input(
         &self,
         kv_store: &K,
         requests: &SharedRequests,
+        batch_plan: &IterBatchPlan,
         out: &mut Self::Input,
     ) {
-        self.build_input(kv_store, requests, out);
+        self.build_input(kv_store, requests, batch_plan, out);
     }
 
     fn evaluate_iteration(&mut self, input: &Self::Input, iteration: u64, now: Time) -> Time {
         UnifiedIterExecution::evaluate_iteration(self, input, iteration, now)
+    }
+}
+
+impl<M: IterwiseUnifiedModel> PipelineStageExecution for UnifiedIterExecution<M> {
+    fn evaluate_stage(&mut self, input: &UnifiedArchInput, microbatch: u64, start: Time) -> Time {
+        UnifiedIterExecution::evaluate_iteration(self, input, microbatch, start)
     }
 }

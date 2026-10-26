@@ -12,6 +12,7 @@ import asyncio
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import ExitStack
@@ -31,8 +32,9 @@ class ProcessSupervisor:
     async def run(self, spec: ProcessSpec) -> ProcessResult:
         with ExitStack() as resources:
             stdout_stream, capture_stream = self._open_stdout(spec, resources)
+            stderr_stream = self._open_stderr(spec, resources)
             stdin_stream = self._open_stdin(spec, resources)
-            process = self._spawn(spec, stdin_stream, stdout_stream)
+            process = self._spawn(spec, stdin_stream, stdout_stream, stderr_stream)
             started = time.monotonic()
             termination_reason: str | None = None
             try:
@@ -53,6 +55,7 @@ class ProcessSupervisor:
 
             leaked_descendants = await self._clean_leaked_descendants(process.pid)
             output = self._read_capture(capture_stream)
+            stderr = self._read_capture(stderr_stream)
             return ProcessResult(
                 argv=tuple(str(argument) for argument in spec.argv),
                 pid=process.pid,
@@ -60,6 +63,7 @@ class ProcessSupervisor:
                 exit_code=exit_code,
                 elapsed_seconds=time.monotonic() - started,
                 output=output,
+                stderr=stderr,
                 leaked_descendants=leaked_descendants,
                 termination_reason=termination_reason,
             )
@@ -69,8 +73,9 @@ class ProcessSupervisor:
 
         with ExitStack() as resources:
             stdout_stream, capture_stream = self._open_stdout(spec, resources)
+            stderr_stream = self._open_stderr(spec, resources)
             stdin_stream = self._open_stdin(spec, resources)
-            process = self._spawn(spec, stdin_stream, stdout_stream)
+            process = self._spawn(spec, stdin_stream, stdout_stream, stderr_stream)
             started = time.monotonic()
             termination_reason: str | None = None
             try:
@@ -86,6 +91,7 @@ class ProcessSupervisor:
 
             leaked_descendants = self._clean_leaked_descendants_sync(process.pid)
             output = self._read_capture(capture_stream)
+            stderr = self._read_capture(stderr_stream)
             return ProcessResult(
                 argv=tuple(str(argument) for argument in spec.argv),
                 pid=process.pid,
@@ -93,6 +99,7 @@ class ProcessSupervisor:
                 exit_code=exit_code,
                 elapsed_seconds=time.monotonic() - started,
                 output=output,
+                stderr=stderr,
                 leaked_descendants=leaked_descendants,
                 termination_reason=termination_reason,
             )
@@ -108,19 +115,21 @@ class ProcessSupervisor:
             stream = resources.enter_context(log_path.open(mode))
             return stream, None
         if spec.capture_output:
-            stream = resources.enter_context(
-                tempfile.TemporaryFile(prefix="vibesim-process-")
-            )
+            stream = resources.enter_context(tempfile.TemporaryFile(prefix="vibesim-process-"))
             return stream, stream
         return None, None
+
+    @staticmethod
+    def _open_stderr(spec: ProcessSpec, resources: ExitStack) -> BinaryIO | None:
+        if not spec.separate_stderr:
+            return None
+        return resources.enter_context(tempfile.TemporaryFile(prefix="vibesim-process-stderr-"))
 
     @staticmethod
     def _open_stdin(spec: ProcessSpec, resources: ExitStack) -> BinaryIO | int:
         if spec.input_bytes is None:
             return subprocess.DEVNULL
-        stream = resources.enter_context(
-            tempfile.TemporaryFile(prefix="vibesim-process-input-")
-        )
+        stream = resources.enter_context(tempfile.TemporaryFile(prefix="vibesim-process-input-"))
         stream.write(spec.input_bytes)
         stream.seek(0)
         return stream
@@ -130,14 +139,19 @@ class ProcessSupervisor:
         spec: ProcessSpec,
         stdin_stream: BinaryIO | int,
         stdout_stream: BinaryIO | int | None,
+        stderr_stream: BinaryIO | None,
     ) -> subprocess.Popen[bytes]:
+        if stderr_stream is not None:
+            stderr: BinaryIO | int | None = stderr_stream
+        else:
+            stderr = subprocess.STDOUT if stdout_stream is not None else None
         return subprocess.Popen(
             [str(argument) for argument in spec.argv],
             cwd=spec.cwd,
             env=dict(spec.env) if spec.env is not None else None,
             stdin=stdin_stream,
             stdout=stdout_stream,
-            stderr=subprocess.STDOUT if stdout_stream is not None else None,
+            stderr=stderr,
             start_new_session=True,
             close_fds=True,
         )
@@ -183,7 +197,7 @@ class ProcessSupervisor:
             self._signal_group(process.pid, signal.SIGKILL)
             while process.poll() is None:
                 await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-        if self._group_exists(process.pid):
+        if self._group_has_live_members(process.pid):
             self._signal_group(process.pid, signal.SIGKILL)
 
     def _terminate_group_sync(self, process: subprocess.Popen[bytes]) -> None:
@@ -196,23 +210,23 @@ class ProcessSupervisor:
         except subprocess.TimeoutExpired:
             self._signal_group(process.pid, signal.SIGKILL)
             process.wait()
-        if self._group_exists(process.pid):
+        if self._group_has_live_members(process.pid):
             self._signal_group(process.pid, signal.SIGKILL)
 
     async def _clean_leaked_descendants(self, process_group_id: int) -> bool:
         deadline = time.monotonic() + _DESCENDANT_SETTLE_SECONDS
-        while self._group_exists(process_group_id) and time.monotonic() < deadline:
+        while self._group_has_live_members(process_group_id) and time.monotonic() < deadline:
             await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-        if not self._group_exists(process_group_id):
+        if not self._group_has_live_members(process_group_id):
             return False
         await self._terminate_descendants_after_root(process_group_id)
         return True
 
     def _clean_leaked_descendants_sync(self, process_group_id: int) -> bool:
         deadline = time.monotonic() + _DESCENDANT_SETTLE_SECONDS
-        while self._group_exists(process_group_id) and time.monotonic() < deadline:
+        while self._group_has_live_members(process_group_id) and time.monotonic() < deadline:
             time.sleep(_POLL_INTERVAL_SECONDS)
-        if not self._group_exists(process_group_id):
+        if not self._group_has_live_members(process_group_id):
             return False
         self._signal_group(process_group_id, signal.SIGKILL)
         return True
@@ -220,9 +234,9 @@ class ProcessSupervisor:
     async def _terminate_descendants_after_root(self, process_group_id: int) -> None:
         self._signal_group(process_group_id, signal.SIGTERM)
         deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
-        while self._group_exists(process_group_id) and time.monotonic() < deadline:
+        while self._group_has_live_members(process_group_id) and time.monotonic() < deadline:
             await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-        if self._group_exists(process_group_id):
+        if self._group_has_live_members(process_group_id):
             self._signal_group(process_group_id, signal.SIGKILL)
 
     @staticmethod
@@ -233,14 +247,39 @@ class ProcessSupervisor:
             pass
 
     @staticmethod
-    def _group_exists(process_group_id: int) -> bool:
+    def _group_has_live_members(process_group_id: int) -> bool:
+        """Whether a group still has runnable or sleeping members.
+
+        killpg(0) also finds zombies, which cannot run or respond to signals.
+        A container without a reaping init can retain them indefinitely. On
+        Linux inspect procfs after the cheap existence check; if visibility is
+        incomplete, conservatively retain the group rather than skip cleanup.
+        """
         try:
             os.killpg(process_group_id, 0)
         except ProcessLookupError:
             return False
         except PermissionError:
             return True
-        return True
+        if sys.platform != "linux":
+            return True
+        try:
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    # comm can contain spaces and parentheses; fields after
+                    # its closing parenthesis start with state, ppid, pgrp.
+                    fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                    if int(fields[2]) == process_group_id and fields[0] not in {"Z", "X"}:
+                        return True
+                except ProcessLookupError:
+                    continue
+                except FileNotFoundError:
+                    continue
+        except (OSError, ValueError, IndexError):
+            return True
+        return False
 
     @staticmethod
     def _read_capture(stream: BinaryIO | None) -> str:

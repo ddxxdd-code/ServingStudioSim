@@ -1,9 +1,10 @@
-# VibeSim test-tier runner. One recipe per capability tier (see tests/conftest.py
+# ServingStudioSim test-tier runner. One recipe per capability tier (see tests/conftest.py
 # + skill `dev-run-tests`). Install just: `cargo install just` (or your package mgr).
 #
-#   just            # = test-cpu (the fast default gate)
-#   just test-gpu   # GPU tier (throughput regression etc.)
-#   just test-all   # cpu + gpu
+#   just              # = test-cpu (the fast default gate)
+#   just test-presets # every public preset built through the simulator
+#   just test-gpu     # GPU tier (throughput regression etc.)
+#   just test-all     # cpu + presets + gpu
 #   just test-bench # separate perf step; run after test-all for full validation
 
 # libpython dir — the Rust test binary embeds PyO3 and crashes on
@@ -28,14 +29,38 @@ sync:
     uv sync --inexact --no-install-package deep-gemm
     uv sync
 
-# cpu tier — Rust unit tests + deterministic mocked pytest. No GPU/binary.
+# The image each L1 profile env runs in (profiling/container/README.md):
+# `just profile-container-build vllm`, or every image with no argument.
+profile-container-build *images:
+    uv run python -m profiling.container.images build {{images}}
+
+# The Rust tests run beside pytest; their log prints after it, in full on failure.
 # `workers` is the xdist worker count. Not `auto`: that means one worker per core,
 # and each worker pays ~9 s importing torch + flashinfer, so a big host spends
 # more on startup than it saves. 16 is the measured knee here (17 s, against 19 s
-# at 8 and 24); override on a smaller machine with `just test-cpu workers=4`.
+# at 8 and 24); override on a smaller machine with `just test-cpu 4`.
+# cpu tier — Rust unit tests + deterministic mocked pytest. No GPU.
 test-cpu workers="16": sync
-    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib
-    uv run --no-sync pytest -m "not gpu and not agent and not bench" -n {{workers}}
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rust_log="$(mktemp "${TMPDIR:-/tmp}/test-cpu-rust.XXXXXX")"
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib >"$rust_log" 2>&1 &
+    rust_pid=$!
+    uv run --no-sync pytest -m "not gpu and not agent and not bench and not presets" -n {{workers}}
+    pytest_rc=$?
+    wait "$rust_pid"
+    rust_rc=$?
+    if [ "$rust_rc" -ne 0 ]; then cat "$rust_log"; else grep -E "^test result:" "$rust_log"; fi
+    rm -f "$rust_log"
+    [ "$pytest_rc" -eq 0 ] && [ "$rust_rc" -eq 0 ]
+
+# Builds every public predict and sim preset member through the release
+# simulator (cost trees, then a dry-run per capture) and checks profile.db covers
+# it. Run it after touching presets, the public API or the catalog.
+# `--dist loadfile` keeps each file on one worker, so its module fixture builds once.
+# presets tier — every public preset member built and measured.
+test-presets workers="4": sync
+    uv run --no-sync pytest -m presets -n {{workers}} --dist loadfile
 
 # gpu tier — needs a CUDA device. Auto-includes needs_binary/needs_db tests when
 # present; the perf_api bridge / launcher set their own subprocess env.
@@ -51,8 +76,8 @@ test-bench: sync
     uv run --no-sync pytest -m bench
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --release -- --ignored --nocapture
 
-# Main correctness gate (cpu + gpu). Full validation also runs `just test-bench`.
-test-all: test-cpu test-gpu
+# Main correctness gate (cpu + presets + gpu). Full validation also runs `just test-bench`.
+test-all: test-cpu test-presets test-gpu
 
 # (Re)record per-GPU goldens for throughput + sim-speed on this device.
 update-golden: sync
@@ -63,7 +88,7 @@ update-golden: sync
 test-distributed-kv:
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib remote_cache
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib kv_store
-    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib worker::kv::full_attn
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib worker::kv::kv_cache_store
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib worker::kv::shared::prefix_cache
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib deployment::
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib pinned_mooncake
@@ -72,9 +97,9 @@ test-distributed-kv:
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib sim::run
     uv run --no-sync python -m pytest tests/test_distributed_kv_validation.py tests/test_kv_storage_external_oracles.py tests/test_kv_storage_trace.py tests/test_kv_coverage.py -q
 
-# Added executable lines versus the original KV base, Rust/Python independently.
+# Added executable lines versus the merged upstream base, Rust/Python independently.
 # Requires cargo-llvm-cov, llvm-tools-preview, coverage>=7.10 and pinned checkouts.
-test-distributed-kv-coverage base="48864532c291e5cd48d01efb515d63733496e420":
+test-distributed-kv-coverage base="d2e31e7838fb6a9a2a12e1164480942f88d46bac":
     test -n "${MOONCAKE_CHECKOUT:-}" && test -n "${KVCACHED_CHECKOUT:-}"
     mkdir -p target/kv-coverage-reports
     uv run --no-sync cargo llvm-cov clean --workspace
@@ -86,3 +111,25 @@ test-distributed-kv-coverage base="48864532c291e5cd48d01efb515d63733496e420":
     COVERAGE_FILE=target/kv-coverage-reports/python.coverage uv run --no-sync coverage combine --rcfile tools/kv_coverage.rc
     COVERAGE_FILE=target/kv-coverage-reports/python.coverage uv run --no-sync coverage json --rcfile tools/kv_coverage.rc -o target/kv-coverage-reports/python.json
     uv run --no-sync python tools/check_kv_coverage.py --base {{base}} --rust-lcov target/kv-coverage-reports/rust.lcov --python-json target/kv-coverage-reports/python.json --output target/kv-coverage-reports/added-lines.json --minimum 80
+
+# ── alignment campaigns (skill: operate-run-alignment) ───────────────────────
+# The campaign layer drives the five alignment phases across a whole case matrix.
+# `check` is pure CPU and is also what `just test-cpu` runs; the rest are the
+# daily commands. `run` is deliberately absent here: it takes a --phase and a
+# --out-root that only the operator knows, and there is no --all.
+
+# Validate every pack under presets/alignment/ (no GPU, no build). Pass extra
+# flags through, e.g. `just alignment-check --pack presets/alignment/<name>`.
+alignment-check *flags:
+    uv run --no-sync python -m launcher alignment-campaign check {{flags}}
+
+# Read a completed campaign's Analyzer reports into a metrics document, then
+# judge it against the pack's tolerances. `runs` is colon-separated.
+alignment-compare pack runs out="/tmp/alignment_metrics.json":
+    uv run --no-sync python -m launcher alignment-campaign extract --pack {{pack}} --runs {{runs}} --out {{out}}
+    uv run --no-sync python -m launcher alignment-campaign compare --pack {{pack}} --measured {{out}}
+
+# Accept the current numbers as the new baseline. Review the compare output
+# first: this is the only writer of tests/golden/alignment_<pack>/.
+alignment-record pack out="/tmp/alignment_metrics.json" *flags:
+    uv run --no-sync python -m launcher alignment-campaign compare --pack {{pack}} --measured {{out}} --record {{flags}}

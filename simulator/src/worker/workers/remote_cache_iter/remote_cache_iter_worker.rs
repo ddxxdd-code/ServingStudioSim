@@ -50,6 +50,7 @@ mod tests {
                 WorkerId(0),
                 "main",
                 Arc::new(FakeModel {
+                    kv_layout: None,
                     ms: 1.0,
                     dp_groups: 2,
                 }),

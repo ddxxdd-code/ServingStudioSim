@@ -1,7 +1,7 @@
 ---
 name: impl-wire-kernel-to-rust
 description: >-
-  Use when implementing the Rust timing/cache wiring for an VibeSim L1 kernel
+  Use when implementing the Rust timing/cache wiring for a ServingStudio Sim L1 kernel
   after the orchestrator has validated the Python profiling handoff and selected
   the Rust Config/Input/cache shape. Covers KernelSpec implementation,
   sweep/enumerate/cache wiring, mod.rs exports, slot_input logging, Rust tests,
@@ -61,6 +61,13 @@ The new kernel file should follow the closest existing kind and define:
 - optional `infeasible_mask()` for physically unreachable grid cells;
 - `register_kernel!(<Name>Kernel, <Name>Spec)`.
 
+Before implementing or profiling the grid, calculate its feasible-coordinate
+count for a representative resolved `KernelConfig`: expand the Cartesian grid,
+remove cells selected by `infeasible_mask()`, and do not multiply by the number
+of backends. The count must be at most **500**. If it is larger, stop and return
+the proposed axes, count, and likely cause to the orchestrator; splitting the
+same grid across profiling calls does not satisfy the ceiling.
+
 ## Field And Dtype Contract
 
 `enumerate` must emit one `ArgsPayload` per profiled grid point and backend:
@@ -77,6 +84,24 @@ The new kernel file should follow the closest existing kind and define:
 If a Python args field cannot be derived from Config/Input/grid/backend, stop
 and return to the orchestrator.
 
+Only cache dimensions that affect physical execution. Preserve exact ragged
+topology in `Input` when totals cannot determine planner, page lookup, or a
+branch, but do not mechanically copy upstream popularity into every helper.
+Treat runtime capacity and checkpoint capability as separate identities. Before
+adding an axis, record its timing impact, expected fidelity gain, grid cost, and
+DB migration consequence.
+
+Profile rows do not own runtime semantics. If source-backed workload derivation
+changes, update the payload contract and re-profile; do not add a model-specific
+legacy conversion merely to hit old keys. Reusing another profile table through
+`profile_kind()` requires identical semantics, args meaning, dtype/layout, and
+logical callable boundary.
+
+One Rust L1 kind represents one inseparable semantic callable even if that
+callable contains a fixed launch sequence or a runtime chunk loop. Do not expose
+chunks, ranks, layers, or capacity as permanent upper-layer slots. Truly
+independent production operations still need distinct kinds/slots.
+
 ## Wiring
 
 Wire only the required Rust surfaces:
@@ -91,14 +116,12 @@ Wire only the required Rust surfaces:
 
 ## Tests And Smoke
 
-Add focused tests in the new kernel file:
-
-- Config identity and `describe_config`;
-- Input `coords()` / `coord_field_names()`;
-- `sweep_grid` dimensionality and representative axes;
-- `cache_kind`;
-- `enumerate` emits `backend` plus all Python args fields and no extras;
-- dtype tags where applicable.
+Add the smallest focused tests that protect the physical mapping: a
+kernel-specific Config rejection, exact Input-to-coordinate projection,
+infeasible-domain boundary, or exact Python payload forwarding. Shared derive,
+registry, cache-kind, and metadata behavior belongs in shared timing tests; do
+not restate it once per kernel. Every test should identify the production defect
+it catches.
 
 Run:
 
@@ -126,5 +149,5 @@ not require GPU profiling.
 
 Return files changed, Config fields, Input fields, emitted ArgsPayload field
 list, dtype tags, selected cache kind, sweep grid summary, infeasible-mask
-decision, `slot_input` decision, commands run, and any blocker for cache
-fidelity or upper-layer consumers.
+decision, feasible-coordinate count, `slot_input` decision, commands run, and
+any blocker for cache fidelity or upper-layer consumers.

@@ -7,8 +7,6 @@ nominal FLOPs describe the semantic operation, not undocumented device traffic.
 
 from __future__ import annotations
 
-from typing import Any
-
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
@@ -17,7 +15,6 @@ from profiling.runners.metrics import ComputeMetrics
 
 _EPS = 1e-5
 _KERNEL_NAME = "fused_add_rms_norm_kernel"
-_REQUIRED_GPU = "NVIDIA H200"
 _SUPPORTED_DTYPES = frozenset({DType.BF16, DType.FP16})
 
 
@@ -33,23 +30,9 @@ def _validate_args(
         raise ValueError(f"m and hidden must be > 0, got m={m}, hidden={hidden}")
     if dtype not in _SUPPORTED_DTYPES:
         raise ValueError(
-            "vllm_cuda residual_rms_norm supports only bf16 and fp16, "
-            f"got {dtype.value}"
+            f"vllm_cuda residual_rms_norm supports only bf16 and fp16, got {dtype.value}"
         )
     return m, hidden, dtype
-
-
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the residual_rms_norm vllm_cuda backend"
-        )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            "residual_rms_norm vllm_cuda is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
-        )
 
 
 def profile_residual_rms_norm_vllm_cuda(
@@ -67,8 +50,6 @@ def profile_residual_rms_norm_vllm_cuda(
             "the instrumented vLLM environment is required for "
             "the residual_rms_norm vllm_cuda backend"
         ) from exc
-
-    _validate_cuda_device(torch)
 
     try:
         torch_dtype = dtype.torch()
@@ -108,21 +89,13 @@ def profile_residual_rms_norm_vllm_cuda(
         # normalized input and residual sum back in place.
         logical_elements = 4 * m * hidden + hidden
         bytes_accessed = int(logical_elements * dtype.size_bytes())
-        bandwidth_gbps = (
-            (bytes_accessed / (time_ms / 1000.0)) / 1e9
-            if time_ms > 0.0
-            else 0.0
-        )
+        bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0.0 else 0.0
 
         # Nominal semantic FLOPs: residual add, square/reduction contribution,
         # normalization multiply, and weight multiply, plus rowwise mean,
         # epsilon, and rsqrt. Casts count as zero.
         flops = 5 * m * hidden + 2 * m
-        tflops = (
-            (flops / (time_ms / 1000.0)) / 1e12
-            if time_ms > 0.0
-            else 0.0
-        )
+        tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0.0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=float(tflops),

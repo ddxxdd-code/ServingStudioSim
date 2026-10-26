@@ -93,6 +93,16 @@ pub struct RequestLifecycle {
     pub stage_log: Vec<StageEvent>,
 }
 
+/// One recomputation episode after decode retraction. The request keeps its
+/// emitted output and TTFT; these fields describe only the extra prefill work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReprocessedPrefillEpisode {
+    pub output_tokens_before: u32,
+    pub prefix_cache_hit_tokens: u32,
+    pub prefill_tokens_processed: u32,
+    pub completed: bool,
+}
+
 /// Observations collected without changing request-family semantics.
 #[derive(Clone, Debug, Default)]
 pub struct RequestTelemetry {
@@ -103,6 +113,34 @@ pub struct RequestTelemetry {
     /// means admission never resolved a prefix context; `Some(0)` is a real
     /// cold/disabled-cache result rather than missing telemetry.
     pub prefix_cache_hit_tokens: Option<u32>,
+    /// Number of times active decode KV was released and the request returned
+    /// to the waiting queue.
+    pub retraction_count: u32,
+    /// Extra prefill episodes caused by those retractions.
+    pub reprocessed_prefills: Vec<ReprocessedPrefillEpisode>,
+    /// Allocate only for speculative requests; ordinary traces keep one pointer.
+    pub speculative: Option<Box<SpeculativeProgress>>,
+}
+
+/// Completion-side observations, independent of the model input/cost logger.
+/// Bounded per request even when per-token timestamp logging is disabled.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SpeculativeProgress {
+    /// The worker's full verify width, `draft_tokens + 1`.
+    pub query_width: u32,
+    pub prefill_chunks: u64,
+    pub decode_rounds: u64,
+    pub resident_kv_sum: u64,
+    /// Verify rows over completed rounds: `query_width` per round, fewer for a
+    /// round clipped at `max_model_len`.
+    pub query_rows: u64,
+    /// Causal query-key pairs over completed rounds, `q * resident + q(q+1)/2`
+    /// per round of `q` rows.
+    pub verify_pairs: u64,
+    pub emitted_tokens: u64,
+    pub pending_prefill: Option<(u32, u32)>,
+    /// `(resident KV, query rows)` of a verify round the run stopped inside.
+    pub pending_decode: Option<(u64, u32)>,
 }
 
 /// One live request: immutable definition + progress + lifecycle + telemetry.
@@ -185,16 +223,71 @@ impl ActiveRequest<TextGenerationDefinition> {
         );
         self.telemetry.prefix_cache_hit_tokens = Some(prefix_cache_hit_tokens);
     }
+
+    pub fn record_retraction(&mut self) {
+        self.telemetry.retraction_count = self
+            .telemetry
+            .retraction_count
+            .checked_add(1)
+            .expect("request retraction count overflow");
+    }
+
+    pub fn begin_reprocessed_prefill(&mut self, prefix_cache_hit_tokens: u32) {
+        assert!(
+            self.telemetry
+                .reprocessed_prefills
+                .last()
+                .is_none_or(|episode| episode.completed),
+            "request {} began overlapping reprocessed-prefill episodes",
+            self.request.core.id.0,
+        );
+        self.telemetry
+            .reprocessed_prefills
+            .push(ReprocessedPrefillEpisode {
+                output_tokens_before: self.progress.output_tokens_emitted,
+                prefix_cache_hit_tokens,
+                prefill_tokens_processed: 0,
+                completed: false,
+            });
+    }
+
+    pub fn record_reprocessed_prefill_tokens(&mut self, tokens: u32) {
+        let episode = self
+            .telemetry
+            .reprocessed_prefills
+            .last_mut()
+            .expect("reprocessed prefill tokens require an active episode");
+        assert!(
+            !episode.completed,
+            "reprocessed prefill episode already completed"
+        );
+        episode.prefill_tokens_processed = episode
+            .prefill_tokens_processed
+            .checked_add(tokens)
+            .expect("reprocessed prefill token count overflow");
+    }
+
+    pub fn complete_reprocessed_prefill(&mut self) {
+        let episode = self
+            .telemetry
+            .reprocessed_prefills
+            .last_mut()
+            .expect("reprocessed prefill completion requires an active episode");
+        assert!(!episode.completed, "reprocessed prefill completed twice");
+        episode.completed = true;
+    }
 }
 
 /// Dense id-indexed slots plus compact lifecycle indexes.
 ///
 /// `records[id]` keeps direct request lookup O(1); `None` means the trace
 /// reserved the id but the replay scheduler has not released that request yet.
+/// A record is boxed so a reserved slot costs a pointer, not a whole request: a
+/// closed-loop trace reserves millions of ids its run never releases.
 /// The id vectors avoid scanning every reserved slot for arrived/admitted views.
 #[derive(Debug)]
 pub struct RequestStore<Definition: RequestDefinition = TextGenerationDefinition> {
-    records: Vec<Option<ActiveRequest<Definition>>>,
+    records: Vec<Option<Box<ActiveRequest<Definition>>>>,
     /// Request ids in release order. Every present record occurs exactly once.
     arrived_ids: Vec<RequestId>,
     /// Request ids in first-admission order. Every admitted record occurs once.
@@ -232,7 +325,7 @@ impl<Definition: RequestDefinition> RequestStore<Definition> {
         let slot = request_id.0 as usize;
         if slot == self.records.len() {
             self.records
-                .push(Some(ActiveRequest::from_request(request)));
+                .push(Some(Box::new(ActiveRequest::from_request(request))));
             self.arrived_ids.push(request_id);
             return;
         }
@@ -244,16 +337,18 @@ impl<Definition: RequestDefinition> RequestStore<Definition> {
             );
         };
         assert!(record_slot.is_none(), "request id {slot} inserted twice");
-        *record_slot = Some(ActiveRequest::from_request(request));
+        *record_slot = Some(Box::new(ActiveRequest::from_request(request)));
         self.arrived_ids.push(request_id);
     }
 
     pub fn get(&self, id: RequestId) -> Option<&ActiveRequest<Definition>> {
-        self.records.get(id.0 as usize).and_then(Option::as_ref)
+        self.records.get(id.0 as usize).and_then(Option::as_deref)
     }
 
     pub fn get_mut(&mut self, id: RequestId) -> Option<&mut ActiveRequest<Definition>> {
-        self.records.get_mut(id.0 as usize).and_then(Option::as_mut)
+        self.records
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_deref_mut)
     }
 
     pub fn len(&self) -> usize {

@@ -47,7 +47,7 @@ pub(super) struct PullPipeline {
     pull_budget_tokens: u64,
     cluster: SharedGpuCluster,
     receive_group_id: u16,
-    kv_bytes_per_token: u64,
+    kv_accounting: crate::worker::kv::SharedKvAccounting,
     transfer_kind: &'static str,
 }
 
@@ -66,6 +66,7 @@ where
     pub(crate) kv_store: K,
     execution: E,
     input: E::Input,
+    batch_plan: crate::worker::types::IterBatchPlan,
     balance: LoadBalance,
     pub(super) pull_pipeline: PullPipeline,
     decode_fsm: DecodeIterationFsm,
@@ -85,13 +86,14 @@ where
         cluster: SharedGpuCluster,
         receive_group_id: u16,
         pull_budget_tokens: u64,
-        kv_bytes_per_token: u64,
+        kv_accounting: crate::worker::kv::SharedKvAccounting,
     ) -> Self {
         Self {
             context,
             kv_store,
             execution,
             input: Default::default(),
+            batch_plan: Default::default(),
             balance,
             pull_pipeline: PullPipeline {
                 pending_decodes: VecDeque::new(),
@@ -101,7 +103,7 @@ where
                 pull_budget_tokens,
                 cluster,
                 receive_group_id,
-                kv_bytes_per_token,
+                kv_accounting,
                 transfer_kind: "pd_kv_pull",
             },
             decode_fsm: DecodeIterationFsm {
@@ -241,9 +243,10 @@ where
             }
 
             let (request, transfer) = self.pull_pipeline.pending_pulls.pop_front().unwrap();
-            let bytes = transfer
-                .tokens
-                .saturating_mul(self.pull_pipeline.kv_bytes_per_token);
+            let bytes = self
+                .pull_pipeline
+                .kv_accounting
+                .transfer_bytes(transfer.tokens);
             // A standalone request in the remote composition still uses the
             // original direct GPU link, including its telemetry label.
             let kind = if self.context.requests.borrow()[request]
@@ -357,9 +360,12 @@ where
     }
 
     fn start_iteration(&mut self, now: Time) -> Time {
+        self.batch_plan
+            .reset_decode_participation(self.kv_store.num_partitions(), true);
         self.execution.build_iteration_input(
             &self.kv_store,
             &self.context.requests,
+            &self.batch_plan,
             &mut self.input,
         );
         let cost =

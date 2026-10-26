@@ -5,7 +5,8 @@
 //! [`CapacityLimit`] decides how many units may be *active* at once, and
 //! [`SessionDependency`] decides whether a row is independent or waits for the
 //! preceding round of its session. Keeping them separate permits every
-//! combination without growing a cross-product enum.
+//! combination without growing a cross-product enum. The last is no choice: a
+//! trace with sessions chains its rounds, and one without has none to chain.
 //!
 //! Arrival and capacity used to be one axis, which made two of the four
 //! combinations unrepresentable: a timeline replay could not be capped, and a
@@ -19,15 +20,15 @@ use anyhow::{bail, Result};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use super::ReleaseMetadata;
+use super::{InputFileSchema, ReleaseMetadata, TraceTag};
 use crate::common::{RequestId, Time};
 
 pub use req_frontend::release::ArrivalMode;
 
-/// VibeSim's resolved pacing input.
+/// ServingStudioSim's resolved pacing input.
 ///
 /// [`ArrivalMode`] is the shared cross-consumer choice. The rate stays beside
-/// it here because VibeSim stores rate-1-normalized arrivals, while the measured
+/// it here because ServingStudioSim stores rate-1-normalized arrivals, while the measured
 /// client rescales a trace from its observed absolute rate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArrivalSchedule {
@@ -97,22 +98,22 @@ impl CapacityLimit {
 
 /// Whether requests are causally independent or chained within each session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionDependency {
+pub(crate) enum SessionDependency {
     Independent,
     Chained,
 }
 
 impl SessionDependency {
-    pub const CHOICES: &'static [&'static str] = &["independent", "chained"];
-
-    pub fn parse(name: &str) -> Result<Self> {
-        match name {
-            "independent" => Ok(Self::Independent),
-            "chained" => Ok(Self::Chained),
-            other => bail!(
-                "unknown session_dependency {other:?} (expected one of {:?})",
-                Self::CHOICES
-            ),
+    /// What a trace declaring `schema` replays: its sessions' rounds chained
+    /// when it has sessions (the `session` tag, or a format whose rows are
+    /// rounds), each row on its own otherwise. A session trace's later rounds
+    /// carry their session's arrival, not their own, so replaying them
+    /// independently would release a whole conversation at once.
+    pub(crate) fn of(schema: &InputFileSchema) -> Self {
+        if schema.carries(TraceTag::Session) || schema.input_file_format.has_session_topology() {
+            Self::Chained
+        } else {
+            Self::Independent
         }
     }
 }
@@ -123,8 +124,8 @@ pub(super) struct ReplayScheduler {
     capacity: CapacityLimit,
     dependency: SessionDependencyState,
     active: ActiveUnits,
-    /// Whether the previous call turned away a unit that had already arrived,
-    /// purely for lack of a slot.
+    /// Whether the trace cursor is inside a run of units that were already due
+    /// but could not enter purely for lack of a slot.
     ///
     /// It decides which instant a head is stamped with. Normally that is the
     /// unit's own trace arrival, deliberately, so the tick granularity of the
@@ -133,7 +134,12 @@ pub(super) struct ReplayScheduler {
     /// permit *after* waiting for the arrival and only then sends, so its clock
     /// starts at the permit. Stamping the trace time instead would charge the
     /// simulated request for a wait the measured one never reports.
-    capacity_deferred: bool,
+    ///
+    /// This remains set while one drain call consumes several newly opened
+    /// slots. Clearing it after the first admission would stamp only that
+    /// request with the permit time and incorrectly charge its deferred peers
+    /// from their original trace arrival.
+    capacity_backlogged: bool,
 }
 
 /// Which top-level units currently hold a capacity slot.
@@ -278,7 +284,7 @@ impl ReplayScheduler {
             capacity,
             dependency,
             active,
-            capacity_deferred: false,
+            capacity_backlogged: false,
         }
     }
 
@@ -301,9 +307,12 @@ impl ReplayScheduler {
         let (index, mut release_time) = match &mut self.dependency {
             SessionDependencyState::Independent { cursor } => {
                 let release = releases.get(*cursor)?;
-                let release_time = release_time(self.arrival, release, now)?;
+                let Some(release_time) = release_time(self.arrival, release, now) else {
+                    self.capacity_backlogged = false;
+                    return None;
+                };
                 if !admits_new_unit {
-                    self.capacity_deferred = true;
+                    self.capacity_backlogged = true;
                     return None;
                 }
                 (take(cursor), release_time)
@@ -342,9 +351,12 @@ impl ReplayScheduler {
                     }
                     // Arrival is checked before capacity so that a unit that has
                     // not arrived yet is never recorded as capacity-deferred.
-                    let release_time = release_time(self.arrival, release, now)?;
+                    let Some(release_time) = release_time(self.arrival, release, now) else {
+                        self.capacity_backlogged = false;
+                        return None;
+                    };
                     if !admits_new_unit {
-                        self.capacity_deferred = true;
+                        self.capacity_backlogged = true;
                         return None;
                     }
                     head = Some((take(cursor), release_time));
@@ -353,7 +365,7 @@ impl ReplayScheduler {
                 head?
             }
         };
-        if std::mem::take(&mut self.capacity_deferred) {
+        if self.capacity_backlogged {
             release_time = release_time.max(now);
         }
         self.admit(releases, index, release_time)

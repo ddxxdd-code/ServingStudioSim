@@ -7,13 +7,13 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{LocalPrefillDecodeAdmission, PendingOrder};
+use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{BareboneWorker, IterBatchWorker};
-use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prepare_unified_iter_build_essentials,
+use crate::worker::workers::iter_build_essentials::{
+    kv_cache_store, prepare_iter_build_essentials, resolve_kv_accounting,
 };
 
 /// Selects the production barebone composition without changing the L6-facing
@@ -31,29 +31,27 @@ pub(crate) fn build_barebone_worker<M: IterwiseUnifiedModel>(
     cluster: SharedGpuCluster,
 ) -> BareboneWorker<M> {
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
-    let kv_capacity = full_attention_token_capacity(model.as_ref(), &config);
-    let prefix_cache = config.prefix_cache.resolve_tokens(
-        kv_capacity,
-        model.total_kv_bytes_per_token(),
-        model.num_attn_shards(),
-    );
-    let essentials = prepare_unified_iter_build_essentials(
+    let kv_accounting =
+        resolve_kv_accounting(&model.kv_cache_layout(), model.num_attn_shards(), &config);
+    let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
-        model,
         requests,
         &config,
         cost_log_dir,
         pool,
         gpu_name,
         &cluster,
-        kv_capacity,
+        model.gpus_per_replica(),
+        model.cost_log_manifest(),
+        &kv_accounting,
         1,
     );
-    let kv_store = FullAttnKv::with_prefix_cache(
+    let kv_store = kv_cache_store(
+        kv_accounting,
         1,
-        essentials.kv_capacity,
-        prefix_cache,
+        model.num_attn_shards(),
+        &config,
         essentials.sampler,
         prefix_cache_logger,
     );
@@ -68,6 +66,6 @@ pub(crate) fn build_barebone_worker<M: IterwiseUnifiedModel>(
         essentials.context,
         kv_store,
         admission,
-        essentials.execution,
+        UnifiedIterExecution::new(model, essentials.cost),
     )
 }

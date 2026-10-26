@@ -1,15 +1,24 @@
-//! FlashInfer TRT-LLM fused TP boundary:
+//! FlashInfer fused TP boundary:
 //! all-reduce + residual add + RMSNorm in one device kernel.
+//!
+//! Backends: `flashinfer_trtllm` (TRT-LLM IPC workspace) and `flashinfer_mnnvl`
+//! (NVLink-multicast workspace, vLLM's `auto` choice on B200). MNNVL
+//! switches from one-shot to two-shot inside the call by the same 1 MiB
+//! all-gathered-payload rule as the standalone call, so its grid brackets that
+//! switch and the 16-token PDL completion boundary.
 //!
 //! Unlike byte-keyed pure all-reduce, launch cost depends on the 2-D
 //! `[num_tokens, hidden_dim]` shape. `hidden_dim` is static config and
-//! `num_tokens` is the runtime/sweep axis. The grid is capped at vLLM's H200
-//! fusion-size threshold for the TP degree; callers must use the unfused path
-//! above that threshold.
+//! `num_tokens` is the runtime/sweep axis. The grid is capped at vLLM's
+//! GPU-architecture-specific fusion-size threshold for the TP degree; callers
+//! must use the unfused path above that threshold.
 
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
+use crate::timing::kernels::all_reduce_fusion::{
+    flashinfer_fusion_max_bytes, mnnvl_max_oneshot_tokens,
+};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
@@ -27,6 +36,12 @@ pub struct AllReduceResidualRmsNormKernelConfig {
     pub strategy: String,
     pub launch_with_pdl: bool,
     pub fp32_acc: bool,
+    /// An engine's own fused-token limit, replacing vLLM's workspace-size
+    /// rule when set: SGLang fuses any batch of at most 2048 tokens whatever
+    /// its byte size (`layers/communicator.py:162-179`). `None` (vLLM) is left
+    /// out of the config identity, so vLLM configs keep their identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fused_token_limit: Option<u32>,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -37,28 +52,17 @@ pub struct AllReduceResidualRmsNormKernelInput {
 pub struct AllReduceResidualRmsNormSpec;
 
 impl AllReduceResidualRmsNormSpec {
-    /// Effective vLLM H200 fusion boundary for the compiled shape ranges used
-    /// by the alignment target. The TP4 workspace itself can hold 4 MiB, but
-    /// vLLM compiles ranges `(1, 256)` and `(257, 8192)` and only fuses a range
-    /// when its end fits the workspace; therefore the observable TP4 boundary
-    /// is 256 BF16 x 4096 tokens (2 MiB), not the raw 512-token capacity.
-    fn max_fused_bytes(num_gpus: u32) -> u64 {
-        match num_gpus {
-            2 => 64 * 1024 * 1024,
-            4 => 2 * 1024 * 1024,
-            8 => 512 * 1024,
-            _ => panic!("FlashInfer fused all-reduce supports TP 2/4/8"),
-        }
-    }
-
-    /// Largest token count for which vLLM selects the fused SM90 recipe.
+    /// Largest token count for which vLLM selects the fused recipe.
     ///
     /// L3 uses the same policy to choose between this fused leaf and the
     /// unfused all-reduce + RMSNorm fallback. Keeping the threshold here makes
     /// the runtime branch and this kernel's profiling grid share one owner.
     pub fn max_fused_tokens(config: &AllReduceResidualRmsNormKernelConfig) -> u32 {
+        if let Some(limit) = config.fused_token_limit {
+            return limit;
+        }
         let bytes_per_token = (config.hidden_dim as u64) * (config.dtype.size_bytes() as u64);
-        (Self::max_fused_bytes(config.num_gpus) / bytes_per_token) as u32
+        (flashinfer_fusion_max_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
     }
 }
 
@@ -71,11 +75,21 @@ impl KernelSpec for AllReduceResidualRmsNormSpec {
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         let max_fused_tokens = Self::max_fused_tokens(config);
         let mut tokens = Axis::chain([Axis::pow2(0, 4), Axis::token_axis()]);
-        tokens.retain(|num_tokens| *num_tokens <= max_fused_tokens as f64);
-        if tokens.last().copied() != Some(max_fused_tokens as f64) {
-            tokens.push(max_fused_tokens as f64);
-            tokens.sort_by(f64::total_cmp);
+        // Only MNNVL gets the PDL completion (17) and one-shot/two-shot
+        // brackets; keeping them off the trtllm grid avoids resampling that
+        // backend's existing rows.
+        if config.backends.contains(&"flashinfer_mnnvl") {
+            let last_oneshot =
+                mnnvl_max_oneshot_tokens(config.hidden_dim, config.num_gpus, config.dtype);
+            tokens.push(17.0);
+            if last_oneshot > 0 {
+                tokens.extend([f64::from(last_oneshot), f64::from(last_oneshot + 1)]);
+            }
         }
+        tokens.retain(|num_tokens| *num_tokens <= max_fused_tokens as f64);
+        tokens.push(max_fused_tokens as f64);
+        tokens.sort_by(f64::total_cmp);
+        tokens.dedup();
         SweepGrid::new(vec![tokens])
     }
 
@@ -113,10 +127,10 @@ mod tests {
     use crate::timing::SweepCoords;
     use serde_json::Value;
 
-    fn config(num_gpus: u32) -> AllReduceResidualRmsNormKernelConfig {
+    fn config(gpu_name: &str, num_gpus: u32) -> AllReduceResidualRmsNormKernelConfig {
         AllReduceResidualRmsNormKernelConfig {
             backends: vec!["flashinfer_trtllm"],
-            gpu_name: "NVIDIA H200".to_string(),
+            gpu_name: gpu_name.to_string(),
             num_gpus,
             hidden_dim: 4096,
             dtype: DType::Bf16,
@@ -124,12 +138,34 @@ mod tests {
             strategy: "auto".to_string(),
             launch_with_pdl: true,
             fp32_acc: true,
+            fused_token_limit: None,
         }
     }
 
     #[test]
+    fn an_engine_token_limit_replaces_the_fusion_size_policy() {
+        let sglang = AllReduceResidualRmsNormKernelConfig {
+            hidden_dim: 6144,
+            fused_token_limit: Some(2048),
+            ..config("NVIDIA B200", 8)
+        };
+        assert_eq!(
+            AllReduceResidualRmsNormSpec::max_fused_tokens(&sglang),
+            2048
+        );
+        assert_eq!(
+            AllReduceResidualRmsNormSpec::sweep_grid(&sglang).axes()[0].last(),
+            Some(&2048.0)
+        );
+        assert!(config("NVIDIA B200", 8)
+            .identity()
+            .get("fused_token_limit")
+            .is_none());
+    }
+
+    #[test]
     fn config_identity_and_dtype_are_explicit() {
-        let config = config(2);
+        let config = config("NVIDIA H200", 2);
         assert_eq!(config.compute_dtype(), Some(DType::Bf16));
         assert_eq!(config.backends(), &["flashinfer_trtllm"]);
         assert_eq!(config.describe_config()["hidden_dim"], 4096);
@@ -147,11 +183,15 @@ mod tests {
     }
 
     #[test]
-    fn sweep_is_capped_by_vllm_h200_fusion_policy() {
-        let tp2 = AllReduceResidualRmsNormSpec::sweep_grid(&config(2));
-        let tp4 = AllReduceResidualRmsNormSpec::sweep_grid(&config(4));
+    fn sweep_is_capped_by_vllm_gpu_fusion_policy() {
+        let tp2 = AllReduceResidualRmsNormSpec::sweep_grid(&config("NVIDIA H200", 2));
+        let h200_tp4 = AllReduceResidualRmsNormSpec::sweep_grid(&config("NVIDIA H200", 4));
+        let mut b200 = config("NVIDIA B200", 4);
+        b200.hidden_dim = 6144;
+        let b200_tp4 = AllReduceResidualRmsNormSpec::sweep_grid(&b200);
         assert_eq!(tp2.axes()[0].last(), Some(&8192.0));
-        assert_eq!(tp4.axes()[0].last(), Some(&256.0));
+        assert_eq!(h200_tp4.axes()[0].last(), Some(&256.0));
+        assert_eq!(b200_tp4.axes()[0].last(), Some(&2730.0));
         assert!(matches!(
             AllReduceResidualRmsNormSpec::cache_kind("flashinfer_trtllm"),
             CacheKind::Cache1DLinear
@@ -159,8 +199,29 @@ mod tests {
     }
 
     #[test]
+    fn mnnvl_sweep_brackets_completion_and_oneshot_switch() {
+        let mnnvl = AllReduceResidualRmsNormKernelConfig {
+            backends: vec!["flashinfer_mnnvl"],
+            ..config("NVIDIA B200", 4)
+        };
+        let grid = AllReduceResidualRmsNormSpec::sweep_grid(&mnnvl);
+        let tokens = &grid.axes()[0];
+        // 1 MiB / (4096 * 4 * 2 B) = 32 tokens one-shot.
+        for t in [16.0, 17.0, 32.0, 33.0] {
+            assert!(tokens.contains(&t), "missing {t}");
+        }
+        assert_eq!(tokens.last(), Some(&4096.0));
+        assert!(tokens.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(tokens.len(), 41);
+
+        let trtllm = AllReduceResidualRmsNormSpec::sweep_grid(&config("NVIDIA B200", 4));
+        assert!(!trtllm.axes()[0].contains(&17.0) && !trtllm.axes()[0].contains(&33.0));
+        assert_eq!(trtllm.axes()[0].len(), 39);
+    }
+
+    #[test]
     fn enumerate_matches_python_args_exactly() {
-        let config = config(4);
+        let config = config("NVIDIA H200", 4);
         let grid = AllReduceResidualRmsNormSpec::sweep_grid(&config);
         let first =
             &AllReduceResidualRmsNormSpec::enumerate(&config, &grid, "flashinfer_trtllm")[0];

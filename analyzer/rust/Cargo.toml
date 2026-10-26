@@ -2,7 +2,11 @@
 name = "analyzer"
 version = "0.1.0"
 edition = "2021"
-description = "VibeSim post-sim analyzer — DataFusion parquet scan → report + plot-payload JSON"
+description = "ServingStudio Analyzer — DataFusion parquet scan → report + plot-payload JSON"
+# Licensed under the root LICENSE (PolyForm Noncommercial 1.0.0 OR PolyForm
+# Internal Use 1.0.0); not published to crates.io.
+license-file = "../../LICENSE"
+publish = false
 
 [[bin]]
 name = "analyze"
@@ -13,7 +17,11 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 csv = "1"
+# Per-iteration reduction and detail serialization are independent pure maps.
+# Rayon keeps those CPU-heavy maps off the serial, order-sensitive fold.
+rayon = "1"
 # DataFusion drives the parquet scan / filter / grouped aggregation. arrow-array
 # is pinned to the version DataFusion 45 re-exports so downcasts on its
 # RecordBatches resolve to the same arrow types (matches ref/moesim-rs analyze-rust).
@@ -23,6 +31,15 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 # The first UI wiring slice exposes only a read-only run catalog. Axum owns the
 # small HTTP surface; filesystem discovery remains explicit in this crate.
 axum = "0.8"
+# Response compression as a layer over the whole route table. Every JSON
+# response the UI reads goes out compressed, rather than the one alignment path
+# that used to gzip itself by hand. Brotli is included because browsers prefer
+# it and it is meaningfully smaller on the large analysis payloads; gzip stays
+# for anything that does not ask for br.
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"] }
+# Per-iteration alignment shards are one zstd frame per record (12x smaller on
+# a large capture); already in the tree through parquet.
+zstd = "0.13"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 sha2 = "0.10"
 # Pure-Rust linear algebra — used only by `src/pca.rs` for the symmetric

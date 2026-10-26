@@ -1,7 +1,7 @@
 ---
 name: operate-profile-existing-kernel
 description: >-
-  Query, fill, refresh, validate, or measure a registered VibeSim L1 kernel
+  Query, fill, refresh, validate, or measure a registered ServingStudio Sim L1 kernel
   profile, including DB-row provenance and preservation.
 ---
 
@@ -29,13 +29,13 @@ The supported CLI is:
 uv run python -m launcher kernel-profile list [--json]
 uv run python -m launcher kernel-profile count-missing <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
 uv run python -m launcher kernel-profile query <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
-uv run python -m launcher kernel-profile run <table> --backend <backend> (--spec JSON | --specs PATH) [--force] [--output-dir DIR] [--gpu-name NAME] [--db PATH] [--json]
+uv run python -m launcher kernel-profile run <table> --backend <backend> (--spec JSON | --specs PATH) [--force | --fresh] [--output-dir DIR] [--gpu-name NAME] [--db PATH] [--json]
 ```
 
 `python -m profiling ...` remains a compatibility/developer entry and calls the
 same `profiling.cli` implementation. Skills and managed Agent runs use the
 launcher form so simulation, timing prediction, alignment, and kernel profiling
-share one VibeSim command surface.
+share one ServingStudio Sim command surface.
 
 Spec input rules:
 
@@ -56,6 +56,13 @@ Important semantics:
   missing specs are profiled, then results are queried.
 - `run --force` refreshes every provided spec through `perf_api` even if rows
   already exist.
+- `run --fresh` measures every provided spec exactly like `--force` but inserts
+  nothing: the DB is left untouched and the reported metrics come straight from
+  the measurement. Use it to look at a kernel's numbers without moving the
+  shared cache. The two flags are mutually exclusive, and because nothing is
+  written, a `--fresh` result is **not** DB evidence — its `missing_count`
+  counts specs whose runner failed in that run, not rows absent from the DB, and
+  a follow-up `count-missing` will (correctly) still report those rows missing.
 - `run --output-dir DIR` writes immutable `request.json`, `results.json`,
   `curve.json`, and `job.meta.json`. A managed Agent run requires this option;
   put it below the workspace `logs/` root. Direct development calls may omit it
@@ -80,6 +87,20 @@ Record these fields with the spec set and verify them before calling a row a DB
 hit for the target experiment. If provenance is unavailable, report the row as
 unverified rather than inferring equivalence from table/backend alone.
 
+For framework and specialized compute rows, verify that the timed boundary is
+the production public callable and that `Timer.cupti` sums one logical
+invocation: a stable single kernel may use a name filter, while a compound
+callable must include its full launch sequence with `kernel_name=None`. Preserve
+the documented `Timer.do_bench` path for simple Torch GEMM. CUDA-event timing is
+diagnostic, not DB evidence. Allocation, compile, correctness, and
+synchronization must be outside the timed closure.
+
+Inspect input generation before trusting a row for a data-sensitive algorithm.
+The synthetic workload must exercise the same planner, histogram/radix path, or
+memory-locality regime as production, with deterministic construction outside
+timing and an independent correctness oracle. Do not refresh a row merely to
+bless a pathological input or a relaxed tolerance.
+
 ### Preserve rows written in a worktree
 
 `profiling/profile.db` is tracked, but a worktree may hide its local changes with
@@ -96,6 +117,12 @@ Stage or commit it only when the user requests that action. A clean `git status`
 does not prove the rows were saved.
 
 ### Automatic work submission
+
+When shapes originate from an alignment or simulation workload, do not replace
+that demand with a hand-authored fill sweep. Let timing-predict or simulation
+JIT-fill the exact requested shapes; use this skill only for read-only coverage
+inspection, a diagnosed missing/error-only retry, or explicit cache-fidelity
+work requested by the user.
 
 For one homogeneous table/backend/GPU-count request, generate the complete
 intended spec set and submit it in one public `profiling run --specs ...` call.
@@ -133,6 +160,35 @@ will profile on top of someone else's job, so use it only for GPUs you know are
 yours. Note again that `--gpu-name` is a profile.db key/filter, **not** a device
 selector — it neither adds nor removes hardware from the pool.
 
+### Workers run in their env's image
+
+Each worker runs in the image `profiling/container/images.py` assigns to its
+backend's profile env (`subprocess_env`, default `default_env`), here and on a
+remote. When that image is not built on this host, the run fails with
+"build it with `python -m profiling.container.images build <name>`". Report that;
+building is `just profile-container-build <name>` (tens of GB, tens of minutes),
+so ask before starting it. `VIBESIM_PROFILE_RUNTIME=host` runs on host
+interpreters instead. It exists for debugging a runner, not for producing rows.
+`profiling/container/README.md` lists the images.
+
+### On a remote GPU host: `--remote NAME`
+
+`kernel-profile run|measure ... --remote NAME` runs the same call on a machine
+from the untracked `remote.yaml` (`remote.example.yaml` lists the fields). Use
+it when the user asks, or when the target GPU (`--gpu-name`) is only available
+there. Run from the checkout root. The output directory must be under `logs/`
+(`run` requires `--output-dir`); `--db` is refused. The remote needs only docker with the NVIDIA runtime:
+the image is sent from here when it lacks it, so it must be built here first.
+The first send of an image is 30–40 GB and takes minutes; later calls reuse it.
+The job measures into a private profile.db copy, which is merged into this
+checkout's DB when the job finishes (`--fresh` merges nothing). A conflicting
+row merges nothing and leaves the merge report in the output directory: report
+that and do not force it. `remote-run.json` in the output directory records the
+host, the image and its id, and the remote path. A Slurm remote asks for the
+GPUs the specs need, and `--remote-set launch.slurm.time=...` changes the limit
+for one call. Do not create or edit `remote.yaml` or ssh setup unless asked.
+Details: `launcher/README.md`, "Remote execution" (Kernel profiling).
+
 ## The `measure` diagnostic (NVML telemetry, out of the cache path)
 
 `launcher kernel-profile` has a fifth verb, `measure`, that the four cache verbs
@@ -143,7 +199,8 @@ util / temp / throttle drift for one kernel spec, **not** to fill or refresh
 
 ```bash
 uv run python -m launcher kernel-profile measure <table> --backend <backend> --spec JSON \
-  [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--gpu-name NAME] [--db PATH] [--json]
+  [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--cuda-graph] \
+  [--gpu-name NAME] [--db PATH] [--json]
 ```
 
 How it differs from the cache verbs:
@@ -154,12 +211,18 @@ How it differs from the cache verbs:
 - **Exactly one spec.** `measure` rejects a multi-spec batch.
 - Runs a single CUPTI window of `--duration-s` (default 10 s), records **every**
   per-launch kernel duration, samples NVML telemetry on a background thread at
-  `--telemetry-hz` (default 20 Hz), and writes `runtimes.csv`, `telemetry.csv`,
-  `summary.json`, and two `.png` plots to `--output-dir` (default
-  `./measure_<table>_<backend>`).
+  `--telemetry-hz` (default 20 Hz), and always writes `runtimes.csv`,
+  `telemetry.csv`, and `summary.json` to `--output-dir` (default
+  `./measure_<table>_<backend>`). It also writes two `.png` plots when matplotlib
+  is installed in the selected profiling environment; otherwise the summary
+  records them as skipped and the measurement still succeeds.
 - `--no-clear-l2` switches from the default cold per-launch L2 displacement
   (which matches the `profile.db` measurement) to a warm continuous window that
   surfaces sustained power/clock drift.
+- `--cuda-graph` replays the kernel from a CUDA graph. Without it, a kernel with
+  slow host dispatch (e.g. CuTe-DSL) leaves the GPU idle between launches even
+  with `--no-clear-l2`, so it never reaches the power-limited clock that
+  back-to-back serving runs at.
 - Only kernels whose runner times through `Timer.cupti` are accepted; comm
   kernels are rejected.
 
@@ -179,14 +242,18 @@ only after doing the exact action, or write `N/A: reason`.
   `<table>` and `--backend` exist.
 - [] Record the listed `kernel_kind`, `args`, `metric_family`,
   `subprocess_env`, generated `get_fn`, and generated `count_fn`.
+- [] For compute profiling, verify the public callable, CUPTI filter/sum
+  boundary, untimed setup/correctness, and representative input distribution.
 - [] Build the complete intended spec set. Confirm every spec has exactly the
   listed `args` fields and no routing-only fields such as `backend`.
+- [] If the shapes come from alignment or simulation, confirm timing-predict or
+  simulation produced the demand. Do not substitute a manual pre-fill sweep.
 - [] For a homogeneous multi-spec profiling request, write the complete set to
   one `--specs` input and record its count. Do not pre-shard it into multiple
   `run` calls.
 - [] For a single spec, use `--spec`; for a multi-spec set, choose JSON list,
   `{"specs": [...]}`, or JSONL as the one `--specs` input.
-- [] Decide DB path. Use a task-scoped DB under `<workspace>/tmp/` for
+- [] Decide DB path. Use a task-scoped DB under `$TMPDIR` for
   validation-only runs; use the
   default/shared DB only when the user explicitly wants to update it.
 - [] Decide whether `--gpu-name` is needed. Use it for a known DB key or to
@@ -195,7 +262,8 @@ only after doing the exact action, or write `N/A: reason`.
 - [] Confirm the command does not narrow the device set (no
   `CUDA_VISIBLE_DEVICES`, no `VIBESIM_PROFILE_GPUS`) — L1 detects and arranges
   idle GPUs itself. If it does, record the concrete reason.
-- [] Choose the command mode: `count-missing`, `query`, `run`, or `run --force`.
+- [] Choose the command mode: `count-missing`, `query`, `run`, `run --force`,
+  or `run --fresh` (measure without persisting).
 - [] For `run` / `run --force`, choose a fresh `--output-dir` below `logs/` when
   the result must appear in the managed UI. Never reuse an artifact directory
   containing an existing immutable snapshot.
@@ -211,7 +279,8 @@ only after doing the exact action, or write `N/A: reason`.
   errored. If manual sharding was required, record the allowed exception and
   supporting evidence.
 - [] For `run` or `run --force`, run `count-missing` again on the same
-  table/backend/specs/DB/gpu-name to verify persistence.
+  table/backend/specs/DB/gpu-name to verify persistence. Skip this for
+  `run --fresh`, which is expected to leave the rows missing.
 - [] For `query` or completed `run`, verify the JSON result count equals the
   spec count and each result has `status: "ok"` unless reporting misses.
 - [] Sanity-check metrics by family: compute rows have `time_ms`, `tflops`,
@@ -241,9 +310,10 @@ items as `[x]` only when complete.
   multi-spec request, or an allowed manual-sharding exception is documented
   with evidence.
 - [] `count-missing` was run before profiling, or skipped with a stated reason.
-- [] `run` or `run --force` completed with exit code 0.
+- [] `run`, `run --force`, or `run --fresh` completed with exit code 0.
 - [] Any retry contained only specs previously reported missing or errored.
 - [] Post-run `count-missing` returned 0, or every remaining miss is listed.
+  N/A for `run --fresh`, which persists nothing by design.
 - [] `query` or run output returned one result per input spec.
 - [] No result has `status: "missing"` unless the final answer explicitly
   reports the miss.
@@ -269,7 +339,7 @@ Always report:
   `skills/operate-profile-existing-kernel/SKILL.md`.
 - Docs checked: concrete doc paths/sections.
 - Command(s): exact CLI command(s), including `--db`, `--gpu-name`, and
-  `--force` when used.
+  `--force` / `--fresh` when used.
 - Scope: table, backend, spec count, DB path, and whether DB path was temporary
   or shared.
 - Submission: confirm one complete `run --specs` call, or report the allowed
@@ -278,7 +348,8 @@ Always report:
   whether the command relied on CUDA device-name auto-resolution. State that the
   device set was left to L1's idle-GPU detection, or report the narrowing and
   its concrete reason.
-- Mode: read-only query, count-missing, JIT-fill, or force refresh.
+- Mode: read-only query, count-missing, JIT-fill, force refresh, or fresh
+  (measured, not persisted). For `fresh`, say plainly that no row was written.
 - Result: missing count before/after when available.
 - Metrics: compact table of returned metrics, or JSON status summary for large
   batches. For small batches, include the input `KernelArgs` columns next to
@@ -296,7 +367,7 @@ Single-spec run:
 
 ```bash
 uv run python -m launcher kernel-profile run single_gemm --backend torch --force \
-  --db tmp/single-gemm/profile.db \
+  --db "$TMPDIR/single-gemm/profile.db" \
   --output-dir logs/20260731_0_single_gemm_profile --json \
   --spec '{"m":128,"n":8192,"k":8192,"dtype":"bf16"}'
 ```
@@ -304,7 +375,14 @@ uv run python -m launcher kernel-profile run single_gemm --backend torch --force
 Complete JSON/JSONL spec set:
 
 ```bash
-uv run python -m launcher kernel-profile run single_gemm --backend torch --gpu-name "H100" --specs specs.json --db tmp/single-gemm/profile.db --output-dir logs/20260731_0_single_gemm_profile --json
-uv run python -m launcher kernel-profile count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db tmp/single-gemm/profile.db --json
-uv run python -m launcher kernel-profile query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db tmp/single-gemm/profile.db --json
+uv run python -m launcher kernel-profile run single_gemm --backend torch --gpu-name "H100" --specs specs.json --db "$TMPDIR/single-gemm/profile.db" --output-dir logs/20260731_0_single_gemm_profile --json
+uv run python -m launcher kernel-profile count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db "$TMPDIR/single-gemm/profile.db" --json
+uv run python -m launcher kernel-profile query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db "$TMPDIR/single-gemm/profile.db" --json
 ```
+
+## Do not re-tune what an earlier run already tuned
+
+A FlashInfer-autotuned kernel re-derives its tactics in every worker process
+unless the runner wraps `profiling/runners/autotune_cache.py` — one submission
+measured 166 s of tuning against 5.7 s of measuring. Before a large fill, read
+`operate-manage-jit-and-autotune-caches`.

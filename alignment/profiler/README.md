@@ -1,52 +1,239 @@
-# vLLM profiler setup
+# Serving-engine profiler setup
 
-The alignment ground truth comes from the **vLLM submodule in this directory**,
-which adds `vllm_iteration(N): <phase>` NVTX scopes and a versioned
+Alignment ground truth comes from the instrumented **vLLM and SGLang
+submodules in this directory**. Both forks emit indexed per-phase NVTX scopes
+and the same versioned alignment records, so capture parsing and downstream
+analysis stay shared. The parent repository pins the exact fork commits:
+
+```text
+alignment/profiler/vllm    # branch: servingstudio-alignment
+alignment/profiler/sglang  # branch: vibesim-alignment
+```
+
+Initialize both from the ServingStudio Sim checkout:
+
+```bash
+git submodule update --init alignment/profiler/vllm alignment/profiler/sglang
+```
+
+## vLLM environment
+
+The vLLM fork adds `vllm_iteration(N): <phase>` NVTX scopes and a versioned
 `VibeSimAlignmentIteration {json}` model-input record. It also emits one
 `VibeSimAlignmentRequestTiming {json}` record when each request completes. The
-MoE popularity pass additionally emits `VibeSimAlignmentExpertLoad {json}` only
-when EPLB balancedness logging is explicitly enabled. Each record contains the
-EP-reduced per-layer token counts mapped back to logical expert ids; the launcher
-aggregates these into `expert_popularity.json`. This pass runs without NSYS and
-must be separate from the timing pass because the reduction and D2H conversion
-are deliberate measurement overhead.
-record contains both first-token and decode-span timing. The fork source is
-already vendored (as a git submodule) at:
+MoE routing passes additionally emit `VibeSimAlignmentExpertLoad {json}` only
+when EPLB balancedness logging is explicitly enabled — which the runner enables
+for them, so no operator flag is required. Each record contains the EP-reduced
+per-layer token counts mapped back to logical expert ids; the launcher
+aggregates these into `expert_popularity.json`. A `token_corpus` pass also
+returns the experts each token routed to on the response itself, which the load
+generator persists per request. These passes run without NSYS and must be
+separate from the timing pass because the reduction and D2H conversion are
+deliberate measurement overhead. Each request-timing record contains both
+first-token and decode-span timing.
 
-    alignment/profiler/vllm      # branch: moesim-profile
+Raw expert-load schema v3 adds model role, maximum forwards per engine step and
+a monotonic observation timestamp. The extractor writes separate target/draft
+schema-v4 popularity summaries within the replay window. Iteration schema v4
+also records per-request query width, pre-forward KV, output progress and
+drafted/accepted/emitted counts. Explicit external IDs preserve client identity;
+an apparent random suffix alone is not sufficient reason to strip client text.
+These observations support alignment and acceptance diagnostics, not simulator
+placement policy.
+
+`output_tokens_before` is the scheduler's committed output count immediately
+before consuming this batch's sampled output. Async scheduler cache counts can
+include unconfirmed placeholders and must not supply this field. Queued work for
+a retired request remains in the record with `request_finished_before: true`;
+its committed count is `null` if the scheduler has already removed the request.
+Such work contributes to raw verification totals, but cannot advance effective
+client output when deriving per-request acceptance rates.
+
+### One maintained fork line
+
+`servingstudio-alignment` is the only maintained line, on upstream vLLM main
+`04730e8` (2026-09-24, the newest main with a `cu130` wheel that serves
+DeepSeek-V4.1; previously v0.28.1rc0 `8369aff`). Its `ALIGNMENT.md` records the
+base, what the line adds (instrumentation, MTP drafter route capture under model
+runner V2, record-only EPLB), and how each commit of the retired
+`moesim-profile` line was carried.
+`moesim-profile` stays on the remote because recorded captures name it. Every
+capture's `<name>_launch.json` records the fork's `head`, `branch`, and
+`status_short` under `fork_git`.
+
+To move to a newer upstream, rebase `servingstudio-alignment` onto it in an
+isolated checkout, update the base SHA in `ALIGNMENT.md`, rebuild `.venv` with
+the new base as the wheel commit, run the fork's focused tests listed there,
+and run a GPU capture through `alignment-campaign` before bumping the Sim
+gitlink.
 
 Only its `.venv` is missing — build it once. `runner.py` defaults `fork_python`
 to `alignment/profiler/vllm/.venv/bin/python`; override `fork_python` in
 the align config to point elsewhere.
 
-The instrumentation on `moesim-profile` is Python-only (NVTX scopes + iteration
-metrics logging), so the **precompiled fast path** works — no multi-hour CUDA
-compile:
+The instrumentation on `servingstudio-alignment` is Python-only (NVTX scopes +
+iteration metrics logging), so the **precompiled fast path** works — no multi-hour CUDA
+compile. The submodule is detached at the parent gitlink, so explicitly select
+the last upstream commit before the `feat(alignment):` patches. Without this,
+vLLM's setup cannot resolve the branch and silently falls back to the latest
+nightly wheel, which can be binary-incompatible with the pinned fork:
 
 ```bash
 cd alignment/profiler/vllm
-git status                         # confirm branch moesim-profile, tree present
+git status --short                 # confirm the pinned checkout is clean
+git rev-parse HEAD                 # record the exact detached gitlink
 
 # 3.12 venv living next to the fork (the path runner.py expects)
+# Archive any adopted environment first: installing over it does not prune
+# stale dependencies from a different nightly/CUDA generation.
+if [ -e .venv ]; then
+  ENVIRONMENT_ARCHIVE=$(mktemp -d "$TMPDIR/vllm-venv-archive-XXXXXXXX")
+  rmdir "$ENVIRONMENT_ARCHIVE"
+  mv .venv "$ENVIRONMENT_ARCHIVE"
+  echo "archived old vLLM environment at $ENVIRONMENT_ARCHIVE"
+fi
 uv venv --python 3.12 .venv
-source .venv/bin/activate
 
-# Install the fork's Python over vLLM's precompiled binaries for the pinned
-# base version (skips the from-source CUDA build). Match the box's CUDA (12.8).
-export VLLM_USE_PRECOMPILED=1
-pip install -e .
+# Resolve the binary base and verify every checkout-local change remains Python.
+FIRST_ALIGNMENT_COMMIT=$(git log --reverse --format=%H --fixed-strings \
+  --grep='feat(alignment):' HEAD | sed -n '1p')
+if [ -z "$FIRST_ALIGNMENT_COMMIT" ]; then
+  echo "cannot resolve the first alignment commit" >&2
+  exit 1
+fi
+PRECOMPILED_BASE_COMMIT=$(git rev-parse "$FIRST_ALIGNMENT_COMMIT^")
+if git diff --name-only "$PRECOMPILED_BASE_COMMIT"..HEAD | \
+  grep -E '\.(c|cc|cpp|cu|cuh|h|hpp|rs)$'; then
+  echo "alignment fork has native changes; build vLLM from source" >&2
+  exit 1
+fi
+
+# Install the fork's Python over that base's precompiled CUDA-13 wheel. This
+# checkout pins Torch 2.11 and CUDA-13 CUTLASS dependencies, so its native vLLM
+# extension must use the matching hosted cu130 variant.
+VLLM_USE_PRECOMPILED=1 \
+  VLLM_PRECOMPILED_WHEEL_COMMIT="$PRECOMPILED_BASE_COMMIT" \
+  VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 \
+  uv pip install --python .venv/bin/python -e .
 
 # VLLM's profiling-only NVTX scopes import this optional package when
 # VLLM_NVTX_SCOPES_FOR_PROFILING=1.
-uv pip install nvtx
+uv pip install --python .venv/bin/python nvtx
 
 # Sanity: the fork imports and exposes the instrumentation env var.
-python -c "import vllm, vllm.envs as e; print(vllm.__version__, hasattr(e, 'VLLM_NVTX_SCOPES_FOR_PROFILING'))"
+# (Call the venv directly: `uv run` inside this directory resolves vLLM's own
+# pyproject instead.)
+.venv/bin/python -c "import vllm, vllm.envs as e; print(vllm.__version__, hasattr(e, 'VLLM_NVTX_SCOPES_FOR_PROFILING'))"
 ```
 
-If `VLLM_USE_PRECOMPILED` cannot resolve a wheel for the pinned version, fall
-back to a from-source build (`pip install -e .` without the flag) — this compiles
-CUDA kernels and takes much longer.
+Import success is not a CUDA-runtime qualification: an older driver can load the
+cu130 extensions and still fail at their first PTX kernel with
+`cudaErrorUnsupportedPtxVersion`. Verify that `vllm` and every required native
+extension resolve under this checkout, run `uv pip check`, and execute a small
+production kernel from each CUDA toolchain used by the target model. If the host
+driver is too old, set the profile's top-level `driver_compat_lib_dir` to an
+unpacked matching NVIDIA `cuda-compat` directory containing `libcuda.so.1`; the
+launcher scopes that library to the vLLM server and records it in launch
+metadata. A local source build against the host CUDA toolkit is the other clean
+option.
+Before the probe, inspect `uv pip tree --python .venv/bin/python` for CUDA and
+CUTLASS packages and run `uv pip check --python .venv/bin/python`. Recent vLLM
+can intentionally resolve Torch cu12 together with CUDA-13 CUTLASS DSL/JIT
+packages, so mixed CUDA generations alone do not prove a stale environment.
+Recreate the environment when the consistency check fails, a distribution is
+present at multiple versions, or a package is not reachable from the current
+resolution. Select `driver_compat_lib_dir` for the highest CUDA/PTX generation
+exercised by the actual model path. Record the resolved module paths and loaded
+`libcuda.so.1` path with the alignment artifact; an import-only or tensor-only
+probe is insufficient.
+
+If the diff from `PRECOMPILED_BASE_COMMIT` contains native source, or if
+`VLLM_USE_PRECOMPILED` cannot resolve a wheel for that commit, fall back to a
+from-source build (`uv pip install --python .venv/bin/python -e .` without the
+flag) — this compiles CUDA kernels and takes much longer. Never use the latest
+nightly, another checkout's `.so` files, or model-specific compatibility
+switches as a fallback.
+
+## SGLang environment
+
+The SGLang fork emits `sglang_iteration(N): <phase>` and the same iteration,
+request-timing, expert-load, and worker-device records consumed by the shared
+pipeline. Build its environment under the submodule's `python/` directory,
+which is the default path selected when `engine: sglang` and no `fork_python`
+override is supplied:
+
+Expert-popularity topology is a YAML-only contract for every engine. An
+`expert_popularity` profile must state both `server.expert_parallel_size` (the
+expert-sharding degree) and `server.expert_count_reduction_group_size` (the rank
+population already summed into one expert-count record), because the marginal
+reduced over them is that pass's only product. The profiler never derives either
+value from the engine name. For example, a current SGLang pure-TP run commonly
+states 1 and `tp_size`, respectively; a current vLLM EP run commonly states its
+EP size for both. Those are deployment facts to encode, not defaults in the
+parser. A `token_corpus` profile states them wherever it takes the expert-load
+stream (`ProfileConfig.captures_expert_load`: vLLM, `--enable-expert-parallel`,
+more than one rank, and no `--no-enable-eplb`); elsewhere it records routes
+alone, since a corpus holds logical expert ids and needs no topology.
+
+```bash
+cd alignment/profiler/sglang/python
+uv venv --python 3.12 .venv-sglang
+uv pip install --python .venv-sglang/bin/python -e .
+uv run --python .venv-sglang/bin/python python -c \
+  "import sglang; print(sglang.__version__, sglang.__file__)"
+```
+
+Every SGLang alignment profile must also declare its binary runtime contract.
+The launcher owns this step; there is no separate warm-up command to remember.
+It locks the selected venv, installs only missing exact-version wheels, rejects
+an already-installed version conflict rather than replacing it, and verifies
+the named files from wheel metadata without importing FlashInfer. The lock is
+released before the server starts, so concurrent profiles serialize preparation
+only and still run independently afterward. A satisfied environment performs no
+package-index request and no refresh.
+
+For the pinned CUDA 13 GLM-5.2 stack the campaign contract is:
+
+```yaml
+python_runtime:
+  lock_timeout_seconds: 3600.0
+  install_timeout_seconds: 1800.0
+  packages:
+    - name: nvtx
+      version: 0.2.16
+      index_url: https://pypi.org/simple
+    - name: flashinfer-python
+      version: 0.6.15.post1
+      index_url: https://pypi.org/simple
+    - name: flashinfer-cubin
+      version: 0.6.15.post1
+      index_url: https://flashinfer.ai/whl
+    - name: flashinfer-jit-cache
+      version: 0.6.15.post1
+      local_version: cu130
+      index_url: https://flashinfer.ai/whl/cu130
+      required_files:
+        - flashinfer_jit_cache/jit_cache/fp4_quantization_100/fp4_quantization_100.so
+        - flashinfer_jit_cache/jit_cache/trtllm_comm/trtllm_comm.so
+        - flashinfer_jit_cache/jit_cache/rope/rope.so
+        - flashinfer_jit_cache/jit_cache/fmha_gen/fmha_gen.so
+        - flashinfer_jit_cache/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
+  environment:
+    FLASHINFER_DISABLE_JIT: "1"
+```
+
+The three FlashInfer entries mirror SGLang's pinned cu130 Dockerfile package
+trio; `nvtx` satisfies the separate NSYS iteration-range preflight. The
+prebuilt cache wheel, rather than a worktree-specific Ninja directory under
+`~/.cache`, owns the shared objects. If the declared wheel does not contain a
+required module, the profile fails before loading model weights instead of
+compiling it during server startup.
+
+The pinned SGLang version currently uses a CUDA 13 user-space stack. On a host
+whose driver needs NVIDIA forward compatibility, set `driver_compat_lib_dir`
+in `profile.yaml` to an unpacked matching `cuda-compat` library directory. The
+launcher validates `libcuda.so.1` there and records the path in launch metadata.
+Do not modify the global `LD_LIBRARY_PATH` to make one capture work.
 
 Model weights: the align config uses the HF repo id `meta-llama/Meta-Llama-3-8B`,
 resolved from the shared cache at `HF_HOME=/m-coriander/coriander/hf`. Confirm the
@@ -160,15 +347,25 @@ EngineCore-output wait plus output fan-out. The extractor compares durations
 within their originating clock domains and never subtracts EngineCore and API
 absolute timestamps across processes.
 
-The separate `expert_popularity` pass sets
-`VLLM_NVTX_SCOPES_FOR_PROFILING=0`, so it neither emits nor requires this
-request-timing artifact. Its only model-side ground truth is the expert-load
-record stream described above; timing evidence always comes from the NSYS pass.
+The separate `token_corpus` and `expert_popularity` passes disable the selected
+engine's timing instrumentation, so they neither emit nor require this
+request-timing artifact. Their model-side ground truth is the expert-load record
+stream described above — one rank-synchronized record per forward, which is what
+a sampled corpus fold is scored against — plus, for `token_corpus`, the returned
+per-token routes; timing evidence always comes from the NSYS pass.
 The resulting summary follows
-[`alignment/schema/expert_popularity_v2.schema.json`](../schema/expert_popularity_v2.schema.json):
+[`alignment/schema/expert_popularity_v3.schema.json`](../schema/expert_popularity_v3.schema.json):
 `counts_by_layer[layer][logical_expert]` is authoritative, while EP degree,
 top-k, aggregation scope, and the simulator's rank-major logical partition are
 explicit provenance rather than implicit loader assumptions.
+The raw expert-load JSONL preserves every canonical EPLB record. When an engine
+repeats scheduler evidence on every TP rank, only TP0's copy in each DP group
+is canonical; repeated owner records are rejected. The aggregate uses the
+configured maximum scheduler/CUDA-graph token count and the YAML-provided
+expert count-reduction group size as a conservation ceiling, and excludes
+oversized records that flush work accumulated before the replay.
+`aggregation` records the ceiling, raw and accepted counts, and every discarded
+EPLB step.
 
 For long multi-GPU workloads, set `nsys.capture_duration_seconds` with
 `capture_mode: cuda_profiler_api`. The launcher stops CUPTI at that deadline but
@@ -277,6 +474,18 @@ The same launch boundary enables vLLM prompt-token details by default. req-front
 performs a mandatory two-request prefix-cache preflight and reads
 `usage.prompt_tokens_details.cached_tokens`; experiment presets do not need to
 repeat `--enable-prompt-tokens-details` in `server.extra_args`.
+
+vLLM launches through `python -m vllm.entrypoints.cli.main serve` with
+`server.api_server_count` HTTP API processes, 4 when unset. The deprecated
+`vllm.entrypoints.openai.api_server` module parses `--api-server-count` but
+always runs one process. One process admits a burst of concurrent requests into
+EngineCore serially: on GLM-5.3-Flash TP4, 256 simultaneous requests entered
+EngineCore up to ~240 ms after the client sent them, so EngineCore TTFT started
+its clock late and client TTFT inflated. After readiness the launcher requires
+the log line `Started N API server processes` and fails otherwise; the flag
+belongs in `server.api_server_count`, never `server.extra_args`. `/load` is per
+process, so the idle wait needs 4 consecutive zero reads per process. SGLang
+has no equivalent and rejects the field.
 
 The simulation preset independently uses `io.log_dir`. Paths in `profile.yaml`
 are resolved relative to that file.

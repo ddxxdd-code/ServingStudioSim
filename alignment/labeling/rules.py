@@ -7,10 +7,13 @@ keep. The decisions are the reviewable part — a rule states which evidence it
 rests on (`name`, `after`, `phase`) and which simulated slots it claims — while
 the 40 MB of labeled inventory it produces is derived.
 
-The three evidence keys are exactly the ones `operate-run-alignment` allows a
+The evidence keys are exactly the ones `operate-run-alignment` allows a
 name to be disambiguated by, and no others:
 
-  * `name` — a fragment of the measured kernel name, always required;
+  * `name` — a fragment of the measured kernel name, always required. With
+    `name_exact` it must equal the whole name instead: a kernel literally
+    named `kernel` (an anonymous CuTe/Triton launch) is otherwise unnameable,
+    because every measured name contains that fragment;
   * `after` — the operation of the nearest mapped kernel before it in the same
     segment body. One CUTLASS tile is the router projection in one layer kind
     and the indexer's wk projection in another; the predecessor is what tells
@@ -22,8 +25,22 @@ name to be disambiguated by, and no others:
   * `before_name` — a fragment of the immediately following kernel's name. It
     distinguishes identical kernels at repeated layer and one-off model
     boundaries;
+  * `before` — the immediately following kernel's mapped operation, populated
+    by an earlier fixed-point pass;
   * `phase` — `forward` / `postprocess` / …, which is what separates the
     q_absorb batched GEMM from the lm_head that reuses the same tile.
+  * `stream_role` — `primary` / `concurrent`, for kernels reused on streams with
+    different execution roles.
+
+Any of the four neighbour keys may be the sentinel `"<none>"`, which matches
+only where the slot is **empty** — the position is the first or last kernel of
+its body, so there is no neighbour at all. Without it an absent neighbour is
+unnameable: omitting `after` means "don't care", so a rule meant for a body's
+first kernel also matches every later one, and the only way to keep it off them
+was to let a second rule file overwrite the result. That is how order-dependence
+gets in. The sentinel is deliberately *structural* — it asks whether a
+neighbouring kernel exists, not whether it happens to be labeled yet — so its
+truth does not change as a fixpoint fills the document in.
 
 A rule claims simulated slots by suffix rather than by full name because one
 logical slot exists once per layer variant (dense, initial-shared, cycle-full-
@@ -42,6 +59,13 @@ from pathlib import Path
 from .inventory import load_slots, slots_ending, walk_kernels
 
 CROSS_RANK_VALUES = ("independent", "synchronizing")
+STREAM_ROLE_VALUES = ("primary", "concurrent")
+
+NO_NEIGHBOUR = "<none>"
+"""Sentinel for `after`/`after_name`/`before`/`before_name`: the slot is empty.
+
+Angle brackets appear in no measured kernel name and no operation name, so the
+sentinel cannot collide with a value it is being compared against."""
 
 
 @dataclass(frozen=True)
@@ -55,73 +79,156 @@ class Rule:
     role: str
     slot_suffixes: tuple[str, ...]
     """Suffixes of the simulated slots this operation is compared against."""
+    excluded_slot_prefixes: tuple[str, ...] = ()
+    name_exact: bool = False
+    """Match `name` against the whole kernel name rather than as a fragment."""
     after: str | None = None
     after_name: str | None = None
+    before: str | None = None
     before_name: str | None = None
     phase: str | None = None
+    stream_role: str | None = None
     cross_rank: str = "independent"
+    status: str = "mapped"
     overwrite: bool = False
     """Replace an already-mapped label. Off by default: a pass that silently
     overrode earlier decisions would make the order of the rule file matter."""
     note: str = ""
     """Why this rule is the reading of the evidence. Kept in the file, not in
     the labeled output, because it is for the next reader of the rules."""
+    source_experiment: str = ""
+    """The run whose review produced this rule. A rule set assembled from several
+    alignment experiments used to carry that history in its filenames; keeping it
+    per rule is what lets the files be merged without losing where a decision
+    came from."""
 
     @staticmethod
     def from_mapping(record: dict) -> Rule:
         unknown = set(record) - {
             "name",
+            "name_exact",
             "operation",
             "type",
             "role",
             "slot_suffixes",
+            "excluded_slot_prefixes",
             "after",
             "after_name",
+            "before",
             "before_name",
             "phase",
+            "stream_role",
             "cross_rank",
+            "status",
             "overwrite",
             "note",
+            "source_experiment",
         }
         if unknown:
             raise ValueError(f"rule has unknown keys: {sorted(unknown)}")
-        for required in ("name", "operation", "type", "role", "slot_suffixes"):
+        status = record.get("status", "mapped")
+        if status not in {"mapped", "unmapped"}:
+            raise ValueError("rule status must be mapped or unmapped")
+        required_fields = ("name", "operation") if status == "unmapped" else (
+            "name", "operation", "type", "role", "slot_suffixes"
+        )
+        for required in required_fields:
             if not record.get(required):
                 raise ValueError(f"rule for {record.get('name')!r} has no {required}")
         cross_rank = record.get("cross_rank", "independent")
         if cross_rank not in CROSS_RANK_VALUES:
             raise ValueError(f"cross_rank must be one of {CROSS_RANK_VALUES}, got {cross_rank!r}")
+        if status == "unmapped" and (
+            cross_rank != "synchronizing"
+            or any(
+                key in record
+                for key in ("type", "role", "slot_suffixes", "excluded_slot_prefixes")
+            )
+        ):
+            raise ValueError(
+                "unmapped collective rules require synchronizing and no mapping fields"
+            )
+        stream_role = record.get("stream_role")
+        excluded = record.get("excluded_slot_prefixes", [])
+        if not isinstance(excluded, list) or any(
+            not isinstance(prefix, str) or not prefix for prefix in excluded
+        ):
+            raise ValueError("excluded_slot_prefixes must be a list of non-empty strings")
+        if stream_role is not None and stream_role not in STREAM_ROLE_VALUES:
+            raise ValueError(
+                f"stream_role must be one of {STREAM_ROLE_VALUES}, got {stream_role!r}"
+            )
         return Rule(
             name=record["name"],
             operation=record["operation"],
-            type=record["type"],
-            role=record["role"],
-            slot_suffixes=tuple(record["slot_suffixes"]),
+            type=record.get("type", ""),
+            role=record.get("role", ""),
+            slot_suffixes=tuple(record.get("slot_suffixes", ())),
+            excluded_slot_prefixes=tuple(excluded),
+            name_exact=bool(record.get("name_exact", False)),
             after=record.get("after"),
             after_name=record.get("after_name"),
+            before=record.get("before"),
             before_name=record.get("before_name"),
             phase=record.get("phase"),
+            stream_role=stream_role,
             cross_rank=cross_rank,
+            status=status,
             overwrite=bool(record.get("overwrite", False)),
             note=record.get("note", ""),
+            source_experiment=record.get("source_experiment", ""),
         )
 
     def matches(self, position) -> bool:
-        if self.name not in position.name:
+        if self.name_exact:
+            if self.name != position.name:
+                return False
+        elif self.name not in position.name:
             return False
         if self.phase is not None and position.phase != self.phase:
             return False
-        if self.after is not None and position.previous_operation != self.after:
+        if self.stream_role is not None and position.stream_role != self.stream_role:
             return False
-        if self.after_name is not None and (
-            position.previous_name is None or self.after_name not in position.previous_name
+        # `previous_name` / `next_name` are present for every neighbour that
+        # exists, mapped or not, so they are what the `<none>` sentinel is tested
+        # against — including when it is written on the operation key.
+        if not _neighbour_matches(
+            self.after, position.previous_operation, position.previous_name, exact=True
         ):
             return False
-        if self.before_name is not None and (
-            position.next_name is None or self.before_name not in position.next_name
+        if not _neighbour_matches(
+            self.after_name, position.previous_name, position.previous_name, exact=False
+        ):
+            return False
+        if not _neighbour_matches(
+            self.before, position.next_operation, position.next_name, exact=True
+        ):
+            return False
+        if not _neighbour_matches(
+            self.before_name, position.next_name, position.next_name, exact=False
         ):
             return False
         return True
+
+
+def _neighbour_matches(
+    want: str | None, value: str | None, neighbour_name: str | None, *, exact: bool
+) -> bool:
+    """One neighbour key against one position.
+
+    `want is None` is "don't care"; `NO_NEIGHBOUR` is "the slot is empty", which
+    is decided by whether a neighbouring kernel exists at all rather than by
+    whether it carries an operation — an unlabeled neighbour is still a
+    neighbour, and a test that said otherwise would change its answer as the
+    fixpoint progressed.
+    """
+    if want is None:
+        return True
+    if want == NO_NEIGHBOUR:
+        return neighbour_name is None
+    if value is None:
+        return False
+    return value == want if exact else want in value
 
 
 def load_rules(path: Path) -> list[Rule]:
@@ -175,8 +282,16 @@ def label_body(rule: Rule, slots: list[tuple[str, str]]) -> dict:
     inventory loader rejects an operation whose kernels disagree, and it reports
     only the operation name, never which two labels differed.
     """
+    if rule.status == "unmapped":
+        return {
+            "status": "unmapped",
+            "cross_rank": "synchronizing",
+            "collective": rule.operation,
+        }
     resolved: list[str] = []
     for slot in slots_ending(slots, *rule.slot_suffixes):
+        if slot.startswith(rule.excluded_slot_prefixes):
+            continue
         if slot not in resolved:
             resolved.append(slot)
     return {
@@ -209,6 +324,9 @@ def apply_rules(document: dict, rules: list[Rule], slots: list[tuple[str, str]])
                 else None
             )
             fired.add(index)
+            if position.label == bodies[rule.operation]:
+                report.confirmed[rule.operation] += 1
+                break
             if mapped_operation is not None and not rule.overwrite:
                 if mapped_operation == rule.operation:
                     report.confirmed[rule.operation] += 1
@@ -229,6 +347,126 @@ def apply_rules(document: dict, rules: list[Rule], slots: list[tuple[str, str]])
         if index not in fired
     ]
     return report
+
+
+def evidence_of(position) -> tuple:
+    """Everything `Rule.matches` is allowed to look at, and nothing else.
+
+    Two positions with the same tuple are indistinguishable to every rule, so a
+    rule set can be checked against the distinct tuples of a capture instead of
+    its hundreds of thousands of kernels.
+    """
+    return (
+        position.name,
+        position.phase,
+        position.stream_role,
+        position.previous_operation,
+        position.previous_name,
+        position.next_operation,
+        position.next_name,
+    )
+
+
+def disagreements(document: dict, rules: list[Rule]) -> list[str]:
+    """Positions where two rules match and claim different operations.
+
+    This is the whole of what "first matching rule wins" decides. An empty result
+    means no position has a contested reading, so which rule is tried first
+    cannot change the outcome and the rules are a *set* rather than a sequence —
+    the property that lets them be reordered, regrouped, or split across files
+    without the labels moving.
+
+    Run it against a document at the fixpoint: a rule resting on a neighbour's
+    operation cannot be judged against a document where that neighbour has not
+    been labeled yet.
+    """
+    seen: set[tuple] = set()
+    findings: list[str] = []
+    for position in walk_kernels(document):
+        evidence = evidence_of(position)
+        # `matches` reads nothing but the evidence, so one position per distinct
+        # tuple settles it for every position sharing that tuple.
+        if evidence in seen:
+            continue
+        seen.add(evidence)
+        claims = {rule.operation for rule in rules if rule.matches(position)}
+        if len(claims) > 1:
+            findings.append(f"{position.coordinate}: {position.name} claimed by {sorted(claims)}")
+    return findings
+
+
+#: Evidence keys compared for equality, and keys where the rule's value must be
+#: contained in the position's. `Rule.matches` splits them the same way.
+EXACT_KEYS = ("phase", "stream_role", "after", "before")
+SUBSTRING_KEYS = ("name", "after_name", "before_name")
+
+
+def _subsumes(wide: Rule, narrow: Rule) -> bool:
+    """True when every position `narrow` matches, `wide` matches as well.
+
+    Purely syntactic, and deliberately one-directional: an omitted key is no
+    constraint, an exact key must be the same value, and a substring key must be
+    contained in the narrower rule's fragment — every kernel name containing
+    `nvjet_sm100_tst_64x32_64x16` contains `nvjet_sm100_tst_`. The sentinel is
+    structural, so it subsumes only itself.
+
+    It never reports an overlap that cannot happen; it does miss some that can
+    (two fragments may still co-occur in one name). That asymmetry is the point:
+    a hit here is a proof, not a suspicion.
+    """
+    for key in EXACT_KEYS:
+        want = getattr(wide, key)
+        if want is not None and getattr(narrow, key) != want:
+            return False
+    # An exact name claims one kernel name, so it contains only a narrow rule
+    # that claims that same single name; a fragment contains an exact name
+    # exactly when the fragment occurs in it, which the substring test below
+    # already decides.
+    if wide.name_exact and (not narrow.name_exact or narrow.name != wide.name):
+        return False
+    for key in SUBSTRING_KEYS:
+        want = getattr(wide, key)
+        if want is None:
+            continue
+        have = getattr(narrow, key)
+        if want == NO_NEIGHBOUR or have == NO_NEIGHBOUR:
+            if want != have:
+                return False
+        elif have is None or want not in have:
+            return False
+    return True
+
+
+def subsumptions(rules: list[Rule]) -> list[str]:
+    """Rule pairs whose labels are decided by which one is tried first.
+
+    When a wider rule claims a different operation than a narrower one it fully
+    contains, every position the narrow rule was written for is also claimed by
+    the wide one, so the outcome is whichever the applier reaches first. That is
+    order-dependence provable from the rule file alone — no capture needed, which
+    is what lets it be a pack check rather than something only a labeling run
+    finds.
+
+    `disagreements` is the empirical counterpart: it sees overlaps this cannot
+    prove, but only for the evidence one capture happens to contain.
+    """
+    findings: list[str] = []
+    for i, wide in enumerate(rules):
+        for narrow in rules[i + 1:]:
+            if wide.operation == narrow.operation:
+                continue
+            if _subsumes(wide, narrow):
+                first, second = wide, narrow
+            elif _subsumes(narrow, wide):
+                first, second = narrow, wide
+            else:
+                continue
+            findings.append(
+                f"{first.operation} <- {first.name!r} claims everything "
+                f"{second.operation} <- {second.name!r} does, so the label depends "
+                "on which is tried first"
+            )
+    return findings
 
 
 def apply_rule_file(

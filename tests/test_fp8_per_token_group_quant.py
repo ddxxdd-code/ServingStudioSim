@@ -61,6 +61,7 @@ def test_registry_contract_and_backend_support():
     assert profiler_spec.subprocess_env == "vllm_env"
     assert profiler_spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
     assert profiler_spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
+    assert profiler_spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not profiler_spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
 
 
@@ -85,7 +86,7 @@ def test_import_is_lazy_for_runner_torch_and_vllm():
         ({"num_tokens": 0}, "num_tokens must be > 0"),
         ({"hidden_size": 0}, "hidden_size must be > 0"),
         ({"hidden_size": 4100}, "divide hidden_size"),
-        ({"group_size": 64}, "requires group_size=128"),
+        ({"group_size": 64, "scale_format": "ue8m0_packed_int32"}, "requires group_size=128"),
         ({"input_dtype": DType.FP16}, "requires input_dtype=bf16"),
         ({"scale_format": "fp32_row_major"}, "ue8m0_column_major"),
     ],
@@ -135,7 +136,7 @@ def test_profile_calls_exact_vllm_op_and_reports_logical_bytes(monkeypatch):
     monkeypatch.setattr(
         runner,
         "_load_vllm_quant_op",
-        lambda _torch: lambda *arguments: quant_calls.append(arguments),
+        lambda _torch, _scale_format: lambda *arguments: quant_calls.append(arguments),
     )
     monkeypatch.setattr(runner.Timer, "cupti", lambda function, **kwargs: (function(), 2.0)[1])
     monkeypatch.setattr(
@@ -168,6 +169,46 @@ def test_profile_calls_exact_vllm_op_and_reports_logical_bytes(monkeypatch):
     assert metrics.energy_j == 0.25
 
 
+@pytest.mark.parametrize("scale_format", ["ue8m0_column_major", "ue8m0_row_major"])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+def test_generic_kernel_accepts_any_dividing_group_size(scale_format, group_size):
+    # Only the packed register kernel is compiled for group_size 128.
+    from profiling.runners.elementwise import fp8_per_token_group_quant as runner
+
+    assert runner._validate_args(64, 4096, group_size, DType.BF16, scale_format)[2] == group_size
+
+
+def test_packed_format_uses_deepgemm_tma_layout_on_any_gpu():
+    from profiling.runners.elementwise import fp8_per_token_group_quant as runner
+
+    strided = []
+    fake_torch = SimpleNamespace(
+        bfloat16="bfloat16",
+        float8_e4m3fn="float8_e4m3fn",
+        int32="int32",
+        randn=lambda shape, **kwargs: object(),
+        empty=lambda shape, **kwargs: object(),
+        empty_strided=lambda *arguments, **kwargs: strided.append(arguments) or object(),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_capability=lambda _device: (9, 0),
+            get_device_name=lambda _device: "NVIDIA H200",
+        ),
+    )
+    operands = runner._allocate_operands(
+        fake_torch, num_tokens=33, hidden_size=4096, group_size=128,
+        scale_format="ue8m0_packed_int32",
+    )
+    assert strided == [((33, 8), (1, 36))]
+    calls = []
+    runner._launch_quant(lambda *a: calls.append(a), *operands, 128, "ue8m0_packed_int32")
+    assert len(calls[0]) == 7  # the packed writer takes no layout flags
+    assert runner._logical_bytes(
+        num_tokens=33, hidden_size=4096, group_size=128, scale_format="ue8m0_packed_int32"
+    ) == 33 * 4096 * 3 + 33 * 8 * 4
+
+
 def test_generated_facade_symbols_exist():
     from profiling import perf_api
 
@@ -183,7 +224,6 @@ def test_exact_vllm_op_matches_torch_reference_on_cuda():
 
     from profiling.runners.elementwise import fp8_per_token_group_quant as runner
 
-    runner._validate_cuda_device(torch)
     quant_op = runner._load_vllm_quant_op(torch)
     input_tensor, output_quantized, output_scales = runner._allocate_operands(
         torch,

@@ -1,13 +1,13 @@
 ---
 name: skill-of-skills
 description: >-
-  Add, rename, organize, or select repo-local VibeSim skills. Defines naming
+  Add, rename, organize, or select repo-local ServingStudio Sim skills. Defines naming
   levels, workflow routing, and writing quality.
 ---
 
 # Skill Of Skills
 
-This is the map for repo-local skills. Keep these skills in `main/skills/`; the
+This is the map for repo-local skills. Keep these skills in `ServingStudioSim/skills/`; the
 workspace `.codex/skills` path should point here rather than becoming a separate
 source of truth.
 
@@ -16,10 +16,12 @@ source of truth.
 - `top-*`: top-level entry points for major user requests. A top skill may
   complete the request by sequencing lower-level skills, but should stay concise
   and route work rather than duplicate implementation details.
-- `orchestrator-*`: planning and verification roles. An orchestrator classifies
-  intent, writes implementer briefs, defines completion evidence, and verifies
-  returned work. It should not contain detailed implementation contracts that
-  belong in an implement skill.
+- `orchestrator-*`: planning and verification roles. An orchestrator skill
+  classifies intent, defines the steps and their completion evidence, and
+  verifies the result. Its reader owns that piece of work: a coordinator
+  briefing an implementer, or the agent the whole piece was handed to. It
+  should not contain detailed implementation contracts that belong in an
+  implement skill.
 - `impl-*`: leaf implementation roles. An implement skill owns a concrete write
   scope or investigation scope, states the files/contracts to follow, and lists
   the tests or smoke commands that prove completion.
@@ -56,16 +58,20 @@ completion condition should be obvious.
 ## Current Tree
 
 ```text
-top-add-new-arch - add a whole model architecture end to end (explore → split → build L1–L4)
+top-add-new-arch - add a whole model architecture end to end (capture → split → build L1–L4, largest kernel first)
+├── dev-parallelize-arch-addition - single-agent mode only: run the phases as parallel lanes: capture beside the build, one lane per kernel family and per worklet, one serial arch lane
+├── operate-run-alignment - Phase 0: capture the real vLLM/SGLang kernel sequence that drives the split (profile phase only; needs no arch)
 ├── top-split-model-into-kernels - explore + break the forward into the kernel/op sequence
 ├── top-add-kernel - create each new L1 kernel (L1-Python impl-register-kernel + L1-Rust impl-wire-kernel-to-rust)
 ├── impl-compose-op - compose kernels into L2 ops
 ├── impl-compose-worklet - compose ops into L3 sync-section worklets
 ├── impl-compose-arch - wire worklets into the L4 model_arch cost file
 ├── impl-wire-new-arch - integrate the arch into dispatch/build/timing-predict/deployment (Phase 3)
-└── impl-add-model-work-label - add the independent model.work label and semantic location maps for R6/R7 (Phase 4, before Validate)
+├── impl-add-model-work-label - add the independent model.work label and semantic location maps for R6/R7 (Phase 4, before Validate)
+├── top-align-with-framework - Phase 5: close the loop on the same capture; ranks which placeholder to promote next
+└── dev-finalize-model-addition - after Phase 5: check results, publish presets and captures, merge main, review, open the PR
 
-top-add-kernel - add an L1 kernel end to end
+top-add-kernel - add an L1 kernel end to end; one kernel is one delegated task (several at once: fan out one subagent per kernel, 3 at a time)
 ├── orchestrator-add-kernel-to-python-profile - plan and verify Python profiling
 │   ├── dev-explore-kernel - search vLLM/SGLang/FlashInfer for a source to wrap (shared)
 │   └── impl-register-kernel - register a Python profiler kind or backend
@@ -74,25 +80,28 @@ top-add-kernel - add an L1 kernel end to end
     └── impl-validate-kernel-cache - measure Rust cache fidelity
 
 top-explore-models - understand a new model or checkpoint from HF/public sources
-├── dev-calculate-kv-cache-capacity - calculate KV cache bytes and capacity
+├── dev-calculate-kv-cache-capacity - KV capacity: read it from the sim for an existing arch, derive the layout for a new model
 └── dev-lookup-transformers-model - inspect local Transformers/Torch semantics
 
-top-split-model-into-kernels - break a model forward into the VibeSim kernel sequence
+top-split-model-into-kernels - break a model forward into the ServingStudioSim kernel sequence, ordered by measured share
 ├── top-explore-models - step 1: establish the architecture (entry above)
+├── operate-run-alignment - measured launch granularity, when no capture was supplied (profile phase only)
 ├── dev-lookup-transformers-model - what math each op computes (shared)
-└── dev-explore-kernel - whether a real fused kernel exists in the ecosystem (shared)
+└── dev-explore-kernel - which callable to wrap; and, with no capture, whether a real fused kernel exists (shared)
 
-top-align-with-framework - consume the Align VibeSim to framework side of shared evidence to evaluate simulator fidelity (kernel-only deviation + missing-chunk coverage, GPU duty cycle, TTFT/TPOT)
+top-align-with-framework - consume the Align ServingStudioSim to framework side of shared evidence to evaluate simulator fidelity (kernel-only deviation + missing-chunk coverage, GPU duty cycle, TTFT/TPOT)
 ├── operate-run-alignment - produce the shared labeled evidence (Step 0, below)
+├── operate-align-moe-kernel - diagnose one fused MoE kernel from exact input through full-run popularity
 ├── impl-validate-kernel-cache - fix a wrong-shape kernel cost surfaced by Check 1
-└── top-add-kernel - add/repair a kernel whose backend the sim mismodels
+├── top-add-kernel - add/repair a kernel whose backend the sim mismodels
+└── top-split-model-into-kernels - re-decide the home of an op the split missed or wrongly folded
 
-top-compose-real-framework-from-sim - actively build a real serving framework from VibeSim evidence in a Tick (sim) / Tock (one measured trial) / Probe (attribute and decide) loop; the orchestrator owns the workflow and delegates only actual code writing
+top-compose-real-framework-from-sim - actively build a real serving framework from ServingStudioSim evidence in a Tick (sim) / Tock (one measured trial) / Probe (attribute and decide) loop; the orchestrator owns the workflow and delegates only actual code writing
 ├── top-explore-models - establish exact checkpoint architecture and support requirements
-├── top-add-new-arch - add missing VibeSim L1–L4 support before selecting a real-code trial
+├── top-add-new-arch - add missing ServingStudioSim L1–L4 support before selecting a real-code trial
 ├── top-add-kernel - add missing measured kernel/backend support
 ├── operate-run-simulation - produce the comparable serving-workload target and analyzer artifacts
-├── operate-run-alignment - consume the Align framework to VibeSim side of the same shared labeled evidence
+├── operate-run-alignment - consume the Align framework to ServingStudioSim side of the same shared labeled evidence
 ├── operate-run-timing-predict - compare user-supplied explicit building-block inputs through the existing offline predictor
 ├── operate-profile-serving-run - capture and attribute a real serving profile (the Probe step)
 ├── dev-build-serving-repetitive-unit - investigate kernels with a complete reduced model on the production execution path
@@ -103,19 +112,23 @@ top-compose-real-framework-from-sim - actively build a real serving framework fr
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
 operate-use-analyzer - select, read, interpret, and cite Analyzer-owned simulation, prediction, profile, and measurement results
-operate-run-alignment - produce one shared VibeSim↔framework comparison for vLLM or SGLang; Align VibeSim to framework through top-align-with-framework, or Align framework to VibeSim through top-compose-real-framework-from-sim
+operate-run-alignment - produce one shared ServingStudioSim↔framework comparison for vLLM or SGLang; Align ServingStudioSim to framework through top-align-with-framework, or Align framework to ServingStudioSim through top-compose-real-framework-from-sim
+operate-align-moe-kernel - diagnose one existing fused MoE kernel with exact-input, iteration-popularity, and full-run comparisons
 operate-gpu-spec - query or update the GPU spec catalog
+operate-manage-jit-and-autotune-caches - reuse JIT/autotune work across engine restarts and profiling worker processes instead of rebuilding it every time
 operate-profile-sim-speed - profile simulator wallclock speed
 operate-profile-serving-run - capture a comparable bounded profile of a real serving process and attribute its wall time to named engine phases (NVTX readiness + instrumentation contract, node-level CUDA-graph tracing, nsys SQLite aggregation)
 operate-profile-existing-kernel - query or fill registered profiler rows
 operate-compare-serving-performance - compare two real serving engines under one request/numeric contract, overall metrics first and coarse device-region totals second
 
-dev-create-worktree - create an VibeSim development worktree
+dev-create-worktree - create a ServingStudioSim development worktree
 dev-orchestrate-parallel-subagents - isolate concurrent writing subagents
-dev-run-tests - select and run VibeSim test tiers
+dev-run-tests - select and run ServingStudioSim test tiers
 dev-compose-worker - plan, estimate, implement, compose, and review production L5 workers against the four-axis ownership rules
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
+dev-finalize-model-addition - land an aligned model on main: result checks, public presets, HF captures, profiling, merge, review worktree, PR
+dev-clean-reimplement-for-merge - rebuild accepted but unmergeably iterative branch work cleanly from main, preserving behavior
 dev-build-serving-repetitive-unit - kernel/layer-timing development with reduced depth but production model, loader, engine, API, and profiler paths
 dev-compose-kernel - compose a real serving kernel, fused boundary, or collective change through six practical steps
 dev-llm-serving - implement or review real LLM/multimodal serving framework code using the copied models/algorithms/backends/frameworks/hardware/engines/tooling reference library
@@ -125,13 +138,13 @@ dev-llm-serving - implement or review real LLM/multimodal serving framework code
 
 When adding or renaming a skill:
 
-- put the skill under `main/skills/<skill-name>/SKILL.md`;
+- put the skill under `ServingStudioSim/skills/<skill-name>/SKILL.md`;
 - choose the prefix by role, not by implementation language;
 - update this tree if the skill becomes part of a routed workflow;
 - update parent skill descriptions so agents can discover the relationship from
   metadata alone;
 - run the skill validator for each changed skill;
-- search for stale names with `rg "<old-skill-name>" main/skills`.
+- search for stale names with `rg "<old-skill-name>" ServingStudioSim/skills`.
 
 If a lower-level skill starts duplicating a parent, move the duplicated details
 down to the leaf and let the parent point to it. If a top skill grows into a

@@ -178,7 +178,8 @@ def audit_run(run: Path) -> dict:
             )
     event_file = run / "raw/kv_store_event.parquet"
     capacities = {
-        w["worker_id"]: sum(p["capacity_tokens"] for p in w["kv_pools"])
+        w["worker_id"]: sum(p["capacity_units"] if "capacity_units" in p else p["capacity_tokens"]
+                            for p in w["kv_pools"])
         for w in meta["workers"]
         if w["pool_tag"] == "kv_store"
     }

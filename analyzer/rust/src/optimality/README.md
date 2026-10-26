@@ -10,10 +10,12 @@ each successive gap is an attributable source of sub-optimality:
 |---|---|---|
 | R0 Real            | `span × G`            | — (GPU·s actually held) |
 | R1 Busy            | `Σ total_time × G`   | **idle** (scheduler gaps) |
-| R2 Balanced        | real times, `Max`→mean | **imbalance** (DP/EP straggler) |
+| R2 Balanced        | real times, rank `Max`→mean, stream `Parallel` kept | **imbalance** (DP/EP straggler) |
 | R3 per-config best | unlocked: selected grid-peak throughput; locked: R2 unchanged | **batching** |
 | R4 ignore network  | R3, comm leaves → 0  | **communication** |
-| R5 hardware limit  | active regime's work unit / matching GPU-spec peak | **profiled↔hardware** |
+| R4a sustained limit | active regime's work unit / back-to-back GEMM (same dtype class) or large-copy rate from `gpu/spec.json` `sustained` | **kernel gap** |
+| R4b achievable peak | active regime's work unit / best measured `single_gemm` (same dtype class) or ≥1 GiB copy | **power gap** (power-capped clocks) |
+| R5 hardware limit  | active regime's work unit / matching GPU-spec peak | **hardware gap** (best measured ↔ spec) |
 | R6 segmented necessary | sum of per-location semantic rooflines | **redundant work** |
 | R7 scope-fused necessary | fused semantic roofline within the allowed batch boundary | **fusion** |
 
@@ -26,10 +28,20 @@ exactly R5. Unlocked mode may compose work into a saturated batch. Locked mode
 preserves every observed iteration boundary: equal shapes are deduplicated only as
 an evaluation optimization, then restored by occurrence weighting before rollup.
 
+Speculative GLM-5.2 uses the executed draft/verify trajectory as its workload:
+rejected candidates remain necessary work. Raw request geometry in `groups`
+preserves query width, per-request sparse saturation and the MTP stages before
+Python derives work from the model config. Speculative shapes bypass the ordinary
+scalar affine approximation. Location maps cover index-share/full-index recurrent
+passes and the single-draft layout, for TP4 and TP8. FP4 target experts, BF16 MTP
+experts and FP8 index logits retain distinct hardware peaks through attribution.
+Historical logs without the required geometry remain unavailable rather than
+being interpreted as single-token decode workloads.
+
 The payload also carries per-worker kernel rung ladders. Its R0/R1 bars reuse
 the additive R2 kernel baseline and append two explicit aggregate chunks
 (`imbalance = R1-R2`, `idle = R0-R1`); R2..R5 carry each location's attributable
-value. The renderer keeps a kernel's color across all six bars and connects it
+value. The renderer keeps a kernel's color across all seven bars and connects it
 with a ribbon, without pretending the two aggregate gaps have a per-kernel
 critical-path attribution. In unlocked mode each worker workload is saturated by
 scaling its compressed additive totals 10,000× and normalizing the label back. This
@@ -83,16 +95,16 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   `run_meta` GPU counts and `gpu/spec.json`, wires the stages below, and assembles
   the report/payload JSON (+ the `unavailable` degrade paths, `definitions`).
 - `prepare.rs` — preparation. Interns every manifest leaf into a global location
-  and precomputes each `(pool, worker, section)`'s fold weights `α` + rate ceilings
+  and precomputes each `(pool, worker, section)`'s tree + rate ceilings
   (`build_section_fold_plans`); no folding here.
 - `fold.rs` — the algorithm. Exact R0/R1 SQL sums (`read_exact_worker_totals`) + the
-  stride-sampled R2..R5 mean-fold hot loop (`accumulate_fold`,
+  stride-sampled R2..R5 balanced-fold hot loop (`accumulate_fold`,
   `leaf_selected_throughput_ms`).
 - `levels.rs` — the worker / pool / cluster tiers. `assemble_tiers` turns the fold's
   per-worker accumulators into named R0..R5 values and rolls them up; `levels_json`
   + `level_entry_json` + `rung_report_json` emit the level/report JSON.
 - `kernel.rs` — the kernel tier. Per-location bars (`kernel_levels_json`, single-leaf so
-  only batching/communication/hw), the report's `worst_batching`, and the
+  only batching/communication/kernel gap/power gap/hw), the report's `worst_batching`, and the
   per-worker kernel rung ladders.
 - `ladder.rs` — typed kernel-ladder/work domain and the sole worker → pool →
   cluster reducer. It serializes at the publication boundary only. Unlocked parents
@@ -103,17 +115,62 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   batched `kernel-query peak` call (including maximum grid arithmetic intensity,
   used with the GPU ridge point to select one throughput basis), caches it as
   `raw/kernel_grid_peaks.json`. Absent + un-generatable → R3 = R2 with a caveat.
-- `spec.rs` — the R5 hardware ceilings. Resolves the run's `gpu_name` to a `gpu/spec.json`
+- `achievable.rs` — the R4b ceiling. Runs `python -m profiling.db.achievable` once
+  in the owning checkout for the run's GPU (best `single_gemm` TFLOP/s per dtype,
+  best elementwise copy GB/s at ≥1 GiB, outliers excluded) and caches it as
+  `raw/achievable_peaks.json`, keyed by GPU name. `prepare.rs` caps each rate at
+  the spec peak, so R5 is unchanged. Absent → R4b = R4a with a caveat; the exact-
+  iteration service path reads the cached sidecar only.
+- `spec.rs` — the R5 hardware ceilings and the entry's `sustained` rates for R4a
+  (measured by `gpu/measure_sustained.py`; absent → R4a = R4b with a caveat).
+  `DtypeClass` also keys R4a's and R4b's GEMM rates. Resolves the run's `gpu_name` to a `gpu/spec.json`
   entry by its explicit `aliases`, then dense peak TFLOP/s by dtype + HBM GB/s.
 - `floors.rs` — bridge to the independent `model.work` labeler. One batched call computes
   unlocked per-level/saturated-worker labels or deduplicated fixed-iteration labels;
   exact-iteration detail uses the same contract. Transport failure degrades the
   request, while one unsupported/heterogeneous scope degrades only that scope to the
   plain R5 ladder. Locked responses expose shape, iteration, affine-basis, and direct
-  fallback counters in payload meta.
+  fallback counters in payload meta. A PP stage gets its share of the whole model's
+  label (see `pipeline.rs`); a pipelined pool's floor, and the cluster over it, are the
+  sum of its stages' floors and are never labelled as one pooled workload. Equal
+  locked compositions within a pool (every stage of one pipeline) are sent once.
+- `pipeline.rs` — PP stage identity. Reads each stage worker's index and `[start,
+  end)` decoder layers from its manifest root label (`"... pipeline stage <i> of <N>
+  ... [layers <start>..<end>..."`, the label `tools/pp-layer-balance` also reads) and
+  checks that each pipelined pool's stages are exactly `0..N` and tile from layer 0.
 - `location.rs` — strict exact-iteration semantic-location mapping. It validates
   complete coverage, computes per-location `max(FLOPs/TFLOPS, bytes/BW)`, and
-  attaches R6 plus redundant/under-accounted diagnostics atomically.
+  attaches R6 plus redundant/under-accounted diagnostics atomically. A PP stage uses
+  its arch's whole-pipeline map restricted to the locations the stage ran; the
+  coverage check is unchanged.
+
+## Offline scoped analysis
+
+`analyze optimality-scoped <run_dir> --path <path>` (or `--label <label>`) is a
+separate, CPU-only report path for one CostTree subtree. The path grammar is
+`[section/]child/child/...`, where `section` is the manifest section name and
+each child is a zero-based ordinal among that node's children. `root` may be
+used after the section name, so `iter`, `iter/root`, and `iter/1` select the
+`iter` root, the same root explicitly, and its second root child respectively.
+When the section is omitted it must resolve unambiguously. `--label` matches
+the node label exactly; `section::label` qualifies a label whose text occurs in
+more than one section. Supplying both flags is allowed only when they resolve
+to the same node. No-match and ambiguous selectors are errors.
+
+The command recursively includes every descendant leaf, including leaves below
+`Scale` nodes, and writes only
+`reports/optimality_scoped_<slug>.json`. The report contains `selection`,
+`rungs`, `omitted_rungs`, and `provenance`. `rungs` can contain only the
+subtree-defined values `r0_measured`, `r5_hardware_limit`,
+`r6_segmented_necessary`, and `r7_scope_fused_necessary`, all in GPU·seconds.
+`r0_measured` is the CostTree wall fold of the selected node times its
+physical-GPU count. R5 is the balanced leaf fold of
+`max(FLOPs / hardware TFLOP/s, bytes / HBM GB/s)`; communication leaves make
+R5 undefined. R6 and R7 require an exact semantic location map plus a
+reconciling `model.work` label for every selected worker. Cluster-level values
+such as idle, imbalance, communication, balanced, busy, and ignore-network are
+omitted with machine-readable `{rung, reason}` entries rather than being
+reported under a subtree label.
 
 ## Cost model notes
 
@@ -122,9 +179,12 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
 - R0/R1 are exact SQL sums over every row; R2..R5 fold a 1-in-`stride`-iteration
   sample (rates are near-constant across iterations) **anchored to the exact R1**
   by the sampled ratio, so the ladder stays monotone and the buckets stay exact.
-- The mean-mode fold (`trace::manifest::fold_mean`) is linear ⇒ a precomputed
-  per-leaf weight `α` (`∏ 1/(child·overlap)` over `Max` × `∏ n` over `Scale`) gives
-  both the per-worker totals and the additive per-kernel attribution in one walk.
+- The balanced fold (`trace::manifest::BalancedFold`) re-evaluates each sampled
+  row's tree once for R2..R5: rank `Max` → mean/overlap, stream `Parallel` →
+  max/overlap (its slowest child for that rung). The same walk attributes each
+  rung to the leaves, so per-worker totals and the per-kernel attribution add up.
+  On the 555,785-row GLM-5.2 run (834 slots, 1,035 nodes, 11,115 sampled rows) the
+  walk takes ~0.3 s of the fold's ~12 s, which is reading the sampled slot lists.
 - R3 is not a roofline of the current point. It approximates large-batch
   operation: if any fitted point's algorithmic intensity reaches the GPU-spec
   ridge, the config uses only its peak TFLOP/s; otherwise it uses only peak GB/s.
@@ -138,5 +198,7 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   `optimality_batch_locked_waterfall.json`. A normal analyzer invocation generates
   both whenever optimality is selected; `--lock-batch-size` recomputes only the
   locked variant. Exact iteration requests carry the mode explicitly.
-- R5 uses the active regime: unlocked analysis reuses the R3 grid classification;
-  locked analysis uses the current-point classification.
+- R4a, R4b and R5 use the active regime: unlocked analysis reuses the R3 grid
+  classification; locked analysis uses the current-point classification. R4a is
+  `min(R4 leaf, work / sustained rate)`, R4b `min(R4a leaf, work / achievable rate)`
+  and R5 `min(R4b leaf, work / spec peak)`.

@@ -1,11 +1,24 @@
-"""Profilers for GLM-5.2 persistent decode DSA top-k.
+"""Profilers for persistent decode top-k: the DSA indexer (GLM-5.x) and the QSA
+indexer (Qwen4Exp) alike.
+
+Logits come in two context modes: ``uniform`` (every row holds the same
+increasing sequence) and ``uniform_random`` (same lengths, seeded random
+scores); the fork backend's ``max_ragged`` lives in
+``dsa_persistent_topk_decode_fork``. The helpers here (operands, reference check, logical bytes,
+the call) are shared with ``dsa_persistent_topk_decode_cooperative``, which
+times vLLM's ``cooperative_topk`` on the same operands.
 
 The Torch backend times the complete vectorized semantic composite. The
 production backend packages a corrected vLLM v0.23-derived
 ``persistent_topk``: lengths through ``top_k`` retain the pinned natural-index
 writer, while every longer row uses the bundled cooperative radix path. Its
 workspace memset and one persistent kernel write all ``top_k`` slots. The
-indexer's separate outer global index-buffer fill remains excluded.
+indexer's separate outer global index-buffer fill remains excluded. The
+corrected extension is compiled for ``sm_90`` only, so every other device calls
+the image vLLM's own ``persistent_topk`` (the alignment fork, upstream base
+04730e8). The previous image's build (3f667d7eb) had a tie-overflow bug in its
+buffered selection paths (``_overflow_buffer``), which the correctness check
+still allows for.
 """
 
 from __future__ import annotations
@@ -20,14 +33,35 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import ComputeMetrics
 
 _MIN_BATCH_SIZE = 1
-_MAX_BATCH_SIZE = 256
-_SUPPORTED_NEXT_N = frozenset({1, 2})
-_TOP_K = 2048
 _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
-_REQUIRED_GPU = "NVIDIA H200"
-_WORKSPACE_BYTES = 1024 * 1024
+# Uniform lengths over seeded normal logits. The radix select's work follows
+# the score distribution: on B200, 1024 rows of 8192 cost 42.2 µs on the
+# increasing template padded to 65536 columns, 30.6 µs on the same template
+# spanning only the valid columns, and 35.1 µs on normal scores, which is what
+# a live indexer's continuous scores look like.
+_RANDOM_CONTEXT_MODE = "uniform_random"
+_CONTEXT_MODES = (_CONTEXT_MODE, _RANDOM_CONTEXT_MODE)
+# The callable's K instantiations (vLLM csrc/libtorch_stable/topk.cu dispatch);
+# an indexer over 4-token key pools selects 2048 / 4. Every backend, the fork's and
+# the Torch reference's included, shares this bound and the workspace below.
+VLLM_TOP_K = frozenset({512, 1024, 2048})
+# The corrected extension builds SASS for sm_90 only
+# (dsa_persistent_topk_native/loader.py `_CUDA_CFLAGS`).
+_NATIVE_EXTENSION_CAPABILITY = (9, 0)
+# vLLM's RADIX_TOPK_WORKSPACE_SIZE (model_executor/layers/sparse_attn_indexer.py).
+WORKSPACE_BYTES = 1024 * 1024
+
+
+def require_vllm_top_k(label: str, top_k: int) -> None:
+    """Refuse a top_k the persistent_topk callable has no instantiation for.
+
+    The spec is valid; the backend has no kernel for it, so this is
+    ProfilerNotImplemented, not ValueError.
+    """
+    if top_k not in VLLM_TOP_K:
+        raise ProfilerNotImplemented(f"{label} requires top_k in {sorted(VLLM_TOP_K)}, got {top_k}")
 
 
 @dataclass(frozen=True)
@@ -52,7 +86,7 @@ class _DsaPersistentTopkDecodeNativeOperands:
     workspace: Any
 
 
-def _validate_args(
+def validate_args(
     batch_size: int,
     context_len: int,
     next_n: int,
@@ -73,12 +107,12 @@ def _validate_args(
     index_dtype = str(index_dtype)
     context_mode = str(context_mode)
 
-    if not _MIN_BATCH_SIZE <= batch_size <= _MAX_BATCH_SIZE:
-        raise ValueError(
-            f"dsa_persistent_topk_decode requires 1 <= batch_size <= 256, got {batch_size}"
-        )
-    if next_n not in _SUPPORTED_NEXT_N:
-        raise ValueError(f"dsa_persistent_topk_decode requires next_n in [1, 2], got {next_n}")
+    # No row cap: topk.cu dispatches any row count (<=4, <=8, >32 filtered, else
+    # persistent) and sizes its grid from the device SM count.
+    if batch_size < _MIN_BATCH_SIZE:
+        raise ValueError(f"dsa_persistent_topk_decode requires batch_size >= 1, got {batch_size}")
+    if next_n <= 0:
+        raise ValueError(f"dsa_persistent_topk_decode requires next_n > 0, got {next_n}")
     if context_len < 0:
         raise ValueError(f"context_len must be >= 0, got {context_len}")
     if context_len < next_n - 1:
@@ -97,8 +131,7 @@ def _validate_args(
         raise ValueError(
             f"context_len must be <= max_model_len, got {context_len} and {max_model_len}"
         )
-    if top_k != _TOP_K:
-        raise ValueError(f"dsa_persistent_topk_decode requires top_k=2048, got {top_k}")
+    require_vllm_top_k("dsa_persistent_topk_decode", top_k)
     if logits_row_stride <= 0 or logits_row_stride < max_model_len:
         raise ValueError(
             "logits_row_stride must be positive and >= max_model_len, "
@@ -112,9 +145,10 @@ def _validate_args(
         raise ValueError(
             f"dsa_persistent_topk_decode requires index_dtype='int32', got {index_dtype!r}"
         )
-    if context_mode != _CONTEXT_MODE:
+    if context_mode not in _CONTEXT_MODES:
         raise ValueError(
-            f"dsa_persistent_topk_decode requires context_mode='uniform', got {context_mode!r}"
+            "dsa_persistent_topk_decode requires context_mode='uniform' or "
+            f"'uniform_random', got {context_mode!r}"
         )
     return (
         batch_size,
@@ -129,17 +163,10 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any, *, backend: str = "torch") -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            f"CUDA is required for the {backend} dsa_persistent_topk_decode backend"
-        )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            f"{backend} dsa_persistent_topk_decode is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
-        )
+def _uses_native_extension(torch: Any) -> bool:
+    """True when the device can run the corrected sm_90 extension."""
+    capability = tuple(torch.cuda.get_device_capability(torch.cuda.current_device()))
+    return capability == _NATIVE_EXTENSION_CAPABILITY
 
 
 def _build_common_operands(
@@ -152,6 +179,7 @@ def _build_common_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Build exact logits/length/output storage without row-scaled sources."""
     num_rows = batch_size * next_n
@@ -160,16 +188,21 @@ def _build_common_operands(
         dtype=torch.float32,
         device=device,
     )
-    # One row-sized template broadcasts into the exact padded production
-    # allocation. Never materialize a second [B*next_n, row_stride] source.
-    column_template = torch.linspace(
-        -1.0,
-        1.0,
-        logits_row_stride,
-        dtype=torch.float32,
-        device=device,
-    )
-    logits_backing.copy_(column_template)
+    if context_mode == _RANDOM_CONTEXT_MODE:
+        # Filled in place: no second [B*next_n, row_stride] source.
+        generator = torch.Generator(device=device).manual_seed(0)
+        logits_backing.normal_(generator=generator)
+    else:
+        # One row-sized template broadcasts into the exact padded production
+        # allocation. Never materialize a second [B*next_n, row_stride] source.
+        column_template = torch.linspace(
+            -1.0,
+            1.0,
+            logits_row_stride,
+            dtype=torch.float32,
+            device=device,
+        )
+        logits_backing.copy_(column_template)
     logits = logits_backing[:, :max_model_len]
 
     per_request_lengths = torch.arange(
@@ -194,6 +227,7 @@ def _build_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> _DsaPersistentTopkDecodeOperands:
     """Build exact padded logits and pinned row-major decode lengths."""
     logits_backing, logits, lengths, flat_lengths, out = _build_common_operands(
@@ -205,6 +239,7 @@ def _build_operands(
         top_k=top_k,
         logits_row_stride=logits_row_stride,
         device=device,
+        context_mode=context_mode,
     )
 
     key_positions = torch.arange(max_model_len, dtype=torch.int32, device=device)
@@ -228,7 +263,7 @@ def _build_operands(
     )
 
 
-def _build_native_operands(
+def build_native_operands(
     torch: Any,
     *,
     batch_size: int,
@@ -238,6 +273,7 @@ def _build_native_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> _DsaPersistentTopkDecodeNativeOperands:
     """Build production operands without Torch-composite mask/top-k tensors."""
     logits_backing, logits, lengths, flat_lengths, out = _build_common_operands(
@@ -249,8 +285,9 @@ def _build_native_operands(
         top_k=top_k,
         logits_row_stride=logits_row_stride,
         device=device,
+        context_mode=context_mode,
     )
-    workspace = torch.empty((_WORKSPACE_BYTES,), dtype=torch.uint8, device=device)
+    workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=device)
     return _DsaPersistentTopkDecodeNativeOperands(
         logits_backing=logits_backing,
         logits=logits,
@@ -345,14 +382,16 @@ def _validate_semantics(
             raise RuntimeError("Torch composite output aliases an input")
 
 
-def _native_call(
+def native_call(
     op: Any,
     operands: _DsaPersistentTopkDecodeNativeOperands,
     *,
     top_k: int,
     max_seq_len: int,
 ) -> None:
-    """Invoke only the private corrected v0.23-derived callable."""
+    """Call a persistent or cooperative top-k op on the shared operands: the
+    corrected extension, the image vLLM's ``persistent_topk`` or its
+    ``cooperative_topk`` (same signature)."""
     return op(
         operands.logits,
         operands.lengths,
@@ -363,15 +402,73 @@ def _native_call(
     )
 
 
-def _validate_native_semantics(
+def _fp16_key_bin(torch: Any, values: Any, shift: int) -> Any:
+    """The kernel's fp16 sign-magnitude key, keeping its top ``16 - shift`` bits."""
+    bits = values.to(torch.float16).view(torch.int16).to(torch.int32) & 0xFFFF
+    key = torch.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits | 0x8000)
+    return key >> shift
+
+
+def _overflow_buffer(num_rows: int, length: int, top_k: int) -> tuple[int, int] | None:
+    """``(bin shift, buffered items)`` of the image vLLM kernel path a row takes, if it buffers.
+
+    Each buffered path keeps at most that many threshold-bin candidates and
+    silently drops the rest, so its top-k is wrong when the bin overflows
+    (captures 20260925_0 and _4). The timing is still the production kernel's.
+    """
+    if num_rows > 32:
+        # FilteredTopK: >32K rows bin by 8 bits into FILTERED_TOPK_SMEM_INPUT_SIZE;
+        # the <=32K short path bins by 12 bits and keeps top_k ties.
+        return (8, 16384) if length > 32768 else (4, top_k)
+    if length <= 8192:
+        return 5, 3708  # decode path: 11-bit bins, DBUF items
+    if length <= 32768:
+        return 8, 4096  # medium histogram_256_topk: MAX_BUFFERED_ITEMS
+    return None  # cooperative radix path buffers nothing
+
+
+def _medium_overflow_explains(
+    torch: Any,
+    row_logits: Any,
+    actual_indices: Any,
+    expected_values: Any,
+    num_rows: int = 1,
+) -> bool:
+    """Return whether a threshold-bin buffer overflow accounts for one bad row.
+
+    The row must take a buffering path, its threshold bin (the bin of the
+    reference k-th value) must hold more candidates than that path buffers, and
+    the kernel must still have selected every element strictly above that bin
+    and nothing below it -- only the threshold-bin tie-break may differ.
+    """
+    path = _overflow_buffer(num_rows, int(row_logits.numel()), int(actual_indices.numel()))
+    if path is None:
+        return False
+    shift, buffered_items = path
+    bins = _fp16_key_bin(torch, row_logits, shift)
+    threshold = int(_fp16_key_bin(torch, expected_values.min().reshape(1), shift)[0])
+    if int((bins == threshold).sum()) <= buffered_items:
+        return False
+    selected_bins = bins.index_select(0, actual_indices)
+    if bool((selected_bins < threshold).any()):
+        return False
+    return int((selected_bins > threshold).sum()) == int((bins > threshold).sum())
+
+
+def validate_native_semantics(
     torch: Any,
     op: Any,
     operands: _DsaPersistentTopkDecodeNativeOperands,
     *,
     top_k: int,
     max_seq_len: int,
+    overflow_allowed: bool = False,
 ) -> None:
-    """Compare corrected native output with the committed semantic reference."""
+    """Compare native output with the committed semantic reference.
+
+    ``overflow_allowed`` accepts a mismatching long row only when a buffer
+    overflow fully explains it (``_medium_overflow_explains``).
+    """
     from profiling.runners.attention.dsa_persistent_topk_decode_reference import (
         dsa_persistent_topk_decode_reference,
     )
@@ -381,7 +478,7 @@ def _validate_native_semantics(
     expected = torch.empty_like(operands.out)
     out_storage = operands.out.untyped_storage().data_ptr()
     workspace_storage = operands.workspace.untyped_storage().data_ptr()
-    returned = _native_call(
+    returned = native_call(
         op,
         operands,
         top_k=top_k,
@@ -409,19 +506,31 @@ def _validate_native_semantics(
     if long_rows.numel():
         actual_long = operands.out.index_select(0, long_rows).to(torch.int64)
         expected_long = expected.index_select(0, long_rows).to(torch.int64)
-        if not torch.equal(
-            actual_long.sort(dim=1).values,
-            expected_long.sort(dim=1).values,
+        if bool((actual_long < 0).any()) or bool(
+            (actual_long >= operands.flat_lengths.index_select(0, long_rows).unsqueeze(1)).any()
         ):
-            raise RuntimeError("pinned CUDA disagrees with long-row reference selections")
+            raise RuntimeError("persistent CUDA returned an out-of-range long-row index")
+        if bool((actual_long.sort(dim=1).values.diff(dim=1) == 0).any()):
+            raise RuntimeError("persistent CUDA returned duplicate long-row indices")
         long_logits = operands.logits.index_select(0, long_rows)
         actual_values = long_logits.gather(1, actual_long)
         expected_values = long_logits.gather(1, expected_long)
-        if not torch.equal(
-            actual_values.sort(dim=1).values,
-            expected_values.sort(dim=1).values,
-        ):
-            raise RuntimeError("pinned CUDA disagrees with long-row reference values")
+        selection_rows = (actual_long.sort(1).values != expected_long.sort(1).values).any(1)
+        value_rows = (actual_values.sort(1).values != expected_values.sort(1).values).any(1)
+        for position in torch.nonzero(selection_rows | value_rows).flatten().tolist():
+            length = int(operands.flat_lengths[long_rows[position]])
+            if not (
+                overflow_allowed
+                and _medium_overflow_explains(
+                    torch,
+                    long_logits[position, :length],
+                    actual_long[position],
+                    expected_values[position],
+                    num_rows=int(operands.flat_lengths.numel()),
+                )
+            ):
+                kind = "values" if bool(value_rows[position]) else "selections"
+                raise RuntimeError(f"pinned CUDA disagrees with long-row reference {kind}")
 
     if returned is not None:
         raise RuntimeError("pinned persistent_topk must return None")
@@ -438,7 +547,7 @@ def _validate_native_semantics(
             raise RuntimeError("pinned CUDA output aliases another operand")
 
 
-def _logical_bytes(
+def logical_bytes(
     *,
     batch_size: int,
     context_len: int,
@@ -480,8 +589,8 @@ def profile_dsa_persistent_topk_decode_torch(
         logits_row_stride,
         _logits_dtype,
         _index_dtype,
-        _context_mode,
-    ) = _validate_args(
+        context_mode,
+    ) = validate_args(
         batch_size,
         context_len,
         next_n,
@@ -499,8 +608,6 @@ def profile_dsa_persistent_topk_decode_torch(
             "torch is required for the torch dsa_persistent_topk_decode backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -511,6 +618,7 @@ def profile_dsa_persistent_topk_decode_torch(
             top_k=top_k,
             logits_row_stride=logits_row_stride,
             device="cuda",
+            context_mode=context_mode,
         )
         _validate_semantics(
             torch,
@@ -527,13 +635,13 @@ def profile_dsa_persistent_topk_decode_torch(
         # Logical traffic counts valid FP32 logits, one int32 length per row,
         # and all int32 output slots. It excludes padded columns, persistent
         # scratch workspace, Torch intermediates, and physical transactions.
-        logical_bytes = _logical_bytes(
+        num_bytes = logical_bytes(
             batch_size=batch_size,
             context_len=context_len,
             next_n=next_n,
             top_k=top_k,
         )
-        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        bandwidth_gbps = num_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,
@@ -545,6 +653,16 @@ def profile_dsa_persistent_topk_decode_torch(
 
 
 def _load_native_op(torch: Any) -> Any:
+    if not _uses_native_extension(torch):
+        try:
+            from vllm import _custom_ops  # noqa: F401
+        except ImportError as exc:
+            raise ProfilerNotImplemented(
+                "the image vLLM extension is required for persistent top-k on devices "
+                "other than sm_90, where the corrected extension is not built"
+            ) from exc
+        return torch.ops._C.persistent_topk
+
     from profiling.runners.attention.dsa_persistent_topk_native import (
         NativeExtensionBuildError,
         NativeExtensionLoadError,
@@ -571,7 +689,13 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
     index_dtype: str,
     context_mode: str,
 ) -> ComputeMetrics:
-    """Profile the complete corrected v0.23-derived persistent callable."""
+    """Profile the persistent callable (corrected v0.23 on sm_90, image vLLM elsewhere).
+
+    For an indexer over key pools (``top_k`` 512), ``context_len`` is the row's pool
+    count and ``max_model_len`` the token-wide logits width. The call passes
+    ``max_seq_len = context_len``; production passes the batch's token maximum,
+    which only gates the <=32-row cooperative radix setup (``> 32768``).
+    """
     (
         batch_size,
         context_len,
@@ -581,8 +705,8 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         logits_row_stride,
         _logits_dtype,
         _index_dtype,
-        _context_mode,
-    ) = _validate_args(
+        context_mode,
+    ) = validate_args(
         batch_size,
         context_len,
         next_n,
@@ -600,11 +724,13 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             "torch is required for the vllm_cuda dsa_persistent_topk_decode backend"
         ) from exc
 
-    _validate_cuda_device(torch, backend="vllm_cuda")
+    # The image vLLM op carries the known buffered-path overflow bug; the
+    # corrected sm_90 extension does not, so only the former is tolerated.
+    overflow_allowed = not _uses_native_extension(torch)
     op = _load_native_op(torch)
 
     try:
-        operands = _build_native_operands(
+        operands = build_native_operands(
             torch,
             batch_size=batch_size,
             context_len=context_len,
@@ -613,17 +739,19 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             top_k=top_k,
             logits_row_stride=logits_row_stride,
             device="cuda",
+            context_mode=context_mode,
         )
-        _validate_native_semantics(
+        validate_native_semantics(
             torch,
             op,
             operands,
             top_k=top_k,
             max_seq_len=context_len,
+            overflow_allowed=overflow_allowed,
         )
 
         def kernel() -> None:
-            return _native_call(
+            return native_call(
                 op,
                 operands,
                 top_k=top_k,
@@ -633,18 +761,30 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         # Correctness above is the exact-shape first launch. Synchronize before
         # formal timing so source verification, build/load, and setup are absent.
         torch.cuda.synchronize()
-        time_ms = Timer.cuda_event(kernel, warmup=5)
+        # CUPTI, not CUDA events. This was the only production backend in the
+        # table still on `Timer.cuda_event`; the other 97 runner call sites all
+        # price kernel-only time, and summing a launch-inclusive row into a cost
+        # tree with kernel-only rows charges this kernel's dispatch twice.
+        #
+        # Measured over 80 stride-sampled specs (job 613): the event timer reads
+        # 1.03x to 3.80x the CUPTI time, median 1.24x, and never less. These
+        # kernels are 2-22 us, so a ~5 us launch gap is most of the difference,
+        # and the ratio is largest on the smallest shapes. Taking the
+        # measurement also cost 1.5 s/spec under events (a flat
+        # 3 x DEFAULT_MIN_DURATION_MS, no drift probe) against 0.120 s/spec
+        # under CUPTI's adaptive budget -- 670 s of a full fill's 3151 GPU-s.
+        time_ms = Timer.cupti(kernel, warmup=5)
         energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
         # Logical traffic counts valid FP32 logits, one int32 length per row,
         # and all int32 output slots. It excludes the 1 MiB scratch workspace,
         # padded logits, intermediates, and physical memory transactions.
-        logical_bytes = _logical_bytes(
+        num_bytes = logical_bytes(
             batch_size=batch_size,
             context_len=context_len,
             next_n=next_n,
             top_k=top_k,
         )
-        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        bandwidth_gbps = num_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,

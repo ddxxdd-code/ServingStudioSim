@@ -11,19 +11,19 @@ from alignment.nsys.parse import (
     RangeStats,
     Worker,
     _parse_label,
+    aggregate_metrics_by_iteration,
     attribute_jit_stalls,
     build_host_timeline,
-    aggregate_metrics_by_iteration,
     build_iteration_details,
     build_kernel_name_index,
     build_parser,
     ensure_query_indexes,
     iteration_kind,
     load_host_threads,
+    load_metrics,
     load_ranges,
     owning_global_pid,
     parsed_window_ns,
-    load_metrics,
     resolve_dp_rank_by_device,
 )
 from alignment.nsys.sequence import build_kernel_sequences, expand_sequence
@@ -50,6 +50,20 @@ def test_parse_defaults_to_all_indexed_phases():
     assert args.range_mode == "phases"
 
 
+def test_parse_iteration_window_defaults_to_the_whole_capture():
+    args = build_parser().parse_args(["--sqlite", "trace.sqlite"])
+
+    assert args.iteration_start is None
+    assert args.iteration_end is None
+
+
+def test_parse_trace_rejects_a_reversed_iteration_window_before_opening_sqlite(tmp_path):
+    from alignment.nsys.parse import parse_trace
+
+    with pytest.raises(ValueError, match="iteration_start must not exceed iteration_end"):
+        parse_trace(tmp_path / "does-not-exist.sqlite", None, 49, 48)
+
+
 def test_parse_persists_correlation_lookup_indexes_idempotently():
     con = sqlite3.connect(":memory:")
     con.executescript(
@@ -70,12 +84,8 @@ def test_parse_persists_correlation_lookup_indexes_idempotently():
     ensure_query_indexes(con)
     ensure_query_indexes(con)
 
-    runtime_indexes = con.execute(
-        "PRAGMA index_list('CUPTI_ACTIVITY_KIND_RUNTIME')"
-    ).fetchall()
-    kernel_indexes = con.execute(
-        "PRAGMA index_list('CUPTI_ACTIVITY_KIND_KERNEL')"
-    ).fetchall()
+    runtime_indexes = con.execute("PRAGMA index_list('CUPTI_ACTIVITY_KIND_RUNTIME')").fetchall()
+    kernel_indexes = con.execute("PRAGMA index_list('CUPTI_ACTIVITY_KIND_KERNEL')").fetchall()
     assert [row[1] for row in runtime_indexes] == ["vibesim_runtime_gtid_start_idx"]
     assert [row[1] for row in kernel_indexes] == ["vibesim_kernel_gpid_corr_start_idx"]
     assert not con.in_transaction
@@ -125,6 +135,71 @@ def test_load_ranges_resolves_indexed_marker_from_string_ids():
     assert [(item.iteration, item.phase, item.stage) for item in ranges] == [
         (34, "forward", "decode")
     ]
+
+
+def _indexed_phase_capture():
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        """
+        CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE NVTX_EVENTS (
+            start INTEGER, end INTEGER, globalTid INTEGER, text TEXT, textId INTEGER
+        );
+        INSERT INTO StringIds VALUES (1, 'gpu_model_runner: draft');
+        """
+    )
+    return con
+
+
+@pytest.mark.parametrize("mode", ["phases", "forward", "envelope"])
+def test_draft_scope_has_one_same_thread_indexed_owner(mode):
+    con = _indexed_phase_capture()
+    con.executemany(
+        "INSERT INTO NVTX_EVENTS VALUES (?, ?, ?, ?, ?)",
+        [
+            (100, 200, 30, "vllm_iteration(34): forward", None),
+            (210, 220, 30, "vllm_iteration(34): sample", None),
+            (270, 280, 30, "vllm_iteration(34): bookkeep", None),
+            (230, 260, 30, None, 1),
+            (240, 250, 30, None, 1),  # Nested draft is already owned by the outer scope.
+            (120, 180, 30, None, 1),  # Already inside an indexed phase.
+            (215, 235, 30, None, 1),  # Partially overlaps sample.
+            (230, 260, 31, None, 1),  # No indexed owner on this thread.
+            (285, 295, 30, None, 1),  # Beyond the last indexed phase.
+        ],
+    )
+    worker = Worker(global_pid=10, pid=20, name="VLLM::Worker", device_id=0)
+    rows = load_ranges(con, {30: worker}, {}, 34, 34, mode)
+    if mode == "phases":
+        assert [(row.phase, row.start, row.end) for row in rows] == [
+            ("forward", 100, 200), ("sample", 210, 220),
+            ("bookkeep", 270, 280), ("draft", 230, 260),
+        ]
+    elif mode == "forward":
+        assert [(row.phase, row.start, row.end) for row in rows] == [("forward", 100, 200)]
+    else:
+        assert [(row.phase, row.start, row.end) for row in rows] == [
+            ("iteration_envelope", 100, 280)
+        ]
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("bounds", [(34, 34), (None, None)])
+def test_shared_tp_index_keeps_peers_outside_the_reference_cpu_envelope(shared, bounds):
+    con = _indexed_phase_capture()
+    con.executemany(
+        "INSERT INTO NVTX_EVENTS VALUES (?, ?, ?, ?, NULL)",
+        [
+            (100, 200, 30, "vllm_iteration(34): forward"),
+            (250, 280, 31, "vllm_iteration(34): forward"),
+        ],
+    )
+    workers = {
+        thread: Worker(global_pid=thread, pid=thread, name="VLLM::Worker", device_id=device)
+        for device, thread in enumerate([30, 31])
+    }
+    rows = load_ranges(con, workers, {}, *bounds, "forward", shared_iteration_index=shared)
+    assert [row.worker.device_id for row in rows] == ([0, 1] if shared else [0])
 
 
 def test_iteration_details_preserve_complete_kernel_launch_record():
@@ -248,9 +323,7 @@ def test_sequence_unique_ignores_iteration_semantic_labels():
     catalog = build_kernel_sequences(details, {1: "kernel"})["forward"]
 
     assert len(catalog["unique_sequences"]) == 1
-    assert catalog["unique_sequences"][0]["occurrences"] == [
-        {"device_id": 0, "iterations": [1, 2]}
-    ]
+    assert catalog["unique_sequences"][0]["occurrences"] == [{"device_id": 0, "iterations": [1, 2]}]
 
 
 def test_fold_prefers_layer_aligned_repeat_with_final_suffix():
@@ -358,14 +431,11 @@ def test_asymmetric_ranks_each_keep_their_own_sequence():
     sequences = catalog["unique_sequences"]
     assert len(sequences) == 2
     assert {
-        expand_sequence(sequence)[0]["name"]: sequence["occurrences"]
-        for sequence in sequences
+        expand_sequence(sequence)[0]["name"]: sequence["occurrences"] for sequence in sequences
     } == {
         "rank0": [{"device_id": 0, "iterations": [7]}],
         "rank1": [{"device_id": 1, "iterations": [7]}],
     }
-
-
 
 
 def test_idle_is_measured_against_the_kernel_span_not_the_nvtx_range():
@@ -446,7 +516,9 @@ def host_capture() -> sqlite3.Connection:
         -- Only the worker process ever put a kernel on a device.
         INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES ({WORKER_GLOBAL_PID}, 3, 1, 1000);
 
-        INSERT INTO NVTX_EVENTS VALUES (1000, 2000, {WORKER_MAIN_TID}, 'vllm_iteration(7): forward', NULL);
+        INSERT INTO NVTX_EVENTS VALUES (
+            1000, 2000, {WORKER_MAIN_TID}, 'vllm_iteration(7): forward', NULL
+        );
         INSERT INTO NVTX_EVENTS VALUES (1100, 1500, {WORKER_MAIN_TID}, 'execute_context_0', NULL);
         INSERT INTO NVTX_EVENTS VALUES (900, 2100, {SCHEDULER_TID}, 'schedule', NULL);
         -- A mark the capture never closed.
@@ -532,10 +604,7 @@ def test_host_timeline_excludes_events_outside_the_parsed_window():
     host = build_host_timeline(host_capture(), Path("trace.sqlite"), 1000, 2000)
 
     assert all(end >= 1000 for _index, _start, end, _name in host["nvtx_ranges"])
-    assert all(
-        start < 2000
-        for _index, start, _end, _name, _correlation_id in host["api_calls"]
-    )
+    assert all(start < 2000 for _index, start, _end, _name, _correlation_id in host["api_calls"])
     assert "warmup" not in host["strings"]
 
 
@@ -552,6 +621,7 @@ def test_parsed_window_spans_every_serialized_range():
 
 def test_parsed_window_of_an_empty_parse_is_empty():
     assert parsed_window_ns({"iteration_details": []}) == (0, 0)
+
 
 def _metrics_line(dp_rank: int, iteration: int, prefill_tokens: int, decode_kv_lens: list[int]):
     return json.dumps(
@@ -592,9 +662,7 @@ def test_metrics_are_keyed_by_rank_and_iteration(tmp_path):
 
 def test_metrics_reject_a_repeated_rank_iteration_pair(tmp_path):
     path = tmp_path / "metrics.jsonl"
-    path.write_text(
-        _metrics_line(0, 4, 8, [10]) + "\n" + _metrics_line(0, 4, 8, [10]) + "\n"
-    )
+    path.write_text(_metrics_line(0, 4, 8, [10]) + "\n" + _metrics_line(0, 4, 8, [10]) + "\n")
 
     with pytest.raises(ValueError, match="duplicate metrics record"):
         load_metrics(path)
@@ -641,7 +709,7 @@ def test_dp_rank_by_device_rejects_a_device_with_no_rank_banner():
         resolve_dp_rank_by_device(workers, {999: 0}, tp_size=1)
 
 
-# ---- wall-clock step alignment --------------------------------------------
+# ---- logical step alignment -----------------------------------------------
 #
 # A data-parallel rank numbers its OWN scheduled steps. When one rank runs a
 # prefill chunk alone its peers run dummy batches that join the expert-parallel
@@ -681,6 +749,81 @@ def test_steps_group_by_measured_time_not_by_iteration_index():
     assert [step.iteration for step in steps] == [5, 6, 7]
     assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}, {0: 6, 1: 4}, {0: 7, 1: 5}]
     assert unpaired == {}
+
+
+def test_single_engine_tp_steps_group_by_index_when_host_ranges_do_not_overlap():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    ranges = [
+        _window(0, 130, 100, 110),
+        _window(0, 131, 110, 120),
+        _window(1, 130, 80, 90),
+        _window(1, 131, 101, 111),
+        _window(1, 132, 112, 113, phase="preprocess"),
+    ]
+
+    steps, unpaired = align_ranges_into_steps(ranges, {0: 0, 1: 0})
+
+    assert [step.index_by_device for step in steps] == [
+        {0: 130, 1: 130},
+        {0: 131, 1: 131},
+    ]
+    assert unpaired == {1: 1}
+
+
+def test_single_engine_tp_requires_the_same_phase_identity():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    reference = _window(0, 5, 100, 110, phase="forward")
+    peer = _window(1, 5, 100, 110, phase="preprocess")
+
+    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 0})
+
+    assert [step.index_by_device for step in steps] == [{0: 5}]
+    assert unpaired == {1: 1}
+
+
+def test_multi_engine_steps_use_kernel_time_instead_of_host_submission_time():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    reference = _window(0, 5, 100, 110)
+    peer = _window(1, 3, 200, 210)
+    reference.intervals = [(1_000, 1_010)]
+    peer.intervals = [(1_001, 1_011)]
+
+    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 1})
+
+    assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}]
+    assert unpaired == {}
+
+
+def test_multi_engine_step_without_kernel_evidence_stays_unpaired():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    reference = _window(0, 5, 100, 110)
+    peer = _window(1, 3, 101, 109)
+    peer.intervals = []
+
+    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 1})
+
+    assert [step.index_by_device for step in steps] == [{0: 5}]
+    assert unpaired == {1: 1}
+
+
+def test_multi_engine_ambiguous_kernel_overlap_stays_unpaired():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    first = _window(0, 5, 100, 110)
+    second = _window(0, 6, 110, 120)
+    peer = _window(1, 3, 100, 120)
+    first.intervals = [(1_000, 1_010)]
+    second.intervals = [(1_010, 1_020)]
+    peer.intervals = [(1_005, 1_015)]
+
+    steps, unpaired = align_ranges_into_steps([first, second, peer], {0: 0, 1: 1})
+
+    assert [step.index_by_device for step in steps] == [{0: 5}, {0: 6}]
+    assert unpaired == {1: 1}
 
 
 def test_a_step_only_one_rank_ran_keeps_that_rank_and_names_the_absent_ones():
@@ -728,6 +871,75 @@ def test_each_range_carries_its_own_index_and_its_own_ranks_metrics():
     assert detail["iteration_type"] == "mixed"
 
 
+def test_tensor_parallel_devices_state_one_shared_scheduler_batch():
+    ranges = [_window(device_id, 5, 0, 10) for device_id in range(4)]
+    rank_metrics = {
+        (0, 5): json.loads(_metrics_line(0, 5, prefill_tokens=2048, decode_kv_lens=[7]))
+    }
+    name_ids, _ = build_kernel_name_index(ranges)
+
+    (detail,) = build_iteration_details(
+        ranges,
+        {},
+        name_ids,
+        rank_metrics,
+        {0: 0, 1: 0, 2: 0, 3: 0},
+    )
+
+    assert detail["iteration_index_by_device"] == {"0": 5, "1": 5, "2": 5, "3": 5}
+    assert detail["metrics"]["prefill_tokens"] == 2048
+    assert detail["metrics"]["prefill_chunk_pairs"] == [[0, 2048]]
+    assert detail["metrics"]["decode_kv_lens"] == [7]
+    assert detail["metrics"]["dp_ranks"] == [0]
+    assert list(detail["metrics_by_dp_rank"]) == ["0"]
+
+
+def test_dp_batches_fold_once_each_even_when_each_has_multiple_tp_devices():
+    ranges = [_window(device_id, 5 if device_id < 2 else 3, 0, 10) for device_id in range(4)]
+    rank_metrics = {
+        (0, 5): json.loads(_metrics_line(0, 5, prefill_tokens=100, decode_kv_lens=[])),
+        (1, 3): json.loads(_metrics_line(1, 3, prefill_tokens=0, decode_kv_lens=[9, 11])),
+    }
+    name_ids, _ = build_kernel_name_index(ranges)
+
+    (detail,) = build_iteration_details(
+        ranges,
+        {},
+        name_ids,
+        rank_metrics,
+        {0: 0, 1: 0, 2: 1, 3: 1},
+    )
+
+    assert detail["metrics"]["prefill_tokens"] == 100
+    assert detail["metrics"]["decode_requests"] == 2
+    assert detail["metrics"]["decode_kv_lens"] == [9, 11]
+    assert detail["metrics"]["dp_ranks"] == [0, 1]
+    assert list(detail["metrics_by_dp_rank"]) == ["0", "1"]
+
+
+def test_one_dp_rank_cannot_name_two_iterations_in_one_measured_step():
+    from alignment.nsys.parse import step_rows_by_dp_rank
+
+    rank_metrics = {
+        (0, 5): {"iteration_index": 5},
+        (0, 6): {"iteration_index": 6},
+    }
+
+    with pytest.raises(ValueError, match="dp_rank 0 maps to iterations 5 and 6"):
+        step_rows_by_dp_rank({0: 5, 1: 6}, rank_metrics, {0: 0, 1: 0})
+
+
+def test_tp_iteration_disagreement_is_rejected_even_when_one_metric_row_is_missing():
+    from alignment.nsys.parse import step_rows_by_dp_rank
+
+    with pytest.raises(ValueError, match="dp_rank 0 maps to iterations 5 and 6"):
+        step_rows_by_dp_rank(
+            {0: 5, 1: 6},
+            {(0, 5): {"iteration_index": 5}},
+            {0: 0, 1: 0},
+        )
+
+
 def test_a_peer_step_with_no_reference_counterpart_is_counted_not_dropped():
     from alignment.nsys.parse import align_ranges_into_steps
 
@@ -766,6 +978,34 @@ def test_the_window_follows_the_reference_rank_and_peers_join_by_time():
     kept = window_rows_by_reference_rank(rows, 8, 9)
 
     assert sorted((row[0], row[2].device_id) for row in kept) == [(4, 1), (5, 1), (8, 0), (9, 0)]
+
+
+def test_an_open_window_analyzes_the_whole_capture():
+    from alignment.nsys.parse import window_rows_by_reference_rank
+
+    reference = Worker(global_pid=1, pid=1, name="W", device_id=0)
+    peer = Worker(global_pid=2, pid=2, name="W", device_id=1)
+    rows = [
+        [7, "forward", reference, 0, 10],
+        [8, "forward", reference, 10, 20],
+        [9, "forward", reference, 20, 30],
+        [3, "forward", peer, 1, 11],
+        [4, "forward", peer, 11, 21],
+        [5, "forward", peer, 21, 31],
+    ]
+
+    kept = window_rows_by_reference_rank(rows, None, None)
+
+    assert sorted((row[0], row[2].device_id) for row in kept) == [
+        (3, 1),
+        (4, 1),
+        (5, 1),
+        (7, 0),
+        (8, 0),
+        (9, 0),
+    ]
+    assert sorted(row[0] for row in window_rows_by_reference_rank(rows, 8, None)) == [4, 5, 8, 9]
+    assert sorted(row[0] for row in window_rows_by_reference_rank(rows, None, 8)) == [3, 4, 7, 8]
 
 
 def _best_repeat_by_definition(tokens, absolute_start):

@@ -1,6 +1,6 @@
 """Strict launcher-owned schemas for the three alignment-specific phases.
 
-The ordinary simulation phase keeps using the normal VibeSim preset schema.
+The ordinary simulation phase keeps using the normal ServingStudioSim preset schema.
 Every path parsed here is resolved relative to the file that declared it, so a
 dated experiment directory can be moved as one self-contained unit. Runtime
 modules receive typed values and never parse YAML or JSON themselves.
@@ -8,14 +8,25 @@ modules receive typed values and never parse YAML or JSON themselves.
 
 from __future__ import annotations
 
+import math
 import os
+import re
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from alignment.load_generator.config import LoadGeneratorConfig
-from alignment.profiler.config import IdleWaitConfig, NsysConfig, ProfileConfig, ServerConfig
-from alignment.timing_predict_input import EngineTextInputSpec
+from alignment.profiler.config import (
+    PROFILE_KINDS,
+    ROUTING_PROFILE_KINDS,
+    IdleWaitConfig,
+    NsysConfig,
+    ProfileConfig,
+    PythonPackageArtifact,
+    PythonRuntimeConfig,
+    ServerConfig,
+)
+from alignment.timing_predict_input import EngineTextInputSpec, SpeculativeEngineTextInputSpec
 
 from .schema.loader import PresetError, _load_preset
 
@@ -72,8 +83,8 @@ class AnalyzePhaseConfig:
     """
 
     simulation_log_dir: Path | None
-    profile_log_dir: Path
-    workload_profile_log_dir: Path
+    profile_log_dir: Path | None
+    workload_profile_log_dir: Path | None
     timing_predict_log_dir: Path | None
     log_dir: Path
     iteration: IterationAnalysisPolicy
@@ -96,8 +107,13 @@ class AnalyzePhaseConfig:
         return selected
 
 
-def load_profile_config(path: Path) -> ProfileConfig:
-    """Load the profile-only schema and normalize its filesystem inputs."""
+def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> ProfileConfig:
+    """Load the profile-only schema and normalize its filesystem inputs.
+
+    ``require_python_runtime=False`` exists only for ``profile --resume``:
+    post-processing an existing capture must not require or mutate the engine
+    interpreter that originally produced it.
+    """
     raw = _phase_document(path, "profile")
     base = path.resolve().parent
     try:
@@ -105,6 +121,7 @@ def load_profile_config(path: Path) -> ProfileConfig:
         workload_raw = _pop_mapping(raw, "workload", "profile")
         idle_raw = _pop_optional_mapping(raw, "idle", "profile")
         nsys_raw = _pop_optional_mapping(raw, "nsys", "profile")
+        python_runtime_raw = _pop_optional_mapping(raw, "python_runtime", "profile")
         server = ServerConfig(**server_raw)
         workload = LoadGeneratorConfig.from_mapping(workload_raw)
         workload = replace(
@@ -118,6 +135,20 @@ def load_profile_config(path: Path) -> ProfileConfig:
         idle = IdleWaitConfig(**idle_raw)
         nsys = NsysConfig(**nsys_raw)
         nsys.validate()
+        python_runtime = None
+        if python_runtime_raw:
+            packages_raw = python_runtime_raw.pop("packages", None)
+            if not isinstance(packages_raw, list) or not packages_raw:
+                raise ValueError("python_runtime.packages must be a non-empty list")
+            packages = []
+            for index, package_raw in enumerate(packages_raw):
+                if not isinstance(package_raw, dict):
+                    raise ValueError(f"python_runtime.packages[{index}] must be a mapping")
+                packages.append(PythonPackageArtifact(**package_raw))
+            python_runtime = PythonRuntimeConfig(
+                packages=packages,
+                **python_runtime_raw,
+            )
         log_dir = _config_path(base, raw.pop("log_dir"), "log_dir")
         fork_python = raw.pop("fork_python", "")
         if fork_python:
@@ -135,6 +166,7 @@ def load_profile_config(path: Path) -> ProfileConfig:
             nsys=nsys,
             fork_python=fork_python,
             driver_compat_lib_dir=driver_compat_lib_dir,
+            python_runtime=python_runtime,
             **raw,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -149,15 +181,105 @@ def load_profile_config(path: Path) -> ProfileConfig:
         raise ValueError(
             f"invalid profile config: engine must be 'vllm' or 'sglang', got {config.engine!r}"
         )
-    if config.profile_kind not in {"nsys", "expert_popularity", "workload_metrics"}:
+    if require_python_runtime and config.engine == "sglang" and config.python_runtime is None:
         raise ValueError(
-            "invalid profile config: profile_kind must be 'nsys', "
-            f"'expert_popularity', or 'workload_metrics', got {config.profile_kind!r}"
+            "invalid profile config: engine sglang requires an explicit "
+            "python_runtime prebuilt-artifact contract"
+        )
+    if config.python_runtime is not None:
+        _validate_python_runtime(config.python_runtime)
+    if (
+        require_python_runtime
+        and config.engine == "sglang"
+        and (
+            config.python_runtime is None
+            or config.python_runtime.environment.get("FLASHINFER_DISABLE_JIT") != "1"
+        )
+    ):
+        raise ValueError(
+            "invalid profile config: SGLang alignment requires "
+            "python_runtime.environment.FLASHINFER_DISABLE_JIT: '1' so a missing "
+            "prebuilt module fails before runtime compilation"
+        )
+    if config.profile_kind not in PROFILE_KINDS:
+        raise ValueError(
+            "invalid profile config: profile_kind must be one of "
+            f"{sorted(PROFILE_KINDS)}, got {config.profile_kind!r}"
         )
     visible_devices = [
         device.strip() for device in config.cuda_visible_devices.split(",") if device.strip()
     ]
     world_size = config.server.tp_size * config.server.dp_size
+    expert_topology = {
+        "expert_parallel_size": config.server.expert_parallel_size,
+        "expert_count_reduction_group_size": (config.server.expert_count_reduction_group_size),
+    }
+    # Recording per-token routes is a fork-specific server capability, and only
+    # the vLLM fork has it. Rejecting the combination here costs nothing; letting
+    # it through spends a scheduled job to die in the other engine's argparse.
+    if config.profile_kind == "token_corpus" and config.engine != "vllm":
+        raise ValueError(
+            f"invalid profile config: profile_kind token_corpus requires engine vllm, "
+            f"got {config.engine!r}"
+        )
+    if config.profile_kind == "token_corpus" and not config.workload.backend.returns_routed_experts:
+        raise ValueError(
+            "invalid profile config: profile_kind token_corpus needs a workload backend "
+            f"that returns routed experts, and {config.workload.backend.type!r} does not"
+        )
+    runtime_env = config.python_runtime.environment if config.python_runtime else {}
+    if config.profile_kind == "token_corpus" and runtime_env.get("VLLM_USE_V2_MODEL_RUNNER") == "0":
+        # The pinned fork records an MTP drafter's routes only in model runner
+        # V2; V1 refuses at startup, after the job has already been scheduled.
+        raise ValueError(
+            "invalid profile config: profile_kind token_corpus needs model runner "
+            "V2; drop VLLM_USE_V2_MODEL_RUNNER=0 from python_runtime.environment"
+        )
+    opted_out_of_eplb = "--no-enable-eplb" in config.server.extra_args
+    if config.profile_kind == "expert_popularity" and opted_out_of_eplb:
+        raise ValueError(
+            "invalid profile config: profile_kind expert_popularity reads EPLB's "
+            "expert-load stream, which --no-enable-eplb turns off; use token_corpus"
+        )
+    # Expert parallelism is declared twice -- as a server flag and as the degree
+    # the records are reduced over -- and the two must agree. Disagreeing is how
+    # a capture ends up paying for an expert-load stream it cannot aggregate, or
+    # aggregating over a topology the server never ran.
+    if config.profile_kind in ROUTING_PROFILE_KINDS and config.engine == "vllm":
+        flagged = "--enable-expert-parallel" in config.server.extra_args
+        declared = config.server.expert_parallel_size
+        if declared is not None and flagged != (declared > 1):
+            raise ValueError(
+                "invalid profile config: server.expert_parallel_size "
+                f"{declared} and --enable-expert-parallel "
+                f"{'present' if flagged else 'absent'} disagree about expert parallelism"
+            )
+    # The topology is what the marginal is reduced over, so it is required by
+    # the pass whose product that is, and by any routing pass that will take the
+    # expert-load stream alongside its own product -- capturing that stream and
+    # then discarding it for want of two declared integers is the server paying
+    # EPLB's synchronization cost for nothing. A corpus capture with neither
+    # keeps working: it records logical expert ids and needs no topology.
+    if (config.profile_kind == "expert_popularity" or config.captures_expert_load) and any(
+        value is None for value in expert_topology.values()
+    ):
+        raise ValueError(
+            f"invalid profile config: {config.profile_kind} requires explicit "
+            "server.expert_parallel_size and "
+            "server.expert_count_reduction_group_size"
+        )
+    for field_name, value in expert_topology.items():
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"invalid profile config: server.{field_name} must be a positive integer"
+            )
+        if world_size % value != 0:
+            raise ValueError(
+                f"invalid profile config: server.{field_name} must divide "
+                f"tp_size * dp_size={world_size}"
+            )
     if len(visible_devices) != world_size:
         raise ValueError(
             "invalid profile config: cuda_visible_devices must contain exactly "
@@ -179,6 +301,87 @@ def load_profile_config(path: Path) -> ProfileConfig:
     return config
 
 
+def _validate_python_runtime(config: PythonRuntimeConfig) -> None:
+    """Reject ambiguous package contracts before touching an interpreter."""
+    for field_name, timeout in (
+        ("lock_timeout_seconds", config.lock_timeout_seconds),
+        ("install_timeout_seconds", config.install_timeout_seconds),
+    ):
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError(
+                f"invalid profile config: python_runtime.{field_name} must be a "
+                "finite number > 0"
+            )
+    names: set[str] = set()
+    for index, package in enumerate(config.packages):
+        prefix = f"python_runtime.packages[{index}]"
+        for field_name in ("name", "version", "index_url"):
+            value = getattr(package, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"invalid profile config: {prefix}.{field_name} must be non-empty")
+        canonical_name = re.sub(r"[-_.]+", "-", package.name).lower()
+        if canonical_name in names:
+            raise ValueError(
+                f"invalid profile config: duplicate python runtime package {package.name!r}"
+            )
+        names.add(canonical_name)
+        if package.local_version is not None and (
+            not isinstance(package.local_version, str) or not package.local_version.strip()
+        ):
+            raise ValueError(f"invalid profile config: {prefix}.local_version must be non-empty")
+        if not isinstance(package.required_files, list) or any(
+            not isinstance(path, str) or not path.strip() for path in package.required_files
+        ):
+            raise ValueError(
+                f"invalid profile config: {prefix}.required_files must be a list of "
+                "non-empty names"
+            )
+        if len(set(package.required_files)) != len(package.required_files):
+            raise ValueError(f"invalid profile config: {prefix}.required_files contains duplicates")
+        for required_file in package.required_files:
+            artifact_path = PurePosixPath(required_file)
+            if (
+                artifact_path.is_absolute()
+                or len(artifact_path.parts) < 2
+                or any(part in {"", ".", ".."} for part in artifact_path.parts)
+            ):
+                raise ValueError(
+                    f"invalid profile config: {prefix}.required_files entry "
+                    f"{required_file!r} must be an exact wheel-relative path"
+                )
+    if not isinstance(config.environment, dict) or any(
+        not isinstance(key, str) or not key or not isinstance(value, str)
+        for key, value in config.environment.items()
+    ):
+        raise ValueError(
+            "invalid profile config: python_runtime.environment must map non-empty "
+            "variable names to strings"
+        )
+    launcher_owned = {
+        "CUDA_VISIBLE_DEVICES",
+        "LD_LIBRARY_PATH",
+        "PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "SGLANG_ENABLE_NVTX_SCHEDULER",
+        "SGLANG_ENABLE_VIBESIM_ALIGNMENT",
+        "UV_PROJECT_ENVIRONMENT",
+        "VIRTUAL_ENV",
+        "VLLM_NVTX_SCOPES_FOR_PROFILING",
+    }
+    conflicts = sorted(launcher_owned.intersection(config.environment))
+    if conflicts:
+        raise ValueError(
+            "invalid profile config: python_runtime.environment cannot override "
+            f"launcher-owned variables {conflicts}"
+        )
+
+
 def load_timing_predict_config(path: Path) -> TimingPredictPhaseConfig:
     """Load one timing-input build and offline-predict phase config."""
     raw = _phase_document(path, "timing-predict")
@@ -188,12 +391,16 @@ def load_timing_predict_config(path: Path) -> TimingPredictPhaseConfig:
         builder_type = builder_raw.pop("type", None)
         # `vllm_text` is the pre-SGLang spelling of the same builder, kept so
         # configs written against the single-engine pipeline still load.
-        if builder_type not in {"engine_text", "vllm_text"}:
+        if builder_type in {"engine_text", "vllm_text"}:
+            builder = EngineTextInputSpec(**builder_raw)
+        elif builder_type == "speculative_engine_text":
+            builder = SpeculativeEngineTextInputSpec(**builder_raw)
+        else:
             raise ValueError(
                 f"unsupported input_builder.type {builder_type!r}; "
-                "available: ['engine_text'] (legacy alias: 'vllm_text')"
+                "available: ['engine_text', 'speculative_engine_text'] "
+                "(legacy alias: 'vllm_text')"
             )
-        builder = EngineTextInputSpec(**builder_raw)
         builder.validate()
         config = TimingPredictPhaseConfig(
             simulation_preset=_config_path(base, raw.pop("simulation_preset"), "simulation_preset"),
@@ -263,12 +470,29 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
             if simulation_raw is not None
             else None
         )
-        profile_log_dir = _config_path(base, raw.pop("profile_log_dir"), "profile_log_dir")
+        profile_raw = raw.pop("profile_log_dir", None)
         workload_profile_raw = raw.pop("workload_profile_log_dir", None)
+        if iteration.enabled and profile_raw is None:
+            raise ValueError("profile_log_dir is required for kernel alignment")
+        if (workload.enabled or e2e.enabled) and workload_profile_raw is None:
+            raise ValueError(
+                "workload_profile_log_dir is required for workload or e2e alignment"
+            )
+        if iteration.enabled and workload_profile_raw is not None:
+            raise ValueError(
+                "workload_profile_log_dir does not belong to kernel alignment"
+            )
+        if (workload.enabled or e2e.enabled) and profile_raw is not None:
+            raise ValueError("profile_log_dir does not belong to workload/e2e alignment")
+        profile_log_dir = (
+            _config_path(base, profile_raw, "profile_log_dir")
+            if profile_raw is not None
+            else None
+        )
         workload_profile_log_dir = (
             _config_path(base, workload_profile_raw, "workload_profile_log_dir")
             if workload_profile_raw is not None
-            else profile_log_dir
+            else None
         )
         timing_predict_raw = raw.pop("timing_predict_log_dir", None)
         if iteration.enabled and timing_predict_raw is None:
@@ -294,11 +518,10 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
         raise ValueError(f"invalid analyze config: {exc}") from exc
     if not config.subjects:
         raise ValueError("invalid analyze config: at least one analysis subject must be enabled")
-    distinct = {
-        "profile_log_dir": config.profile_log_dir,
-        "log_dir": config.log_dir,
-    }
-    if config.workload_profile_log_dir != config.profile_log_dir:
+    distinct = {"log_dir": config.log_dir}
+    if config.profile_log_dir is not None:
+        distinct["profile_log_dir"] = config.profile_log_dir
+    if config.workload_profile_log_dir is not None:
         distinct["workload_profile_log_dir"] = config.workload_profile_log_dir
     if config.timing_predict_log_dir is not None:
         distinct["timing_predict_log_dir"] = config.timing_predict_log_dir
@@ -563,7 +786,14 @@ def _validate_labeled_kernel(
     cross_rank = label.get("cross_rank")
     if cross_rank is not None and cross_rank not in {"synchronizing", "independent"}:
         raise ValueError(f"{context}.label.cross_rank must be synchronizing or independent")
-    mapping_keys = set(label) - {"cross_rank"}
+    collective = label.get("collective")
+    if "collective" in label:
+        _require_nonempty(collective, f"{context}.label.collective")
+        if label["status"] != "unmapped" or cross_rank != "synchronizing":
+            raise ValueError(
+                f"{context} collective identity requires an unmapped synchronizing label"
+            )
+    mapping_keys = set(label) - {"cross_rank", "collective"}
     if label["status"] == "unmapped":
         if mapping_keys != {"status"}:
             raise ValueError(f"{context} unmapped label cannot contain mapping fields")

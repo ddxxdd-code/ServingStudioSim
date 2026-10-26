@@ -1,12 +1,18 @@
 //! `simulator` binary entry — clap top-level CLI and subcommand dispatch.
 //!
-//! Surface (new-interface-design §13.1): each run-like subcommand takes a path
+//! Per the L7 design, each run-like subcommand takes a path
 //! to ONE structured config file (YAML/JSON), which the launcher writes:
 //!   - `run <config>`              — run one sim
 //!   - `build-cache-only <config>` — prebuild profile.db, no sim
 //!   - `dry-run <config>`          — report missing profile.db rows, no sim
+//!   - `kv-cache <config>`         — each KV pool's capacity breakdown, no sim
 //!   - `emit-backends <config>`    — enumerate distinct kernels (JSON), no sim
 //!   - `list-params`               — emit the param-schema registry JSON
+//!   - `kernel-list`               — every kernel kind's config / sweep fields
+//!   - `cost-trees <blocks>`       — given arch blocks' cost trees, no sim
+//!   - `workload-plan <workload>`  — a workload's requests as a run loads them (JSON);
+//!     `workload-plan --config <config>` also checks them against the run's pools
+//!   - `trace-formats`             — the trace formats and tags a run reads (JSON)
 //!
 //! All three run-like subcommands share one parse (`load_config`) → `RunConfig`
 //! (a serde enum tagged by `deployment`) → `deployment::build_flow` dispatch.
@@ -18,15 +24,17 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use simulator::common::{RequestStore, SharedRequests};
-use simulator::deployment::{build_flow, RunConfig};
+use simulator::common::{RequestStore, SharedRequests, TooLong};
+use simulator::deployment::{build_flow, check_trace, pool_bounds, RunConfig, WorkloadSpec};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{
-    run_sim, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, LoadedTrace,
-    SessionDependency, TickCfg, TraceTag,
+    run_sim, trace_formats, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema,
+    LoadedTrace, TickCfg, TraceFrontend, TraceTag,
 };
+use simulator::timing::bridge::{dry_run_document, print_dry_run, write_dry_run_report};
 use simulator::timing::PerfApiBridge;
+use simulator::timing_predict::PredictMode;
 
 // Heap profiling (opt-in, `--features dhat-heap`): dhat's allocator only
 // intercepts Rust's `GlobalAlloc`, so Python/torch C-side allocations bypass it
@@ -40,9 +48,13 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[command(
     name = "simulator",
     version,
-    about = "VibeSim — ML serving + training simulator"
+    about = "ServingStudio Sim — ML serving + training simulator"
 )]
 struct Cli {
+    /// On failure, also write the error (its whole cause chain, as one line)
+    /// to this JSON file as `{"schema_version": 1, "error": ...}`.
+    #[arg(long, value_name = "FILE", global = true)]
+    error_json: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -55,7 +67,13 @@ enum Cmd {
     BuildCacheOnly(RunArgs),
     /// Report how many kernel specs are missing from profile.db (the JIT work a
     /// cache build would do), per kernel, then exit without building or running.
-    DryRun(RunArgs),
+    DryRun(DryRunArgs),
+    /// Print each KV pool's capacity breakdown — the declared layout, the
+    /// resolved options, what each part is charged, and the concurrency at
+    /// `max_model_len` under both `kv_overhead` modes — then exit without
+    /// simulating. Builds the flow structure only (no Python, profile.db or
+    /// GPU), with its logs redirected so the config's `log_dir` is untouched.
+    KvCache(KvCacheArgs),
     /// Print the deployment schema JSON consumed by the launcher (§1.2.7).
     ListParams,
     /// Enumerate the distinct kernels this config touches — one JSON record per
@@ -69,15 +87,99 @@ enum Cmd {
     /// kernel by `{kind, config, query_points}`; writes the interpolated
     /// best-of-N metrics per point + the fitted grid axes on stdout.
     KernelQuery,
+    /// Print every registered kernel kind as JSON: the config fields that fix
+    /// one instance, the input fields its profile.db rows sweep, the cache
+    /// coordinates, and which config field is the compute / KV dtype. Reads the
+    /// kernel registry only (no config, GPU or profile.db).
+    KernelList,
+    /// Build each given arch block on its GPU, iter-wise or layer-wise, and
+    /// print each one's cost tree (the `cost_manifest` form) and, when it holds
+    /// attention, its KV cache layout (`kv_cache`) as JSON. Structure only: no
+    /// run config, Python perf_api, profile.db or GPU.
+    CostTrees(CostTreeArgs),
     /// Predict per-building-block timing offline for a batch of explicit batch
     /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
     /// `{iter|attn|ffn}` + gpu + a cases_file) and writes the standard
     /// `raw/cost_log` + `cost_manifest` artifacts (one row per case/section, tagged
     /// with `section`/`layer`), which `analyze trace` / `analyze run` consume.
-    TimingPredict(RunArgs),
+    ///
+    /// `--dry-run` builds the model and validates every case without costing any:
+    /// it reports the `profile.db` specs a real run would JIT, writes nothing, and
+    /// needs no GPU.
+    TimingPredict(PredictArgs),
+    /// Load a workload block's trace files exactly as `run` does (format, tags,
+    /// replay settings, row checks) and print its requests as JSON: the
+    /// normalized plan, one row per request in the trace's own ids (a row of a
+    /// trace without sessions has no session, round or predecessor).
+    /// Reads no profile.db and builds no model. Given a whole run config
+    /// (`--config`), it also refuses requests a pool cannot serve, as `run`
+    /// does before its first tick.
+    WorkloadPlan(WorkloadArgs),
+    /// Print the input file formats a run reads and the tags each can add, with
+    /// their columns, as JSON.
+    TraceFormats,
 }
 
-/// Shared payload for `run` / `build-cache-only` / `dry-run`: a path to one
+#[derive(Args)]
+struct WorkloadArgs {
+    /// A run config's `workload` block on its own (`.yaml` / `.yml` / `.json`).
+    #[arg(required_unless_present = "config", conflicts_with = "config")]
+    workload: Option<PathBuf>,
+    /// A whole run config instead: its workload, checked against its pools
+    /// (`deployment::check_trace`).
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct PredictArgs {
+    /// Path to the predict config (`.yaml` / `.yml` / `.json`).
+    config: PathBuf,
+    /// Validate and report missing `profile.db` specs; cost and write nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// See [`DryRunArgs::report_json`], without `pools`.
+    #[arg(long, value_name = "FILE", requires = "dry_run")]
+    report_json: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct CostTreeArgs {
+    /// The arch blocks to build: a JSON list of `{gpu, arch}` (`arch` holds
+    /// `type` and the params, file paths as this process opens them), `-` for
+    /// stdin. A param a block leaves out takes its schema default.
+    #[arg(value_name = "FILE")]
+    archs: PathBuf,
+    /// Also give each build's kernel configs (with the grid of args each one
+    /// reads) under `kernel_configs`: `{"schema_version": 1, "configs": [...]}`.
+    #[arg(long)]
+    kernel_configs: bool,
+}
+
+#[derive(Args)]
+struct DryRunArgs {
+    #[command(flatten)]
+    run: RunArgs,
+    /// Also write the report to this JSON file: `{"schema_version": 1,
+    /// "kernels": [{name, kind, missing, total}], "missing", "total",
+    /// "pools": [{role, max_model_len, draft_tokens}]}`, one `pools` entry per
+    /// request-serving pool group (`deployment::pool_bounds`; `draft_tokens`
+    /// is null for a non-speculative worker), and "kv_cache", the run's
+    /// `raw/kv_cache.json` document.
+    #[arg(long, value_name = "FILE")]
+    report_json: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct KvCacheArgs {
+    #[command(flatten)]
+    run: RunArgs,
+    /// Print the `raw/kv_cache.json` document instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Shared payload for `run` / `build-cache-only` / `dry-run` / `emit-backends`: a path to one
 /// structured config file. The `deployment` tag inside it picks the topology.
 #[derive(Args)]
 struct RunArgs {
@@ -88,16 +190,37 @@ struct RunArgs {
 /// Parse a structured config file. YAML is a JSON superset, so `.json` uses the
 /// JSON parser (clearer errors) and everything else uses the YAML parser.
 fn load_config(path: &Path) -> Result<RunConfig> {
+    parse_file(path, "run config")
+}
+
+fn parse_file<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<T> {
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading run config {}", path.display()))?;
-    let cfg = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        .with_context(|| format!("reading {what} {}", path.display()))?;
+    let value = if path.extension().and_then(|e| e.to_str()) == Some("json") {
         serde_json::from_str(&text)
-            .with_context(|| format!("parsing JSON config {}", path.display()))?
+            .with_context(|| format!("parsing JSON {what} {}", path.display()))?
     } else {
         serde_yaml::from_str(&text)
-            .with_context(|| format!("parsing YAML config {}", path.display()))?
+            .with_context(|| format!("parsing YAML {what} {}", path.display()))?
     };
-    Ok(cfg)
+    Ok(value)
+}
+
+/// Load and type-check a workload's trace into the text frontend a run replays:
+/// the declared format and tags, the replay settings, then every row. Shared by
+/// `run` and `workload-plan`, so a plan is the requests a run would release.
+fn load_frontend(workload: &WorkloadSpec) -> Result<TraceFrontend> {
+    let input_file_format = InputFileFormat::parse(&workload.input_file_format)?;
+    let input_file_tags = workload
+        .input_file_tags
+        .iter()
+        .map(|tag| TraceTag::parse(tag))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let input_file_schema = InputFileSchema::new(input_file_format, input_file_tags)?;
+    let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?;
+    let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
+    LoadedTrace::load(&workload.trace_files, &input_file_schema, arrival, capacity)?
+        .into_current_text_frontend()
 }
 
 /// Compact wall-clock log timestamp: `[MM:SS.mmm]` (UTC minute-of-hour). Drops
@@ -146,11 +269,31 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    match cli.cmd {
+    let result = dispatch(cli.cmd);
+    if let (Err(error), Some(path)) = (&result, &cli.error_json) {
+        // A request too long for its pool or arch also gives its limit and counts.
+        let too_long = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<TooLong>());
+        let text = serde_json::json!({
+            "schema_version": 1,
+            "error": format!("{error:#}"),
+            "too_long": too_long,
+        });
+        if let Err(write) = std::fs::write(path, text.to_string()) {
+            tracing::error!("writing {}: {write}", path.display());
+        }
+    }
+    result
+}
+
+fn dispatch(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::Run(args) => cmd_run(&args.config),
         Cmd::BuildCacheOnly(args) => cmd_build_cache(&args.config),
-        Cmd::DryRun(args) => cmd_dry_run(&args.config),
+        Cmd::DryRun(args) => cmd_dry_run(&args.run.config, args.report_json.as_deref()),
         Cmd::EmitBackends(args) => cmd_emit_backends(&args.config),
+        Cmd::KvCache(args) => cmd_kv_cache(&args.run.config, args.json),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
             println!(
@@ -160,7 +303,51 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
-        Cmd::TimingPredict(args) => simulator::timing_predict::run_timing_predict(&args.config),
+        Cmd::KernelList => simulator::introspect::run_kernel_list(),
+        Cmd::CostTrees(args) => {
+            let path = &args.archs;
+            let text = if path.as_os_str() == "-" {
+                std::io::read_to_string(std::io::stdin()).context("reading stdin")?
+            } else {
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?
+            };
+            let blocks: Vec<simulator::arch::build::ArchBlock> =
+                serde_json::from_str(&text).context("parsing the arch blocks")?;
+            let builds = simulator::arch::build::build_arch_blocks(&blocks, args.kernel_configs);
+            println!("{}", serde_json::to_string(&builds)?);
+            Ok(())
+        }
+        Cmd::TimingPredict(args) => simulator::timing_predict::run_timing_predict(
+            &args.config,
+            if args.dry_run {
+                PredictMode::DryRun
+            } else {
+                PredictMode::Run
+            },
+            args.report_json.as_deref(),
+        ),
+        Cmd::WorkloadPlan(args) => {
+            let frontend = match (&args.config, &args.workload) {
+                (Some(config), _) => {
+                    let cfg = load_config(config)?;
+                    let frontend = load_frontend(cfg.workload())?;
+                    check_trace(&cfg, &frontend)?;
+                    frontend
+                }
+                (None, Some(workload)) => {
+                    load_frontend(&parse_file::<WorkloadSpec>(workload, "workload")?)?
+                }
+                (None, None) => unreachable!("clap requires a workload or --config"),
+            };
+            let requests = frontend.plan_rows();
+            println!("{}", serde_json::json!({ "requests": requests }));
+            Ok(())
+        }
+        Cmd::TraceFormats => {
+            println!("{}", serde_json::to_string_pretty(&trace_formats())?);
+            Ok(())
+        }
     }
 }
 
@@ -172,24 +359,8 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // Parse into a concrete request family and narrow to the currently
     // supported text path before starting the bridge or building L4.
     let workload = cfg.workload();
-    let input_file_format = InputFileFormat::parse(&workload.input_file_format)?;
-    let input_file_tags = workload
-        .input_file_tags
-        .iter()
-        .map(|tag| TraceTag::parse(tag))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let input_file_schema = InputFileSchema::new(input_file_format, input_file_tags)?;
-    let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?;
-    let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
-    let session_dependency = SessionDependency::parse(&workload.session_dependency)?;
-    let loaded_trace = LoadedTrace::load(
-        &workload.trace_files,
-        &input_file_schema,
-        arrival,
-        capacity,
-        session_dependency,
-    )?;
-    let mut frontend = loaded_trace.into_current_text_frontend()?;
+    let mut frontend = load_frontend(workload)?;
+    check_trace(&cfg, &frontend)?;
     let tick_cfg = TickCfg::new(
         workload.duration_ms,
         workload.run_to_end,
@@ -211,11 +382,22 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // Run-level GPU facts sidecar (L7): written before the tick loop so the
     // analyzer can normalize per-GPU even if the run later fails.
     simulator::log::write_run_meta(log_dir, &flow.cluster().borrow(), cfg.stage_vocab())?;
+    simulator::log::write_kv_cache(log_dir, &flow.cluster().borrow())?;
     let summary = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &tick_cfg)?;
     // run_sim emits the stats summary (completed/throughput/wall) to the log;
     // persist the structured form as `<log_dir>/summary.json` for regression
     // tests + the aggregator, then point at the parquet logs.
     summary.write_json(log_dir)?;
+    // Dropping the flow drops every worker, which flushes and joins its
+    // `cost_log` writer; a writer that failed fails the run here instead of
+    // leaving an incomplete cost_log behind a successful exit.
+    drop(flow);
+    let failures = simulator::log::cost_log_failures(log_dir)?;
+    anyhow::ensure!(
+        failures.is_empty(),
+        "cost_log writer failed: {}",
+        failures.join("; ")
+    );
     tracing::info!(
         cause = ?summary.cause,
         log_dir = %log_dir.display(),
@@ -224,17 +406,52 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `build-cache-only` — enable JIT profiling, run the L4 cascade so missing
-/// kernels are profiled into `profile.db`, then exit before the tick loop.
+/// `build-cache-only` — collect every miss in one walk, then measure them all in
+/// one pass, then exit before the tick loop.
+///
+/// This used to enable JIT and let the L4 cascade profile on demand, node by
+/// node. An instrumented tp4/ep4/spec5 fill showed the cost of that: 23
+/// `(kind, backend)` units became 55 separate profiling calls (`elementwise` 14
+/// times, `single_gemm` 11), each fanned across four GPUs and joined, for 208
+/// worker launches and 208 cold JIT/autotune caches. Nothing overlapped across
+/// calls, so all four cards idled together 20% of the run. Measured end to end,
+/// collecting first and running each unit whole on one card does the same 6308
+/// rows in 2595 GPU-seconds instead of 6256.
+///
+/// The collect walk is the bridge's dry-run mode, which calls only
+/// `count_missing` and never fits, so no kernel time is needed to discover what
+/// is missing. JIT stays off throughout: nothing is profiled on demand, and
+/// `issue_collected` does all the measuring.
 fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    bridge.enable_dry_run();
     bridge
-        .enable_jit_profiling()
-        .context("enabling JIT profiling for cache build")?;
+        .begin_collect()
+        .context("starting the profiling collect pass")?;
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    let _flow = build_flow(&cfg, &bridge, store)?;
-    tracing::info!("cache build complete: profile.db populated via JIT");
+    let flow = build_flow(&cfg, &bridge, store)?;
+    drop(flow);
+
+    // The plan is worth printing before spending GPU time on it: this is the
+    // point at which a grid that quietly grew by an order of magnitude is still
+    // cheap to notice.
+    let report = bridge.take_dry_run_report();
+    let total_missing: usize = report.iter().map(|k| k.missing).sum();
+    let total_specs: usize = report.iter().map(|k| k.total).sum();
+    println!(
+        "cache build plan: {} kernels, {total_missing} / {total_specs} specs missing",
+        report.len()
+    );
+    for k in report.iter().filter(|k| k.missing > 0) {
+        println!("{k}");
+    }
+    // Called even at zero: it clears the collector and reports the no-op, and
+    // an early return here would leave the collector installed.
+    bridge
+        .issue_collected(total_missing)
+        .context("measuring the collected profiling work")?;
+    tracing::info!("cache build complete: profile.db populated");
     Ok(())
 }
 
@@ -243,27 +460,56 @@ fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
 /// how many of its specs are absent from `profile.db` (the JIT work a real cache
 /// build would do). Exits before the tick loop. JIT stays off so nothing is
 /// profiled — this is a read-only coverage probe.
-fn cmd_dry_run(config: &Path) -> anyhow::Result<()> {
+fn cmd_dry_run(config: &Path, report_json: Option<&Path>) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    let _flow = build_flow(&cfg, &bridge, store)?;
+    let flow = build_flow(&cfg, &bridge, store)?;
 
     let report = bridge.take_dry_run_report();
-    let total_missing: usize = report.iter().map(|k| k.missing).sum();
-    let total_specs: usize = report.iter().map(|k| k.total).sum();
     println!("dry run: {} kernels", report.len());
-    for k in &report {
-        println!(
-            "  {:<40} ({:<16}) {:>8} / {:<8} missing",
-            k.name, k.kind, k.missing, k.total
-        );
+    print_dry_run(&report);
+    if let Some(path) = report_json {
+        let mut document = dry_run_document(&report);
+        document["pools"] = serde_json::to_value(pool_bounds(&cfg)?)?;
+        document["kv_cache"] = simulator::log::kv_cache_document(&flow.cluster().borrow());
+        write_dry_run_report(path, &document)?;
     }
-    println!(
-        "total: {total_missing} / {total_specs} specs missing across {} kernels to JIT",
-        report.len()
-    );
+    Ok(())
+}
+
+/// `kv-cache` — build the flow structure only (no Python, `profile.db` or GPU)
+/// and print every KV pool's report (`raw/kv_cache.json`'s document with
+/// `--json`). Workers open their
+/// log streams at construction, which clears an earlier run's files, so the
+/// build logs into a scratch directory under `TMPDIR` instead of `log_dir`.
+fn cmd_kv_cache(config: &Path, json: bool) -> anyhow::Result<()> {
+    let mut cfg = load_config(config)?;
+    let scratch = std::env::temp_dir().join(format!("simulator-kv-cache-{}", std::process::id()));
+    cfg.io_mut().log_dir = scratch.clone();
+    // KV capacity needs the layout and the worker options, never a kernel time:
+    // build structure only, with no Python, profile.db or GPU.
+    let bridge = PerfApiBridge::structure_only();
+    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+    let printed = build_flow(&cfg, &bridge, store).map(|flow| {
+        let cluster = flow.cluster().borrow();
+        if json {
+            serde_json::to_string_pretty(&simulator::log::kv_cache_document(&cluster))
+                .expect("kv_cache document serializes")
+        } else {
+            simulator::log::kv_cache_text(&cluster)
+        }
+    });
+    if let Err(error) = std::fs::remove_dir_all(&scratch) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("removing {}: {error}", scratch.display());
+        }
+    }
+    print!("{}", printed?);
+    if json {
+        println!();
+    }
     Ok(())
 }
 

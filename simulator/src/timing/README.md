@@ -26,6 +26,9 @@ layers (L2 ops, L3 worklets, the cost-tree compile) consume these:
 - **Metric / coverage types:** `LeafMetrics`, `Metrics4`, `CoverageFlags`.
 - **cost_log capture:** `SlotInput`, `AttnPrefillLog`.
 - **Sweep grid:** `SweepGrid`, `Axis`, `Coords`, the `SweepCoords` trait + derive.
+- **Cache introspection:** `kernel-query eval` accepts physical Input JSON;
+  `eval_coords` evaluates declared cache coordinates directly for Analyzer grid
+  views, including ragged and re-axis kernels.
 - **The bridge:** `PerfApiBridge`, `BuildError`, `KernelMissing`.
 - **Derives:** `KernelConfig`, `SweepCoords` (re-exported under the trait names).
 
@@ -106,6 +109,8 @@ sweep.rs          SweepGrid + Axis presets (e.g. token_axis, a profiler↔sim
 cost_tree.rs      CostNode/FlatCostNode/CostTree/CostManifest + Evaluator +
                   aggregate(). The compile-once-eval-many structure.
 slot_input.rs     SlotInput: closed enum of leaf inputs, captured for cost_log.
+run_encoded.rs    serde `with` module: run-encodes per-row Vec<u32> input fields
+                  (ramps, caps, repeated blocks) so they stay small in cost_log.
 result.rs         Probe (typed per-leaf eval) + CacheProbe (dyn, JSON, for
                   the kernel-query introspection subcommand).
 routing.rs        RoutingDistribution: MoE expert ppm + Hamilton apportionment.
@@ -123,7 +128,7 @@ and, if its input reaches a leaf, one line in `slot_input.rs`. Full end-to-end
 procedure: skill `top-add-kernel`; the Rust timing/cache wiring alone is skill
 `impl-wire-kernel-to-rust`, and its cache-fidelity check is `impl-validate-kernel-cache`.
 
-Two optional `KernelSpec` hooks (default no-ops, but load-bearing when needed):
+Three optional `KernelSpec` hooks (default no-ops, but load-bearing when needed):
 
 - **`profile_kind()`** — the profiler facade / `profile.db` table the specs are
   profiled against (`get_{profile_kind}_times`); defaults to `KIND`. Override when
@@ -135,6 +140,16 @@ Two optional `KernelSpec` hooks (default no-ops, but load-bearing when needed):
   the cache drops + renormalizes instead of fabricating a value. `flashinfer_attn_prefill`
   is the shipped example: its `(A,B)` re-axis grid has an unreachable `A < B/2`
   corner that the mask strips.
+- **`off_grid()`** — how each backend answers an input past the profiled grid.
+  The default extends the cache's interpolant. `OffGrid::Bandwidth` holds the
+  nearest grid point's achieved bandwidth instead: the input's logical bytes,
+  counted as the backend's profiler counts them, over that point's own, for a
+  kernel whose bandwidth measured flat across its largest shapes.
+  `OffGrid::Launches` splits an input the kernel runs as independent sequential
+  launches and sums them. A missing grid point is never a
+  reason to reject a shape the production kernel runs. `dsa_sparse_mla_prefill`
+  (bandwidth) and `compressed_sparse_mla_prefill` (64-request launches, then
+  bandwidth) are the shipped examples.
 
 ## Cross-language identity (must stay equal)
 
@@ -172,3 +187,14 @@ The compose/aggregate machinery (`CostNode`, `FlatCostNode`, `CostTree`,
 profile mid-simulation. Only the `build-cache-only` entry point re-enables JIT.
 `enable_dry_run()` switches build to count-missing-only (no cache fit), feeding
 the launcher's `--cache-report`.
+
+## Kernel-config records
+
+profile.db rows carry the args of one grid cell, but not which config or which
+cell asked for them, and `enumerate` only runs forward. `enable_config_records()`
+makes `Kernel::build` record, in any bridge mode, each config it builds:
+`KernelConfig::identity` (every field but `gpu_name` and `backends`, with `Dim`
+values only), the GPU, the sweep grid with the args of each cell (without
+`backend`, which must be the only column that differs between a config's
+backends), the infeasible cells, and every `(pool, role)` that built it.
+`cost-trees --kernel-configs` gives each arch block's under `kernel_configs`.

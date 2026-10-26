@@ -28,6 +28,12 @@ impl PendingOrderPolicy for FifoOrder {
     }
 
     #[inline]
+    fn push_front(&mut self, candidate: AdmissionCandidate, _context: &mut Self::Context) {
+        self.queued_kv_tokens += candidate.queued_kv_tokens();
+        self.queue.push_front(candidate);
+    }
+
+    #[inline]
     fn peek(&self) -> Option<AdmissionCandidate> {
         self.queue.front().copied()
     }
@@ -88,6 +94,7 @@ mod tests {
             session_input: SessionInput::Standalone,
             conversation_start_time: Time::from_ms_u64(u64::from(request_id)),
             resident_prefix_tokens: 0,
+            retracted: false,
         }
     }
 

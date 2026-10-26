@@ -1,13 +1,13 @@
 ---
 name: top-align-with-framework
 description: >-
-  Align VibeSim to a real framework across kernel timing, GPU duty cycle, and TTFT/TPOT.
+  Align ServingStudio Sim to a real framework across kernel timing, GPU duty cycle, and TTFT/TPOT.
   Routes execution and fixes; does not run phases or edit code.
 ---
 
 # Top Align With Framework
 
-Top-level skill for **judging** whether VibeSim is well aligned to a real serving
+Top-level skill for **judging** whether ServingStudio Sim is well aligned to a real serving
 framework (vLLM or SGLang), from one measured alignment run. `operate-run-alignment`
 *produces* the comparison; this skill *interprets* it — what to compare, what a
 healthy gap looks like, and how to diagnose a bad one. You route and judge here;
@@ -32,9 +32,26 @@ diagnosing loose-level gaps first wastes effort:
 A clean tight level under a dirty loose level points at structure (scheduling,
 async), not the cost model.
 
+## Two ways you get called
+
+Usually you are the check on an existing arch: something looks off, and you find
+out what. But you are also the closing step of `top-add-new-arch`, which captures
+a real run *before* writing any code (its Phase 0) and builds the arch's kernels
+in measured-duration order. In that case the same capture comes back to you, and
+Check 1's per-kernel deviation ranking decides what happens next: the largest
+remaining gap names the `elementwise` placeholder that should be promoted to a
+real kernel. Nothing about the checks changes; where the fix goes does.
+
+For a newly built arch, read the two coverage findings as split verdicts rather
+than labeling misses. A large simulated slot with no measured kernel usually means
+an op was **folded** into a neighbor that does not actually fuse it. A large
+unmapped measured kernel usually means the split **missed an op** outright. Both
+route back to `top-split-model-into-kernels` to re-decide that op's home — after
+you have confirmed the labeling is right, per the guilty-until-proven rule below.
+
 ## Step 0 — Run the alignment
 
-Route to the **Align VibeSim to framework** side of `operate-run-alignment`. It produces the artifacts every
+Route to the **Align ServingStudio Sim to framework** side of `operate-run-alignment`. It produces the artifacts every
 check below reads: the per-iteration labeled kernel breakdown (measured duration
 vs simulated CostTree slot per mapped operation) plus the kernel-align pass's
 `recommended_gpu_time_multiplier` (in `alignment_iteration_report.json` meta), and
@@ -47,6 +64,12 @@ The tightest and most diagnostic check. Compare measured kernel duration against
 the simulated CostTree slot time per mapped operation, per iteration, on
 **kernel-only** time (pure compute, *before* the `gpu_time_multiplier` wall
 inflation).
+
+When the discrepant operation is one fused MoE kernel and the question is
+whether the error comes from isolated execution, compressed routing input, or
+full-run popularity aggregation, route the focused diagnosis through
+`operate-align-moe-kernel`. Keep that evidence separate from whole-model MoE
+attribution.
 
 **First, coverage — is a large chunk missing?** Before scoring deviations, scan
 for a big **measured** kernel with no simulated counterpart (an unmapped measured
@@ -72,6 +95,11 @@ Before scoring timing, require the same request population, prompt-token
 identity, successful execution, and explicit output-evidence provenance. This
 is an eligibility check, not a claim that simulator output establishes
 downstream task accuracy.
+
+Trace equivalence does not authorize replaying framework scheduler decisions as
+simulator policy. Reject alignments that force observed DP ranks, equal-shaped
+adjacent requests, or synthetic chunks to manufacture iteration agreement;
+report observed-conditioning experiments separately.
 
 For every material unmapped semantic family, make one explicit disposition:
 
@@ -108,10 +136,22 @@ modeled time deviates a lot from measured, and attribute it:
 Kernel-only sums exclude the inter-kernel gaps (launch overhead, sync, scheduling)
 that real wall time contains. The kernel-align pass derives the duty-cycle
 correction `recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ
-measured_ms` — the same per-occurrence `measured_ms` reduction the breakdown
-reports, so numerator and denominator are one consistent metric. Judge whether
-that correction is reasonable:
+measured_ms` — the same barrier critical path the breakdown reports, so
+numerator and denominator are one consistent metric. Judge whether that
+correction is reasonable:
 
+- multi-device evidence was reduced by the barrier model: each window between
+  collectives is won by its own busiest rank, so no single device is charged
+  for the whole iteration. Read the multiplier through the exact identities in
+  `operate-run-alignment` → "Measured time taxonomy":
+  `measured_gpu_cycle_ms = wall_ms + gap`, `wall_ms = measured_ms +
+  idle_internal_ms + idle_boundary_ms`, and `measured_ms = critical_busy_ms +
+  collective_ms`. A large multiplier then decomposes into idle inside
+  segments (launch bubbles), idle at barrier edges, or the gap between
+  iterations; `collective_skew_ms` is off the path and never part of it;
+- collective residency/wait remains timeline evidence rather than being counted
+  as CUDA kernel duration, and stream plots preserve reduced work totals even
+  when small streams are aggregated;
 - its inverse (the pooled kernel/GPU busy fraction) is plausible for the workload
   (a well-batched run spends most of the GPU cycle in kernels, so the multiplier
   is near 1; a large multiplier means big host bubbles that deserve an
@@ -152,6 +192,22 @@ percentages unresolved without a controlled A/B. Mixed-region occupancy is not
 attribution. Backend, scale strategy, and other numeric differences qualify the
 conclusion but do not prove a throughput cause.
 
+## Judging a result and choosing a fix
+
+- **Coverage first.** A result counts only for the deployment settings its
+  cases ran. If the pack covers one chunk size or one concurrency regime, report
+  the rest as unvalidated. `operate-run-alignment` lists what a pack must span.
+- **Prefer the simplest fix.** Before proposing a new mechanism, measure its
+  effect in the regime where it applies. If the effect is within
+  repeat-measurement noise, do not propose it.
+- **Never close a gap with a limit.** Do not cap batch size, tokens, or context,
+  and do not refuse a shape the framework runs. Model the path the framework
+  takes there.
+- **Report honestly.** Name a checked cause for every out-of-tolerance item.
+  Retract an earlier claim explicitly when new evidence contradicts it.
+
+The full rule list is in `top-add-new-arch` "Modeling rules".
+
 ## Delegation boundary
 
 You judge; you do not run or fix from here. Diagnose in the tight → loose order:
@@ -160,9 +216,14 @@ per-kernel/collective deviation + cause → duty-cycle ratio → iteration wall 
 TTFT/TPOT/throughput. Then route the fix:
 
 - rerun, resume, or re-label a capture → `operate-run-alignment`;
+- one fused MoE kernel with uncertain routing-input fidelity →
+  `operate-align-moe-kernel`;
 - a wrong-shape or missing kernel cost → `impl-validate-kernel-cache` /
   `top-add-kernel`;
-- a mis-mapped or missing simulated slot → `operate-run-alignment`'s labeling.
+- a mis-mapped or missing simulated slot → `operate-run-alignment`'s labeling;
+- an op the arch never modeled, or folded into a kernel that does not fuse it →
+  `top-split-model-into-kernels` to re-decide its home, then `top-add-new-arch`'s
+  L1 step to build it.
 
 Stop and return to the user when a deviation's cause is genuinely ambiguous
 (model gap vs thermal artifact) rather than guessing — the attribution decides

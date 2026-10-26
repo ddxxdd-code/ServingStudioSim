@@ -1,17 +1,15 @@
 //! `glm52_vllm_dsa_moe` — GLM-5.2 iter-wise architecture in **vLLM kernel
-//! granularity**, for VibeSim-vs-vLLM alignment.
+//! granularity**, for ServingStudioSim-vs-vLLM alignment.
 //!
-//! Structurally identical to [`super::glm52_dsa_moe`]: attention is TP1 and
-//! independently replicated over the EP ranks; decoder layers 0--2 execute the
-//! dense FFN and a full DSA indexer; layers 3--5 reuse the layer-2 index; layers
-//! 6--77 repeat a four-layer cadence containing one full-index layer and three
-//! IndexShare layers; shared-expert compute is conservatively serialized with
-//! routed-expert work.
+//! Attention is TP1 and independently replicated over the EP ranks. Decoder
+//! layers 0--2 execute the dense FFN and a full DSA indexer; layers 3--5 reuse
+//! the layer-2 index; layers 6--77 repeat a four-layer cadence containing one
+//! full-index layer and three IndexShare layers. Shared-expert compute is
+//! conservatively serialized with routed-expert work.
 //!
 //! Sparse-MoE communication is pure EP and is priced by the **profiled**
 //! flashinfer MNNVL all-to-all (`moe_alltoall`, plus `moe_alltoall_prepare` for
-//! the metadata pass), not by the simulated `p2p_intra`/`p2p_inter` byte model
-//! the native graph uses. That buys the real kernel's fan-out and contention.
+//! the metadata pass). That captures the real kernel's fan-out and contention.
 //!
 //! The transfer leaf is keyed by two row counts, `(max_send_rows,
 //! max_recv_rows)`, so both imbalances reach it: how the tokens are spread over
@@ -22,35 +20,27 @@
 //! whose key is the token count alone; a uniformly-drawn benchmark under-reads a
 //! real skewed layer there by ~9%, which is ~3% of the MoE communication budget.
 //!
-//! This is a **separate static graph**, not a flag on the native arch -- the same
-//! split Qwen uses (`qwen3_moe_dp_attn_ep_ffn` / `_fp8_` /
-//! `qwen3_vllm_moe_dp_attn_ep_ffn`). The two files diverge only in leaf
-//! granularity, and keeping them apart is what stops either graph from growing
-//! `if measuring_vllm` branches.
-//!
-//! Divergences from the native graph, each traced to measured evidence recorded
-//! in `doc/alignment/glm52_dp8_ep8_report.md`:
+//! The leaf boundaries follow measured evidence recorded in
+//! `doc/alignment/glm52_dp8_ep8_report.md`:
 //!   - **fp8 activation quantisation is an explicit leaf.** vLLM launches
 //!     `scale_1x128_kernel<bf16, fp8_e4m3, float>` before every dense fp8 GEMM
 //!     (411 launches/iteration, 0.758 ms/iteration = 1.9% of measured forward
-//!     kernel time). The native graph has no such leaf, because its L1 GEMM
-//!     runner quantises outside the timed closure
-//!     (`profiling/runners/gemm/deepgemm.py`) -- so the cost is simply absent
-//!     there, not folded in.
+//!     kernel time).
 //!
 //! The checkpoint identity (`Glm52ModelCfg`) and MTP identity (`Glm52MtpMode`)
-//! are shared with the native graph rather than re-parsed here: they describe the
-//! checkpoint, which does not change with the measurement viewpoint.
+//! are shared across GLM execution graphs because they describe the checkpoint,
+//! which does not change with the serving framework.
 //!
 //! The checkpoint advertises a 1,048,576-token context. The accepted L1 timing
-//! domain is deliberately capped at 131,072 tokens, as in the native graph.
+//! domain reaches that full context and fails closed beyond it.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::glm52_dsa_moe::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -106,6 +96,8 @@ const QK_NOPE_HEAD_DIM: u32 = 192;
 const ROPE_DIM: u32 = 64;
 const V_HEAD_DIM: u32 = 256;
 const MODEL_INDEX_HEADS: u32 = 32;
+/// vLLM launches the logits kernels unpadded at H32 (see the NVFP4 arch). This
+/// H200 arch stays at H64 until its H32 rows are profiled on an H200.
 const PROFILE_INDEX_HEADS: u32 = 64;
 const INDEX_HEAD_DIM: u32 = 128;
 const INDEX_TOP_K: u32 = 2_048;
@@ -146,10 +138,10 @@ const FP8_SINGLE_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 // dense leaves the routed curve over-predicted them ~2.05x at prefill.
 const DENSE_FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const ROUTED_FP8_QUANT_BACKENDS: &[&str] = &["flashinfer_trtllm"];
-const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
-const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
+const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb"];
+const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up"];
 const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
-const INDEX_LOGITS_BACKENDS: &[&str] = &["vllm_deepgemm_fp8"];
+const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["vllm_flashmla_bf16"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 // The MoE transfer does not vary with the expert dtype: vLLM defers activation
@@ -292,6 +284,7 @@ fn attention_config(
     VllmGlm52DsaAttnLocalWorkletConfig {
         fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
         include_indexer,
+        tp_size: 1,
         residual_rms_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
         rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
         single_gemm_backends: gemm_backends.to_vec(),
@@ -308,6 +301,7 @@ fn attention_config(
         sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
         sparse_mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
         sparse_elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        sparse_index_remap_backends: Vec::new(),
         gpu_name: parallel.gpu_name.clone(),
         hidden_dim: model.hidden_dim.clone(),
         num_attention_heads: model.num_attention_heads.clone(),
@@ -347,6 +341,10 @@ fn attention_config(
         sparse_index_distribution: "recent_contiguous".to_string(),
         sparse_cache_layout: "token_major_mqa_bf16_latent_rope".to_string(),
         sparse_mla_cache_format: "plain".to_string(),
+        sparse_attention_q_dtype: DType::Bf16,
+        sparse_attention_cache_dtype: DType::Bf16,
+        sparse_attention_output_dtype: DType::Bf16,
+        sparse_exact_varlen: None,
         decode_next_n: 1,
     }
 }
@@ -451,6 +449,11 @@ pub fn build_configs(
         gpu_name: gpu.clone(),
         hidden_dim: model.hidden_dim.clone(),
         vocab_size: model.vocab_size.clone(),
+        // This arch has no tensor parallelism: attention is TP1 and
+        // independently replicated over the EP ranks, so every rank holds the
+        // whole `ParallelLMHead` and runs it on its own token slice. That is
+        // why the main lm_head below is unsharded too.
+        tp_size: 1,
         dtype: DType::Bf16,
         gemm_dtype,
     });
@@ -506,6 +509,7 @@ pub fn build_configs(
             residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
             gemm_backends: gemm_backends.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            tp_size: 1,
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
             intermediate_dim: model.dense_intermediate_dim.clone(),
@@ -534,6 +538,8 @@ pub fn build_configs(
             norm_topk_prob: true,
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
+            include_router_input_cast: true,
+            include_router_select: true,
         },
         moe_dispatch_prepare: MoeAlltoallPrepareKernelConfig {
             backends: MOE_ALLTOALL_BACKENDS.to_vec(),
@@ -573,6 +579,7 @@ pub fn build_configs(
             gemm_backends: gemm_backends.to_vec(),
             fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            tp_size: 1,
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
             moe_intermediate_dim: model.moe_intermediate_dim.clone(),
@@ -1119,7 +1126,7 @@ pub struct Glm52VllmDsaMoeModel {
     pub nvl_num_gpu: u16,
     pub num_attn_dp_groups: u16,
     pub num_attn_shards: u16,
-    pub total_state_bytes_per_token: u64,
+    pub kv_cache_layout: KvCacheLayout,
     pub embedding: Op<ElementwiseKernel>,
     pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet,
     pub dense_ffn: VllmGlm52DenseFfnLocalWorklet,
@@ -1214,7 +1221,6 @@ pub fn build(
         }
     };
 
-    let total_state_bytes_per_token = state_bytes_per_token(mtp_mode)?;
     let fp8 = resolved.raw_cfg.moe_expert_compute[0].dtype == DType::Fp8E4m3;
     let mut model = Glm52VllmDsaMoeModel {
         name,
@@ -1223,7 +1229,7 @@ pub fn build(
         nvl_num_gpu,
         num_attn_dp_groups: ep_size,
         num_attn_shards: 1,
-        total_state_bytes_per_token,
+        kv_cache_layout: kv_cache_layout(mtp_mode),
         embedding,
         dense_full_index_attention,
         dense_ffn,
@@ -1433,8 +1439,12 @@ impl Glm52VllmDsaMoeModel {
 }
 
 impl IterwiseUnifiedModel for Glm52VllmDsaMoeModel {
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_state_bytes_per_token
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch, self.ep_size).map(|_| ())
+    }
+
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -1530,6 +1540,7 @@ impl NormalizedBatch {
                         VllmGlm52DsaAttnLocalDecodeInput {
                             batch_size: group.decode_tokens,
                             context_len,
+                            context_lens: None,
                             requires_padding: false,
                         }
                     }),
@@ -1632,6 +1643,7 @@ fn normalize_input(
                 decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
                     batch_size: decode_tokens,
                     context_len,
+                    context_lens: None,
                     requires_padding: false,
                 }),
             },
@@ -1790,26 +1802,27 @@ fn expected_slot_count(ep_size: u16, fp8: bool, mtp_mode: Glm52MtpMode) -> usize
     }
 }
 
-fn state_bytes_per_token(mtp_mode: Glm52MtpMode) -> std::result::Result<u64, BuildError> {
-    let main_mla = u64::from(NUM_LAYERS)
-        .checked_mul(u64::from(KV_LORA_RANK + ROPE_DIM))
-        .and_then(|value| value.checked_mul(u64::from(DType::Bf16.size_bytes())))
-        .ok_or_else(|| fit_failed("main MLA state bytes overflow u64"))?;
-    let index = u64::try_from(FULL_INDEX_LAYERS.len())
-        .expect("full-index count fits u64")
-        .checked_mul(u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes()))
-        .ok_or_else(|| fit_failed("index state bytes overflow u64"))?;
-    let main = main_mla
-        .checked_add(index)
-        .ok_or_else(|| fit_failed("main state bytes overflow u64"))?;
-    let mtp_mla = u64::from(KV_LORA_RANK + ROPE_DIM)
-        .checked_mul(u64::from(DType::Bf16.size_bytes()))
-        .ok_or_else(|| fit_failed("MTP MLA state bytes overflow u64"))?;
-    Ok(match mtp_mode {
-        Glm52MtpMode::Off => main,
-        Glm52MtpMode::FullIndex => main + mtp_mla + u64::from(INDEX_HEAD_DIM + 4),
-        Glm52MtpMode::IndexShare => main + mtp_mla,
-    })
+/// One rank's cache: a BF16 (kv_lora_rank + rope_dim) latent in every layer,
+/// and an FP8 index key plus FP32 scale in the full-index layers. The MTP layer
+/// adds its latent and its key: vLLM always builds the MTP layer's indexer,
+/// even when later draft steps share its index.
+fn kv_cache_layout(mtp_mode: Glm52MtpMode) -> KvCacheLayout {
+    let full_index_layers = FULL_INDEX_LAYERS.len() as u64;
+    let (mtp_mla, mtp_index) = match mtp_mode {
+        Glm52MtpMode::Off => (0, 0),
+        Glm52MtpMode::FullIndex | Glm52MtpMode::IndexShare => (1, 1),
+    };
+    let mla_layer_bytes = u64::from(KV_LORA_RANK + ROPE_DIM) * u64::from(DType::Bf16.size_bytes());
+    let index_layer_bytes = u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes());
+    KvCacheLayout::new()
+        .with_part(KvCachePart::per_token(
+            "mla",
+            (u64::from(NUM_LAYERS) + mtp_mla) * mla_layer_bytes,
+        ))
+        .with_part(KvCachePart::per_token(
+            "indexer",
+            (full_index_layers + mtp_index) * index_layer_bytes,
+        ))
 }
 
 #[cfg(test)]
@@ -1924,7 +1937,7 @@ mod tests {
     }
 
     fn model() -> Glm52ModelCfg {
-        crate::arch::glm52_dsa_moe::parse_model_json(&exact_json_value().to_string()).unwrap()
+        crate::arch::glm52_model_cfg::parse_model_json(&exact_json_value().to_string()).unwrap()
     }
 
     fn parallel(ep_size: u16) -> Glm52VllmDsaMoeParallel {
@@ -2021,11 +2034,11 @@ mod tests {
         assert_eq!(cfg.dense_full_index_attention.gemm_dtype, DType::Bf16);
         assert_eq!(
             cfg.dense_full_index_attention.q_absorb_backends,
-            vec!["torch_mla_q_absorb_glm52"]
+            vec!["torch_mla_q_absorb"]
         );
         assert_eq!(
             cfg.dense_full_index_attention.v_up_backends,
-            vec!["torch_mla_v_up_glm52"]
+            vec!["torch_mla_v_up"]
         );
         assert_eq!(
             cfg.dense_full_index_attention.sparse_attention_backends,
@@ -2033,7 +2046,7 @@ mod tests {
         );
         assert_eq!(
             cfg.dense_full_index_attention.index_prefill_logits_backends,
-            vec!["vllm_deepgemm_fp8"]
+            vec!["deepgemm_fp8"]
         );
         assert_eq!(cfg.moe_expert_compute[0].dtype, DType::Bf16);
         assert_eq!(
@@ -2128,11 +2141,8 @@ mod tests {
             assert_eq!(attention.indexer_gemm_backends, vec!["deepgemm"]);
             assert_eq!(attention.gemm_dtype, DType::Fp8E4m3);
             assert_eq!(attention.base_dtype, DType::Bf16);
-            assert_eq!(
-                attention.q_absorb_backends,
-                vec!["torch_mla_q_absorb_glm52"]
-            );
-            assert_eq!(attention.v_up_backends, vec!["torch_mla_v_up_glm52"]);
+            assert_eq!(attention.q_absorb_backends, vec!["torch_mla_q_absorb"]);
+            assert_eq!(attention.v_up_backends, vec!["torch_mla_v_up"]);
         }
 
         let resolved = resolve_configs(&cfg);
@@ -2352,8 +2362,8 @@ mod tests {
         // measured kernel templates do:
         //   22 per EP rank -- this graph's new dense-GEMM quants (the 411
         //      `scale_1x128<bf16, fp8_e4m3, float>` launches);
-        //    6 per EP rank -- the routed grouped-GEMM quants the native graph
-        //      already models (the 150 `scale_1x128<(bool)0, ...>` launches),
+        //    6 per EP rank -- the routed grouped-GEMM quants already present in
+        //      the base FP8 graph (the 150 `scale_1x128<(bool)0, ...>` launches),
         //      contributed by `expert_slots` in the three sparse variants.
         let dense_gemm_quants_per_rank = dense + sparse_full + sparse_share + sparse_share;
         let routed_quants_per_rank = 3 * 2;
@@ -2373,11 +2383,9 @@ mod tests {
         assert_eq!(3 + 3 + 18 * (1 + 3), 78);
         assert_eq!(FULL_INDEX_LAYERS.len(), 21);
         assert_eq!(78 - FULL_INDEX_LAYERS.len(), 57);
-        // BF16 counts match the native graph exactly: with no FP8 GEMM there
-        // is nothing to quantise, so this graph adds no leaves.
-        // Each sparse-layer variant carries two leaves the native graph has no
-        // equivalent of: combine's zero fill and its top-k reduction, split out
-        // of the profiled transfer so that leaf's cache stays two-dimensional.
+        // With no FP8 GEMM there is nothing to quantise. Each sparse-layer
+        // variant additionally carries combine's zero fill and top-k reduction,
+        // split out so the profiled transfer cache stays two-dimensional.
         // Three sparse variants without MTP, four with it.
         assert_eq!(
             expected_slot_count(8, false, Glm52MtpMode::Off),
@@ -2394,8 +2402,8 @@ mod tests {
         // FP8 adds the vLLM activation-quantisation leaves: five per layer
         // variant (attention 3 + FFN 2), plus a sixth on the two variants that
         // run an indexer (its q_proj). That is 22 x ep = 176 more than the
-        // native graph's 1_074. See `doc/alignment/glm52_dp8_ep8_report.md`
-        // section 4.3, which decodes each measured launch by its GEMM shape.
+        // 1,074-leaf base census. See `doc/alignment/glm52_dp8_ep8_report.md`
+        // section 4.3, which identifies each measured launch by its GEMM shape.
         assert_eq!(
             expected_slot_count(8, true, Glm52MtpMode::Off),
             1_074 + 176 + 15 + 3 * 2
@@ -2556,7 +2564,7 @@ mod tests {
 
     #[test]
     fn production_l4_uses_only_the_labeled_max_constructor() {
-        let production = include_str!("glm52_dsa_moe.rs")
+        let production = include_str!("glm52_vllm_dsa_moe.rs")
             .split("#[cfg(test)]")
             .next()
             .expect("production source precedes tests");
@@ -2633,15 +2641,10 @@ mod tests {
 
     #[test]
     fn state_and_topology_contracts_are_exact() {
-        assert_eq!(state_bytes_per_token(Glm52MtpMode::Off).unwrap(), 92_628);
-        assert_eq!(
-            state_bytes_per_token(Glm52MtpMode::FullIndex).unwrap(),
-            93_912
-        );
-        assert_eq!(
-            state_bytes_per_token(Glm52MtpMode::IndexShare).unwrap(),
-            93_780
-        );
+        let bytes = |mode| kv_cache_layout(mode).per_token_bytes();
+        assert_eq!(bytes(Glm52MtpMode::Off), 92_628);
+        assert_eq!(bytes(Glm52MtpMode::FullIndex), 93_912);
+        assert_eq!(bytes(Glm52MtpMode::IndexShare), 93_912);
         assert_eq!(u32::from(parallel(8).ep_size), 8);
     }
 

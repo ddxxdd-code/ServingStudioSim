@@ -1,4 +1,4 @@
-# VibeSim Profiling (L1)
+# ServingStudio Sim Profiling (L1)
 
 The **L1 cost layer**: the source of truth for "how long does one kernel take on
 one GPU". The Rust simulator never measures a kernel itself — it asks this Python
@@ -48,11 +48,63 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
 **Required from below** (only paid when an actual measurement happens):
 
 - One or more **idle GPUs** (`exec/local.py:find_idle_gpus` reads `nvidia-smi`).
+  Host workers receive those indices through `CUDA_VISIBLE_DEVICES`; container
+  workers receive **UUIDs** (`exec/local.py:gpu_uuids_for_indices`). The index is
+  only meaningful in the device view the process that read it could see, and the
+  container runtime has a different one — under a device cgroup (Slurm's
+  `ConstrainDevices`) the allocated card enumerates here as index 0 while
+  `dockerd`, outside the cgroup, resolves `--gpus device=0` to the host's first
+  card. Passing the index across silently profiles GPU 0 instead: concurrent
+  workers pile onto one card, and the idle check that cleared the allocated card
+  never sees it. Resolution raises rather than falling back to the index.
 - The **backend's runtime libraries** — torch, FlashInfer, Triton, NCCL/NVSHMEM —
   available in the selected subprocess interpreter. These are imported **lazily
   inside the worker subprocess**, never in the simulator/main process.
 - The `profilers/` timing primitives (`Timer.cupti`, `Energy.perf`, the CUPTI
   C++ extension).
+
+Every profile env runs its workers in an image
+(`profiling/container/images.py`, `profiling/container/README.md`): build them
+with `just profile-container-build`, and a worker whose image is missing fails
+with the command that builds it. The CUDA 13 images also run on an older
+datacenter driver: the CUDA base image carries the forward-compatibility
+libraries (`/usr/local/cuda/compat`), which the NVIDIA container runtime uses
+when the host driver predates the image's CUDA (seen on driver 570, CUDA 12.8).
+
+`VIBESIM_PROFILE_RUNTIME=host` runs each env on the host interpreter its
+registry entry names instead, for debugging against a local build. Those rows
+carry the same DB key as the image's, so compare them against the image before
+keeping them. The host setups follow.
+
+`vllm_env` on the host is the alignment checkout `alignment/profiler/vllm` (or
+`$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`, built as
+`alignment/profiler/README.md` describes. The worker drops inherited
+site-packages from `PYTHONPATH`, so the project Torch cannot shadow the venv's
+own build.
+
+`flashinfer_kda_env` on the host is a venv at `~/profile_envs/flashinfer_kda` (or a
+symlink to it) for the `kda_chunk_prefill` `flashinfer_*` backends. FlashInfer's
+Blackwell KDA prefill kernels are only on its main branch, and they need Torch
+cu130, CuTe DSL >= 4.7 and a CUDA-enabled TVM with TIRx, so neither the project
+venv nor `vllm_env` can host them. `profiling/exec/flashinfer_kda_env.sh [DIR]`
+builds it from a pinned, hash-checked FlashInfer nightly. TIRx compiles its
+kernels with the CUDA 13 `nvcc` on `CUDA_PATH`/`PATH`; FlashInfer's JIT cache
+follows `FLASHINFER_WORKSPACE_BASE` (default `$HOME`).
+
+`causal_conv1d_env` serves the `gdn_causal_conv_prefill` `dao_channellast`
+backend. It runs the project interpreter with one extra import directory,
+`~/profile_envs/causal_conv1d` (a symlink to a disk with room is fine), that
+holds Dao-AILab `causal-conv1d` 1.7.0 from its prebuilt release wheel. The
+wheel is built against the project Torch (2.10, CUDA 12, cxx11 ABI) and ships
+SASS for sm_75 through sm_120, so it needs no venv or compiler. After a project
+Torch upgrade, install the wheel built for the new Torch instead:
+
+```bash
+uv pip install --python .venv/bin/python --no-deps --target ~/profile_envs/causal_conv1d \
+  https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+```
+
+Rows record `causal-conv1d <version>` as `backend_version`.
 
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
@@ -63,7 +115,10 @@ active-time estimate requests more launches. The default cap is 50,000 launches.
 By default, both passes run a
 read-only reduction over a 64 MiB (or
 `2 × reported L2`, whichever is larger) FP32 tensor before every logical
-callable launch. The reduction's CUPTI records validate ordering but are
+callable launch. Before 2026-09-25 the L2 size was read from a misspelled
+Torch attribute and always fell back to 64 MiB, so rows profiled earlier on a
+GPU with more than 32 MiB of L2 (H100, H200, B200) carry a warm-cache bias;
+refill such rows with `--force` before trusting small-kernel timings. The reduction's CUPTI records validate ordering but are
 excluded from the callable time. This clean-line displacement avoids the dirty
 writeback artifact of memset/`zero_()`; it remains a cold-ish preconditioner,
 not a hardware invalidate. `Timer.cupti(clear_l2=False)` is the explicit
@@ -72,6 +127,15 @@ is intentional: periodic CUPTI restart gaps materially change the power/clock
 state of sustained GEMMs. Fixed `rep` remains the explicit median-of-three
 escape hatch. This is distinct from `Energy.perf`'s 500 ms minimum
 wall-clock/NVML window.
+
+That energy window is **off unless asked for** — `VIBESIM_PROFILE_ENERGY=1`, or
+`--energy` on `python -m profiling run` / `measure`, or the launcher's
+`energy: true`. It is a second measurement loop per spec and the largest single
+cost in a cache fill, while nothing in the timing path reads `energy_j`. Rows
+measured without it record `energy_j = 0.0`, which means "not measured"
+everywhere in this codebase; see `launcher/README.md` for the `energy:` key and
+the `VIBESIM_REQUIRE_ENERGY` guard that stops such a row reaching a run that
+asked for energy.
 
 ## First-class Analyzer resources
 
@@ -129,7 +193,9 @@ kernels/           One file per kernel kind. Each declares KIND + <Kind>Args and
 runners/           L1a measurement. Subpackage per op family (gemm, attention,
   metrics.py         comm, norm, elementwise, idle). Return ComputeMetrics or
   exceptions.py      CommMetrics. Typed failures (OOMError, KernelLaunchFailed,
-                     ProfilerNotImplemented) are understood by L1b.
+  device.py          ProfilerNotImplemented) are understood by L1b. device.py
+                     holds the shared device checks, including the worker's
+                     BackendSupport gate.
 
 profilers/         Low-level timing/energy primitives used by runners
                    (Timer.cupti, Energy.perf, CUPTI kernel profiler + C++ ext).
@@ -149,8 +215,9 @@ artifacts.py       Immutable per-job snapshots: request/results/curve/job.meta.j
 gpu_catalog.py     Read-only gpu/spec.json resolution (exact case-insensitive
                    name/aliases → canonical SKU); used to fail a measured job
                    whose requested cache key vs observed physical GPU mismatch, and
-                   to stamp resolved canonical names into metadata. NOT on the
-                   timing path.
+                   to stamp resolved canonical names into metadata, and to
+                   resolve a GPU's compute capability for BackendSupport. Kernel
+                   times never come from it.
 
 exec/              How a runner actually runs. GpuPool/GpuChunk contracts,
   pool.py            LocalGpuPool (spawns a worker subprocess per chunk),
@@ -167,10 +234,19 @@ Everything flows through `perf_api`. There are exactly two internal paths.
 
 1. Resolve `gpu_name` (explicit arg, else auto-detect via torch).
 2. `find_kernel_profiler_spec(kind, backend)` → `Table(spec, DB_PATH).query(...)`.
+
+Set `VIBESIM_PROFILE_DB` to an absolute path to isolate a simulation or
+timing-predict run's profile database, including its demand-driven JIT writes.
+The default remains `profiling/profile.db`; an explicit kernel-profile `--db`
+overrides the environment selection. Preserve source databases when reproducing
+historical results and record the selected database with the experiment.
 3. Hits return `Metrics`; misses return `MissingEntry`.
 4. If there are misses **and** JIT is enabled, call `run_profile_batch` to fill
    them, then re-query. With `force=True`, skip the first query and re-profile
-   every spec. `count_missing` uses `Table.exists` and **never** profiles.
+   every spec. `force=True, persist=False` (the CLI's `--fresh`) re-profiles the
+   same way but passes `db_path=None` down to the batch, so nothing is inserted
+   and the freshly measured `Metrics` are returned directly instead of re-read.
+   `count_missing` uses `Table.exists` and **never** profiles.
 
 **Profile path — `run_profile_batch`** (`db/batch.py`), the single runner funnel:
 
@@ -182,12 +258,19 @@ Everything flows through `perf_api`. There are exactly two internal paths.
 4. `LocalGpuChunk.run` writes the chunk payload to a temp JSON, sets
    `CUDA_VISIBLE_DEVICES`, applies the selected `ProfileEnv`'s ordered Python
    and shared-library paths, and spawns `python -m profiling.exec.local_worker`
-   in that environment. The worker lazy-loads the registered runner via
-   `RunnerRef`, executes each spec, and writes JSON results back.
+   in that environment. The worker first checks the real device: every backend
+   needs CUDA, and a backend's declared `BackendSupport` device rule must hold
+   (`runners/device.py`). When either fails it refuses every spec of the chunk
+   without loading the runner; runners repeat neither check and keep only
+   shape-dependent ones.
+   Otherwise it lazy-loads the registered runner via `RunnerRef`, executes each
+   spec, and writes JSON results back.
 5. Require every successful worker result to report its observed physical GPU,
    validate all observations against the requested cache key, then persist the
-   rows through `Table.insert`. Cached-only provenance is produced only by a DB
-   hit for which no worker ran.
+   rows through `Table.insert`. Failed specs retain their worker error in one
+   grouped log per backend (warning for a partial batch, error when all specs
+   fail), rather than resurfacing later as anonymous cache misses. With no
+   successful worker observation, returned provenance remains cache-key-only.
 
 The main/simulator process therefore **never imports torch or a runner**: the
 registry holds lazy `RunnerRef`s, and the heavy import only happens in the worker
@@ -220,15 +303,40 @@ schema and are passed as separate kwargs / DB columns.
 
 ## DB shape
 
-One table per args schema, keyed `UNIQUE(gpu_name, backend, <args...>)`. Re-profiling
-the same key overwrites the measurement + provenance columns (and clears the
-outlier flag); key columns are never updated. Metric columns are a table-level
-contract chosen by `metric_family`:
+One table per args schema, keyed `UNIQUE(gpu_name, backend, args_hash)`: `args_hash`
+is an 8-byte hash of the args columns as SQLite stores them, and the args stay in
+their own columns. Re-profiling the same key overwrites the measurement +
+provenance columns (and clears the outlier flag); key columns are never updated.
+Metric columns are a table-level contract chosen by `metric_family`:
 
 - **compute** → `time_ms, tflops, memory_bandwidth_gbps, energy_j`
 - **comm** → `time_ms, algbw_gbps, busbw_gbps, energy_j`
   (`message_size_bytes` is an **args/cache-key** column, not a measured result —
   the simulator derives moved bytes from `busbw × time`.)
+
+profile.db is tracked in git, so it stores each repeated value once (schema v3,
+`profiling/db/storage.py`). A row's provenance — profiler git hash, CUDA, driver
+and backend versions — is a `run_key` into `_profile_run`; `profiler_run_at` and
+`created_at` are epoch seconds. Readers still get the v2 columns: `Table.rows_for`
+and `storage.logical_select(conn, table)` join the run and render the timestamps.
+Ad-hoc SQL does the same:
+
+```sql
+SELECT t.*, r.profiler_git_hash, datetime(t.profiler_run_at, 'unixepoch')
+FROM single_gemm t JOIN _profile_run r USING (run_key)
+```
+
+An args field added to a kind that already has rows is declared with
+`optional_arg(same_as=...)` (`profiling/db/doc.py`), last in its schema: unset
+(or equal to `same_as`) it is stored NULL and left out of `args_hash`, so
+existing rows keep their keys and no migration runs. The table gains the
+nullable column, appended, only when a row first sets it; readers of a table
+without it treat it as unset, and `merge-db` merges a table with it and one
+without. Example: `kv_cache_append.head_dim_v` (`same_as="head_dim"`).
+
+A DB an older checkout wrote (schema v2) is refused by readers until
+`python -m launcher kernel-profile migrate-db <path>` upgrades it in place; the
+upgrade keeps every row and id and then VACUUMs the file.
 
 ## Adding a kernel
 
@@ -245,19 +353,61 @@ side): skill `top-add-kernel`; the Python registration alone is skill
 
 ## CLI
 
-`python -m profiling` is a thin wrapper over the `perf_api` facades (it never
-calls runners or `run_profile_batch` directly):
+The supported operator surface is `python -m launcher kernel-profile`. Its
+profiling commands remain thin wrappers over the `perf_api` facades and never
+call runners or `run_profile_batch` directly:
 
 ```
-python -m profiling list [--json]
-python -m profiling query         <table> --backend <b> [--spec '{...}'] [--specs file] [--gpu-name N] [--db path]
-python -m profiling count-missing <table> --backend <b> ...
-python -m profiling run           <table> --backend <b> [--force] ...    # JIT-fills (or force-refreshes) then reports
-python -m profiling measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2]
+python -m launcher kernel-profile list [--json]
+python -m launcher kernel-profile query         <table> --backend <b> [--spec '{...}'] [--specs file] [--gpu-name N] [--db path]
+python -m launcher kernel-profile count-missing <table> --backend <b> ...
+python -m launcher kernel-profile run           <table> --backend <b> [--force | --fresh] ...
+python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--cuda-graph]
+python -m launcher kernel-profile merge-db LEFT.db RIGHT.db --output MERGED.db [--report REPORT.json]
+python -m launcher kernel-profile migrate-db profile.db
+python -m launcher kernel-profile audit-provenance [--db profile.db] [--json]
 ```
 
 `run` enables JIT for the call (or uses `force=True`), so it is the one CLI verb
 that can launch real GPU work; `query`/`count-missing` are read-only.
+`python -m profiling` remains a developer-compatible alias for these subcommands.
+
+`--force` and `--fresh` both measure every requested spec and differ only in
+whether the rows are kept: `--force` inserts them, `--fresh` inserts nothing and
+reports the measurement it just took. Reach for `--fresh` to look at a kernel's
+numbers — a quick re-measure, a what-if on timing knobs, an off-grid probe —
+without moving the shared cache; nothing downstream can then read that number as
+if it were cached evidence. Because nothing is written, `--fresh` has no row to
+re-query, so its results come straight from the batch, and its reported
+`missing_count` counts the specs whose runner failed in *this* run rather than
+the rows still absent from the DB. Its `--output-dir` snapshot is a normal
+first-class Analyzer resource, recorded with `mode: fresh`. `--fresh` remains a
+cache operation in spirit (ordinary `Metrics` for a whole spec batch); `measure`
+is the separate cache-free *diagnostic* for one spec's per-launch trend and NVML
+telemetry.
+
+`merge-db` reads both inputs without modifying them. It copies rows and whole
+tables found on only one side and deduplicates rows whose declared
+`UNIQUE(gpu_name, backend, args_hash)` identity and payload agree. The
+`_profile_run` lookup table merges the same way on its content-hash `run_key`;
+rows reference it by that key, never by `id`, so nothing is remapped. Both
+inputs must be at this checkout's schema (run `migrate-db` on an older one
+first). If the same
+identity has different measurement, provenance, or outlier state, no output DB
+is published: the command returns `1` and writes both versions to
+`<output>.merge-report.json` for explicit resolution. Surrogate `id` and
+insertion-only `created_at` do not create conflicts. Existing outputs are never
+overwritten, and there is deliberately no broad `--force` policy.
+
+New measurements stamp a bare profiler commit only when `profiling/` is clean;
+staged, unstaged, or untracked profiler code produces `<sha>-dirty` instead.
+`audit-provenance` conservatively checks historical rows against the kernel
+registrations present at their stamped commit. It is always read-only: arbitrary
+Python imports/helpers can register backends as side effects, so static absence
+is a diagnostic candidate rather than proof that is safe to write back. Foreign
+commits and missing, unparseable, or indirect/dynamic historical registrations
+remain explicitly unverifiable. The source-side dirty stamp prevents new rows
+from repeating the historical problem.
 
 Artifact-producing `run --output-dir` and `measure --output-dir` publish
 `artifact.meta.json` as `kernel_profile` and `kernel_measurement`, respectively,
@@ -274,11 +424,18 @@ first `[32,64]` segment. Other token-shaped kernels retain the shared axis.
 CUPTI-timed compute spec it runs a sustained ~`duration_s` capture in a single
 CUPTI window, records **every** per-launch kernel duration, samples NVML telemetry
 (power / SM-clock / mem-clock / util / temp / throttle) on a background thread, and
-writes `runtimes.csv`, `telemetry.csv`, `summary.json`, `runtime_trend.png`, and
-`runtime_telemetry.png` into `--output-dir`. It reaches the kernel's callable
+writes `runtimes.csv`, `telemetry.csv`, and `summary.json` into `--output-dir`.
+When matplotlib is installed in the selected profiling environment it also
+writes `runtime_trend.png` and `runtime_telemetry.png`; otherwise the summary
+records each plot as skipped without invalidating the CUPTI/NVML measurement.
+It reaches the kernel's callable
 through the shared `Timer.cupti` seam via a process-wide `MeasureContext` set only
 for this verb (see `profilers/measure_context.py`, `profilers/trend.py`) — **no
 runner changes**, and the guard is inert for every other call. `--no-clear-l2`
 switches from the default cold per-launch L2-displacement (matching the `profile.db`
 measurement) to a warm continuous window that surfaces sustained power/clock drift.
+`--cuda-graph` replays the kernel from a CUDA graph so host dispatch leaves no gap
+between launches; with `--no-clear-l2` the GPU then runs it back to back, as a
+graph-captured serving step does, and settles at its power-limited clock
+(`gpu/measure_sustained.py` uses this for the `sustained` rates in `gpu/spec.json`).
 Kernels whose runner does not time through `Timer.cupti` (e.g. comm) are rejected.

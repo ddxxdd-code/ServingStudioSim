@@ -23,6 +23,8 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 
 _BACKEND = "torch"
 _VLLM_BACKEND = "vllm_cuda"
+_SGLANG_BACKEND = "sglang_cuda"
+_DEEP_SELECT_BACKEND = "deep_select"
 _BASE_SPEC = {
     "num_queries": 128,
     "num_keys": 8192,
@@ -33,6 +35,33 @@ _BASE_SPEC = {
     "index_dtype": "int32",
     "span_mode": "single_causal_tail",
 }
+
+
+def test_sglang_public_wrapper_receives_the_serving_arguments() -> None:
+    from profiling.runners.attention.dsa_topk_prefill import _launch_sglang_topk
+
+    recorded = {}
+
+    def callable_(**kwargs):
+        recorded.update(kwargs)
+        return "output"
+
+    operands = SimpleNamespace(logits="logits", row_starts="row_starts")
+    extras = SimpleNamespace(
+        lengths="lengths",
+        src_page_table="page_table",
+        cu_seqlens_q="cu_seqlens_q",
+    )
+
+    assert _launch_sglang_topk(callable_, operands, extras, top_k=2048) == "output"
+    assert recorded == {
+        "score": "logits",
+        "lengths": "lengths",
+        "page_table_size_1": "page_table",
+        "cu_seqlens_q": "cu_seqlens_q",
+        "topk": 2048,
+        "row_starts": "row_starts",
+    }
 
 
 def test_args_field_order_and_dtype_coercion() -> None:
@@ -63,7 +92,7 @@ def test_registration_support_and_facades() -> None:
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_topk_prefill"
-    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND, _DEEP_SELECT_BACKEND, _SGLANG_BACKEND]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaTopkPrefillArgs
     assert spec.metric_family is MetricFamily.COMPUTE
@@ -72,7 +101,8 @@ def test_registration_support_and_facades() -> None:
     assert spec.supports.kv is None
     assert spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert spec.runner_ref.module_name == ("profiling.runners.attention.dsa_topk_prefill")
     assert spec.runner_ref.function_name == "profile_dsa_topk_prefill_torch"
     assert hasattr(perf_api, "get_dsa_topk_prefill_times")
@@ -93,12 +123,84 @@ def test_vllm_registration_reuses_schema_table_family_support_and_facades() -> N
     assert vllm_spec.subprocess_env == "vllm_env"
     assert vllm_spec.supports.kv is None
     assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
+    assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert not vllm_spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-    assert not vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
     assert vllm_spec.runner_ref.module_name == ("profiling.runners.attention.dsa_topk_prefill")
     assert vllm_spec.runner_ref.function_name == ("profile_dsa_topk_prefill_vllm_cuda")
     assert hasattr(perf_api, "get_dsa_topk_prefill_times")
     assert hasattr(perf_api, "count_missing_dsa_topk_prefill")
+
+
+def test_deep_select_runs_in_the_vllm_env_on_sm10x_only() -> None:
+    spec = find_kernel_profiler_spec(KIND, _DEEP_SELECT_BACKEND)
+
+    assert spec.args_schema is DsaTopkPrefillArgs
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
+    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
+    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
+    assert spec.runner_ref.function_name == "profile_dsa_topk_prefill_deep_select"
+
+
+def test_deep_select_rejects_out_of_contract_shapes_before_loading(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_topk_prefill as runner
+
+    def fail_if_loaded():
+        raise AssertionError("DeepSelect must not load for an invalid spec")
+
+    monkeypatch.setattr(runner, "_load_deep_select_backend", fail_if_loaded)
+    with pytest.raises(ValueError, match="top_k <= 4096"):
+        runner.profile_dsa_topk_prefill_deep_select(**(_BASE_SPEC | {"top_k": 4097}))
+
+
+def test_deep_select_forwards_vllm_wrapper_arguments(monkeypatch) -> None:
+    """Catches a positional slip in the 13-argument op (vLLM's deep_select_topk)."""
+    from profiling.runners.attention import dsa_topk_prefill as runner
+
+    operands = runner._build_operands(
+        torch, num_queries=4, num_keys=16, top_k=3, logits_row_stride=256, device="cpu"
+    )
+    calls = []
+    runner._launch_deep_select(lambda *args: calls.append(args), operands, top_k=3)
+
+    (args,) = calls
+    assert args[0] is operands.logits
+    assert args[1] == 3
+    assert args[2] is None  # no row starts
+    assert args[3] is operands.row_ends
+    assert args[7] is operands.out
+    assert args[8] is None
+    assert args[9] == -1
+    assert len(args) == 13
+
+
+def test_deep_select_output_rows_meet_the_store_alignment() -> None:
+    from profiling.runners.attention.dsa_topk_prefill import _deep_select_output
+
+    out = _deep_select_output(torch, num_queries=5, top_k=13, output_align=32, device="cpu")
+    assert out.shape == (5, 13)
+    assert out.stride(0) * 4 % 32 == 0
+
+
+def test_selection_check_accepts_exact_and_rejects_wrong_top_k() -> None:
+    from profiling.runners.attention.dsa_topk_prefill import (
+        _build_operands,
+        _check_selection,
+        _torch_composite,
+    )
+
+    operands = _build_operands(
+        torch, num_queries=8, num_keys=40, top_k=4, logits_row_stride=48, device="cpu"
+    )
+    _torch_composite(operands)
+    _check_selection(torch, operands, top_k=4)
+
+    last = operands.out.shape[0] - 1
+    weakest = torch.argsort(operands.logits[last, :40])[:4].to(torch.int32)
+    operands.out[last].copy_(weakest)
+    with pytest.raises(KernelLaunchFailed, match="exact top-4"):
+        _check_selection(torch, operands, top_k=4)
 
 
 def test_registry_barrel_import_is_lazy() -> None:
@@ -157,7 +259,7 @@ def test_runner_ref_resolves_without_importing_torch() -> None:
         ({"num_keys": 0}, "must be > 0"),
         ({"num_queries": 129, "num_keys": 128}, "must be <= num_keys"),
         ({"num_sequences": 2}, "num_sequences=1"),
-        ({"top_k": 1024}, "top_k=2048"),
+        ({"top_k": 0}, "top_k > 0"),
         ({"logits_row_stride": 0}, "positive and >= num_keys"),
         ({"logits_row_stride": 4095}, "positive and >= num_keys"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
@@ -182,42 +284,23 @@ def test_explicit_unpadded_and_padded_strides_are_valid() -> None:
         assert validated[4] == stride
 
 
-def test_rejects_missing_cuda_and_unverified_gpu() -> None:
-    from profiling.runners.attention.dsa_topk_prefill import _validate_cuda_device
+@pytest.mark.parametrize("top_k", [256, 512, 1024, 2048, 4096])
+def test_runtime_top_k_backends_accept_any_positive_width(top_k) -> None:
+    from profiling.runners.attention.dsa_topk_prefill import _validate_args, _validate_vllm_args
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_cuda_device(h100)
+    assert _validate_args(**(_BASE_SPEC | {"top_k": top_k}))[3] == top_k
+    assert _validate_vllm_args(**(_BASE_SPEC | {"top_k": top_k}))[3] == top_k
 
 
-def test_vllm_rejects_missing_cuda_and_unverified_gpu() -> None:
-    from profiling.runners.attention.dsa_topk_prefill import (
-        _validate_vllm_cuda_device,
-    )
+def test_sglang_keeps_its_compiled_2048_width(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_topk_prefill as runner
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_vllm_cuda_device(no_cuda)
+    def fail_if_loaded():
+        raise AssertionError("SGLang loader must not run")
 
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_vllm_cuda_device(h100)
+    monkeypatch.setattr(runner, "_load_sglang_cuda_backend", fail_if_loaded)
+    with pytest.raises(ValueError, match=r"top_k in \[2048\]"):
+        runner.profile_dsa_topk_prefill_sglang_cuda(**(_BASE_SPEC | {"top_k": 1024}))
 
 
 def test_vllm_rejects_common_and_backend_specific_args_before_loading(
@@ -238,7 +321,7 @@ def test_vllm_rejects_common_and_backend_specific_args_before_loading(
         ({"num_keys": 0}, "must be > 0"),
         ({"num_queries": 129, "num_keys": 128}, "must be <= num_keys"),
         ({"num_sequences": 2}, "num_sequences=1"),
-        ({"top_k": 1024}, "top_k=2048"),
+        ({"top_k": 0}, "top_k > 0"),
         ({"logits_row_stride": 0}, "positive and >= num_keys"),
         ({"logits_row_stride": 4095}, "positive and >= num_keys"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
@@ -309,9 +392,26 @@ def test_operand_layout_and_causal_tail_spans() -> None:
     assert operands.valid_mask.shape == (8, 8)
     assert operands.long_row_indices.tolist() == [4, 5, 6, 7]
     assert bool(torch.isfinite(operands.logits).all())
-    assert operands.logits.unique().numel() == 8
     assert bool(torch.any(operands.logits < 0))
     assert bool(torch.any(operands.logits > 0))
+
+
+def test_operand_scores_are_unsorted_distinct_and_seeded() -> None:
+    """A sorted or row-repeated score template is the radix select's slow case
+    (1.7x on vLLM's top_k_per_row_prefill at 16384 x 245760), so the rows must
+    differ from each other and not ascend, and stay identical across builds."""
+    from profiling.runners.attention.dsa_topk_prefill import _build_operands
+
+    def build():
+        return _build_operands(
+            torch, num_queries=8, num_keys=64, top_k=4, logits_row_stride=80, device="cpu"
+        )
+
+    logits = build().logits
+    assert logits.unique().numel() == logits.numel()
+    assert not torch.equal(logits[0], logits[1])
+    assert not bool((logits[:, 1:] >= logits[:, :-1]).all())
+    assert torch.equal(build().logits_backing, build().logits_backing)
 
 
 def _selected_value_map(logits, starts, ends, indices):
@@ -414,7 +514,6 @@ def test_logical_bytes_accounts_only_valid_logits_metadata_and_output() -> None:
 def test_profile_translates_runtime_failure(monkeypatch) -> None:
     from profiling.runners.attention import dsa_topk_prefill as runner
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda _torch: None)
     monkeypatch.setattr(
         runner,
         "_build_operands",
@@ -452,7 +551,6 @@ def test_vllm_profile_forwards_exact_operands_and_arguments(monkeypatch) -> None
         "_load_vllm_cuda_backend",
         lambda: (fake_torch, fake_op),
     )
-    monkeypatch.setattr(runner, "_validate_vllm_cuda_device", lambda _torch: None)
     monkeypatch.setattr(runner, "_build_operands", lambda *args, **kwargs: operands)
 
     def fake_cupti(kernel, *, kernel_name):
@@ -498,7 +596,6 @@ def test_vllm_profile_translates_runtime_failure(monkeypatch) -> None:
         "_load_vllm_cuda_backend",
         lambda: (fake_torch, fail_launch),
     )
-    monkeypatch.setattr(runner, "_validate_vllm_cuda_device", lambda _torch: None)
     monkeypatch.setattr(
         runner,
         "_build_operands",

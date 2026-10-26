@@ -11,28 +11,46 @@ Agent note:
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import sys
+import time
 from pathlib import Path
 
 from profiling.db.batch import args_to_spec, coerce_args
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec
 from profiling.exec.payload import metrics_to_payload, resolve_chunk_backend
+from profiling.instrument import emit, span
+from profiling.profilers.energy import set_energy_enabled
 from profiling.profilers.measure_context import (
     MeasureContext,
     clear_measure_context,
     set_measure_context,
 )
+from profiling.runners.device import unsupported_device
 from profiling.runners.metrics import RunnerResult
+
+_PROCESS_STARTED = time.time()
 
 
 def _worker_main(input_path: Path, output_path: Path) -> None:
+    # _PROCESS_STARTED is captured at import, so this span covers the
+    # interpreter's own start-up cost as seen from inside: torch and the backend
+    # import, CUDA context creation, registry resolution.
+    boot_started = _PROCESS_STARTED
     worker_request = json.loads(input_path.read_text(encoding="utf-8"))
     kernel_kind: KernelKind = worker_request["kernel_kind"]
     chunk_specs = worker_request["specs"]
     backend = resolve_chunk_backend(kernel_kind, chunk_specs)
     profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
+
+    # Settled before any runner loads, because `Energy.perf` is read 96 call
+    # sites down and none of those signatures carries policy. Absent key → leave
+    # the process default alone, so a payload written by an older controller
+    # still runs.
+    if "energy" in worker_request:
+        set_energy_enabled(bool(worker_request["energy"]))
 
     # An optional `measure` block turns this run into the trend+telemetry probe:
     # the context makes the shared Timer.cupti seam capture per-launch durations
@@ -50,20 +68,37 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     # every runner receives already-coerced kwargs (the `batched` adapter and the
     # native comm runners stay schema-free). List-native comm runners spawn their
     # rank group once for the whole list; compute runners are wrapped by `batched`.
-    runner = profiler_spec.load_list_runner()
+    # The backend's declared device requirement is checked here, once, against
+    # the real device; runners keep only their shape-dependent checks.
+    device_error = unsupported_device(profiler_spec.supports, f"{kernel_kind} {backend}")
+    runner = profiler_spec.load_list_runner() if device_error is None else None
     kwargs_list = [
         args_to_spec(coerce_args(profiler_spec.args_schema, _strip_backend(chunk_spec)))
         for chunk_spec in chunk_specs
     ]
     if measure_context is not None:
         set_measure_context(measure_context)
+    emit("worker.boot", boot_started, time.time(), kind=kernel_kind, specs=len(kwargs_list))
     try:
-        results = runner(kwargs_list)
+        if runner is None:
+            results = [RunnerResult(error=device_error) for _ in kwargs_list]
+        else:
+            with span("worker.runner", kind=kernel_kind, specs=len(kwargs_list)):
+                results = runner(kwargs_list)
     finally:
         if measure_context is not None:
             clear_measure_context()
     gpu_name = _current_gpu_name()
-    worker_results = [_to_payload(result, gpu_name) for result in results]
+    runtime_versions = _runtime_versions(backend)
+    row_provenance = profiler_spec.load_row_provenance()
+    worker_results = [
+        _to_payload(
+            result,
+            gpu_name,
+            _with_row_provenance(runtime_versions, row_provenance, kwargs, result),
+        )
+        for result, kwargs in zip(results, kwargs_list, strict=True)
+    ]
 
     output: dict = {"results": worker_results}
     if measure_context is not None:
@@ -92,6 +127,7 @@ def _build_measure_context(
         telemetry_hz=float(measure_request.get("telemetry_hz", 20.0)),
         clear_l2=bool(measure_request.get("clear_l2", True)),
         telemetry=bool(measure_request.get("telemetry", True)),
+        cuda_graph=bool(measure_request.get("cuda_graph", False)),
     )
 
 
@@ -101,7 +137,11 @@ def _strip_backend(chunk_spec: dict) -> dict:
     return {key: value for key, value in chunk_spec.items() if key != "backend"}
 
 
-def _to_payload(result: RunnerResult, gpu_name: str | None) -> dict:
+def _to_payload(
+    result: RunnerResult,
+    gpu_name: str | None,
+    runtime_versions: dict[str, str | None] | None = None,
+) -> dict:
     """Render one ``RunnerResult`` into the worker's on-disk JSON shape that
     ``chunk_result_from_payload`` consumes (unchanged from the single-spec loop)."""
     if result.error is not None or result.metrics is None:
@@ -110,7 +150,25 @@ def _to_payload(result: RunnerResult, gpu_name: str | None) -> dict:
         "ok": True,
         "metrics": metrics_to_payload(result.metrics),
         "gpu_name": gpu_name,
+        **(runtime_versions or {}),
     }
+
+
+def _with_row_provenance(
+    runtime_versions: dict[str, str | None],
+    row_provenance,
+    kwargs: dict,
+    result: RunnerResult,
+) -> dict[str, str | None]:
+    """Append the row's worker-state note (``KernelProfilerSpec.row_provenance_ref``)
+    to ``backend_version``, the free-text provenance column every table has."""
+    if row_provenance is None or result.metrics is None:
+        return runtime_versions
+    note = row_provenance(**kwargs)
+    if not note:
+        return runtime_versions
+    version = runtime_versions.get("backend_version")
+    return {**runtime_versions, "backend_version": f"{version}; {note}" if version else note}
 
 
 def _current_gpu_name() -> str | None:
@@ -122,6 +180,23 @@ def _current_gpu_name() -> str | None:
     except ImportError:
         pass
     return None
+
+
+def _runtime_versions(backend: str) -> dict[str, str | None]:
+    try:
+        import torch
+    except ImportError:
+        return {"cuda_version": None, "backend_version": None}
+
+    package = "vllm" if backend.startswith("vllm") else backend
+    try:
+        backend_version = importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        backend_version = None
+    return {
+        "cuda_version": str(torch.version.cuda) if torch.version.cuda else None,
+        "backend_version": backend_version,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:

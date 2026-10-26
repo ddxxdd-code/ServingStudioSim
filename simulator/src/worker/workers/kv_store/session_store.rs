@@ -18,7 +18,21 @@ pub(super) struct SessionStore {
 impl SessionStore {
     pub(super) fn new(capacity: u64, policy: PrefixCachePolicy) -> Self {
         Self {
-            cache: PrefixCache::new(capacity, policy, 1, 0),
+            cache: PrefixCache::new(
+                std::sync::Arc::new(
+                    crate::worker::kv::KvAccounting::resolve(
+                        &crate::arch::kv_layout::KvCacheLayout::new()
+                            .with_part(crate::arch::kv_layout::KvCachePart::per_token("remote", 1)),
+                        crate::worker::kv::KvAccountingOptions::default(),
+                        capacity,
+                    )
+                    .expect("linear remote storage accounting"),
+                ),
+                crate::worker::kv::PrefixCacheBudget {
+                    max_retained_units: capacity,
+                    policy,
+                },
+            ),
             capacity,
             reserved: 0,
             incoming: HashMap::new(),
@@ -27,7 +41,7 @@ impl SessionStore {
     }
 
     pub(super) fn used(&self) -> u64 {
-        self.cache.used_charge() + self.reserved
+        self.cache.used_units() + self.reserved
     }
     pub(super) fn reserved(&self) -> u64 {
         self.reserved
@@ -36,7 +50,7 @@ impl SessionStore {
         self.cache.pinned_charge()
     }
     pub(super) fn cached(&self) -> u64 {
-        self.cache.used_charge()
+        self.cache.used_units()
     }
     pub(super) fn capacity(&self) -> u64 {
         self.capacity
@@ -84,9 +98,9 @@ impl SessionStore {
         let (owner, tokens) = self.incoming.remove(&session).expect("reserved push");
         assert_eq!(owner, req);
         self.reserved -= tokens;
-        let result = self
-            .cache
-            .insert(session, tokens, self.capacity - self.reserved, None);
+        let result =
+            self.cache
+                .insert(session, tokens, tokens, self.capacity - self.reserved, None);
         assert_eq!(
             result.retained_tokens, tokens,
             "reserved bytes must fit on arrival"

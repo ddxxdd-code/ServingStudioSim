@@ -27,6 +27,7 @@
 //! Backed by `Arc` (not `Rc`): a built model is shared as `Arc<M>` across worker
 //! threads, so `Dim` must be `Send + Sync`. Clone is an `Arc` bump.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -282,8 +283,37 @@ impl fmt::Debug for Dim {
 // expression and its bindings there while keeping `value` authoritative for a
 // kernel-query round-trip; deserialization intentionally rebuilds an anonymous
 // `Const` because cache identity depends only on the folded value.
+thread_local! {
+    /// Set while [`values_only`] runs on this thread.
+    static VALUES_ONLY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with every `Dim` serializing as its bare value instead of
+/// `{value, expression, bindings}`: an identity, where two dims that fold to
+/// the same value must serialize alike. The bare form deserializes back into a
+/// `Dim` like the rich one.
+pub fn values_only<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VALUES_ONLY.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(VALUES_ONLY.with(|flag| flag.replace(true)));
+    f()
+}
+
+/// Whether this thread is inside [`values_only`]: a field with a machine-local
+/// form, such as a corpus's file path, serializes its identity form too.
+pub fn serializing_values_only() -> bool {
+    VALUES_ONLY.with(Cell::get)
+}
+
 impl Serialize for Dim {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if serializing_values_only() {
+            return s.serialize_u32(self.get());
+        }
         let mut state = s.serialize_struct("Dim", 3)?;
         state.serialize_field("value", &self.get())?;
         let expression = match &*self.0 {
@@ -330,6 +360,21 @@ mod tests {
         let mut h = DefaultHasher::new();
         d.hash(&mut h);
         h.finish()
+    }
+
+    #[test]
+    fn values_only_serializes_the_bare_value_and_restores_the_rich_form() {
+        let derived = Dim::param("hidden", 2048) * 2;
+        assert_eq!(
+            values_only(|| serde_json::to_value(&derived).unwrap()),
+            serde_json::json!(4096)
+        );
+        assert_eq!(
+            serde_json::to_value(&derived).unwrap()["expression"],
+            serde_json::json!("hidden*2")
+        );
+        let back: Dim = serde_json::from_value(serde_json::json!(4096)).unwrap();
+        assert_eq!(back, derived);
     }
 
     #[test]

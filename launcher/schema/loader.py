@@ -1,4 +1,4 @@
-"""Load the Rust-authoritative deployment schema (new-interface-design §11).
+"""Load the Rust-authoritative deployment schema (L7 design).
 
 Per L7 design / INV-7, per-param data lives in the Rust binary, not in Python.
 `cargo_build()` (see `launcher.exec`) runs `simulator list-params` after a
@@ -166,7 +166,7 @@ def _merge_backends_file(preset: dict, source: str) -> dict:
         preset["backends"] = _unflatten_backends(flat, "backends")
     return preset
 
-# Fixed skeleton key sets (the uniform pool shape — new-interface-design §8).
+# Fixed skeleton key sets for the uniform pool shape (L6/L7 design).
 _POOL_KEYS = frozenset({"placement", "groups"})
 _GROUP_FLAT = ("gpu", "replicas")  # group_common fields (looked up on each group)
 _GROUP_KEYS = frozenset({"gpu", "replicas", "arch", "worker"})
@@ -179,7 +179,9 @@ class SchemaNotFound(FileNotFoundError):
 
 
 def schema_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "deployment_schema.json"
+    from ..binaries import build_output_dir
+
+    return build_output_dir(build_type) / "deployment_schema.json"
 
 
 @dataclass(frozen=True)
@@ -342,16 +344,21 @@ def iter_slots(registry: Registry, config: dict, *, create: bool = False) -> Ite
                     yield Slot(group, fld, pdef, base + (fld,))
             arch = _child(group, "arch")
             if arch is not None:
-                arch_type = arch.get("type")
-                for pdef in registry.arch_common:
-                    yield Slot(arch, pdef["name"], pdef, base + ("arch", pdef["name"]))
-                for pdef in registry.arch_params(contract, arch_type):
-                    yield Slot(arch, pdef["name"], pdef, base + ("arch", pdef["name"]))
+                yield from iter_arch_slots(registry, contract, arch, base + ("arch",))
             worker = _child(group, "worker")
             if worker is not None:
                 worker_type = worker.get("type")
                 for pdef in registry.worker_params(contract, worker_type):
                     yield Slot(worker, pdef["name"], pdef, base + ("worker", pdef["name"]))
+
+
+def iter_arch_slots(
+    registry: Registry, contract: str, arch: dict, path: tuple[str, ...] = ("arch",)
+) -> Iterator[Slot]:
+    """Yield one `Slot` per expected param of one arch block of `contract`:
+    the params every arch carries, then its type's own."""
+    for pdef in [*registry.arch_common, *registry.arch_params(contract, arch.get("type"))]:
+        yield Slot(arch, pdef["name"], pdef, path + (pdef["name"],))
 
 
 def unknown_keys(registry: Registry, config: dict) -> list[str]:

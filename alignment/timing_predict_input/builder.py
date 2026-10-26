@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..nsys.parsed_io import read_parsed
 from .engine_text import build_cases
 
 INPUT_MANIFEST_NAME = "timing_predict_input_manifest.json"
@@ -40,6 +41,25 @@ class EngineTextInputSpec:
             "type": "engine_text",
             "measured_phase": self.measured_phase,
             "group_assignment": self.group_assignment,
+        }
+
+
+@dataclass(frozen=True, kw_only=True)
+class SpeculativeEngineTextInputSpec(EngineTextInputSpec):
+    """Measured chain verification with an explicitly declared draft depth."""
+
+    draft_tokens: int
+
+    def validate(self) -> None:
+        super().validate()
+        if type(self.draft_tokens) is not int or self.draft_tokens <= 0:
+            raise ValueError("input_builder.draft_tokens must be a positive integer")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            **super().to_mapping(),
+            "type": "speculative_engine_text",
+            "draft_tokens": self.draft_tokens,
         }
 
 
@@ -80,13 +100,21 @@ def build_inputs(request: BuildRequest) -> BuildResult:
     has no analysis directory and cannot create an analyzer manifest.
     """
     request.input_spec.validate()
-    parsed = json.loads(request.parsed_nsys.read_text())
-    if not isinstance(parsed, dict):
-        raise ValueError(f"parsed NSYS root must be a JSON object: {request.parsed_nsys}")
+    speculative = isinstance(request.input_spec, SpeculativeEngineTextInputSpec)
+    draft_tokens = request.input_spec.draft_tokens if speculative else None
+    if speculative and (
+        type(request.arch.get("draft_tokens")) is not int
+        or request.arch["draft_tokens"] != draft_tokens
+    ):
+        raise ValueError("input_builder.draft_tokens must match explicit arch.draft_tokens")
+    # Iteration metrics only: the kernel rows are the bulk of a capture and the
+    # builder never reads one.
+    parsed = read_parsed(request.parsed_nsys, kernels=False)
     cases, case_map, excluded = build_cases(
         parsed,
         request.input_spec.measured_phase,
         request.input_spec.group_assignment,
+        draft_tokens=draft_tokens,
     )
 
     output_dir = request.output_dir.resolve()
@@ -112,7 +140,7 @@ def build_inputs(request: BuildRequest) -> BuildResult:
     predict_config_path.write_text(
         json.dumps(
             {
-                "arch": {"iter": request.arch},
+                "arch": {"speculative_iter" if speculative else "iter": request.arch},
                 "gpu": request.gpu,
                 "backends": request.backends,
                 "log_dir": str(output_dir),

@@ -1,8 +1,8 @@
 # Log — streaming parquet output
 
 Cross-layer logging: turn the sim's per-request and per-iteration events into
-parquet streams plus JSON sidecars (`run_meta.json` and per-worker
-`cost_manifest/*.json`) under `<log_dir>/raw/`. The design
+parquet streams plus JSON sidecars (`run_meta.json`, `kv_cache.json` and
+per-worker `cost_manifest/*.json`) under `<log_dir>/raw/`. The design
 constraint is that **logging must not slow the sim**: the sim thread only fills
 row buffers and hands full chunks to a background thread that does the heavy
 parquet encode + ZSTD compression off the critical path.
@@ -30,7 +30,36 @@ sends the buffer tails, closes the channel, and joins the writer, propagating it
 first error. Files are created **lazily** on the first non-empty write, so a
 stream that never produces a row leaves no file behind.
 
+`cost_log` chunks are cut by rows, but their `slot_input` JSON is not bounded by
+rows. Readers decode by row count too, so a `slot_input` column must stay small
+per row, not just per write: inputs that carry one value per query row (the
+sparse-index remap's span and valid-count vectors) serialize run-encoded
+(`timing/run_encoded.rs`), which took a 1M-context EP run from 1.5 MB to 12 KB
+per row. As a writer-side guard the writer still converts one chunk into as many
+record batches as keep each batch's `slot_input` under 1 GiB
+(`MAX_SLOT_INPUT_BYTES_PER_BATCH`).
+A `CostLogger` never stops the sim, but a failed writer deletes its partial
+parquet and leaves `cost_log/worker_<pool_tag>_<worker_id>.error`; `main` and
+timing-predict drop the workers, read those markers (`cost_log_failures`) and exit
+with an error, so a run can't succeed with an incomplete `cost_log`. Opening a
+stream first deletes the previous run's parquet and marker in that `log_dir`.
+
 ## Directory map
+
+Speculative iterations append nullable `groups.speculative_geometry` JSON with
+`draft_tokens`, `max_model_len`, prefill `(prefix, query)` pairs and decode
+`(final_context, query)` pairs. Ordinary rows leave it null. These are raw request
+shapes, not kernel FLOPs or bytes; the independent model accountant owns those
+formulas. Geometry is encoded on the writer thread.
+
+`request_slo.speculative_progress` independently persists admission/completion
+observations: verify width, completed prefill chunks and decode rounds, resident
+KV sum, the verify rows and causal query-key pairs those rounds ran (fewer rows
+in a round clipped at `max_model_len`), emitted tokens, and an optional pending
+prefill or `(resident, rows)` decode. This bounded
+per-request record survives optional timing logs being disabled. Pending work
+lets conservation account exactly for a sim-end stop before completion. Rejected
+candidates remain part of executed work; only committed output advances KV.
 
 ```
 schemas.rs        Arrow schemas for the streams + ALL_STREAMS. The cost_log
@@ -52,6 +81,8 @@ prefix_cache_logger.rs
 network_logger.rs NetworkLogger — the shared GpuCluster transfer stream writer.
 run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
                   serde_json, not parquet / not threaded).
+kv_cache.rs       write_kv_cache — the kv_cache.json per-pool capacity sidecar,
+                  and the text form `simulator kv-cache` prints.
 ```
 
 ## The streams & files (under `<log_dir>/raw/`)
@@ -62,10 +93,11 @@ run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
 | `request_state.parquet` | `LoggerSession` | L7 `run_sim` | periodic dense snapshot over the admitted set |
 | `cost_log/worker_<pool_tag>_<worker_id>.parquet` | `CostLogger` | each L5 worker | one row per iteration: envelope + per-group `input_section` + the CostTree per-slot breakdown |
 | `cost_manifest/worker_<pool_tag>_<worker_id>.json` | `CostLogger` | each L5 worker | the matching `CostManifest` (slots + flat aggregation nodes) written once at open |
-| `kv_snapshot/worker_<pool_tag>_<worker_id>.parquet` | `KvSampler` | each KV-owning L5 worker | throttled per-partition active/retained-prefix/projected/promised KV series |
+| `kv_snapshot/worker_<pool_tag>_<worker_id>.parquet` | `KvSampler` | each KV-owning L5 worker | throttled per-partition active/retained-prefix/projected/promised KV series, in the pool's KV units |
 | `prefix_cache_event/worker_<pool_tag>_<worker_id>.parquet` | `PrefixCacheLogger` | each prefix-capable KV-owning L5 worker | every session-cache ownership transition, with exact entry/cache before and after token counts |
 | `gpu_cluster.parquet` | `NetworkLogger` | shared `GpuCluster` for PD/AFD | one resolved cross-worker transfer with both endpoints and timing window |
-| `run_meta.json` | `run_meta` | L7 (pre-loop) | GPU registry, worker grouping, KV capacities, comm groups, and stage vocabulary |
+| `run_meta.json` | `run_meta` | L7 (pre-loop) | GPU registry, worker grouping, KV pools (`capacity_units`, `bytes_per_unit`, `kv_overhead`), comm groups, and stage vocabulary |
+| `kv_cache.json` | `kv_cache` | L7 (pre-loop) | one entry per KV pool (`pool_tag`, `pool`, `worker_id`, `group_id`, `gpu_name`): the GPUs one partition spans (`attention_shards`; bytes are over the partition, divide by it for one GPU), the arch's declared layout (`parts`, `engine`), the resolved options, what each part is charged (`bytes_per_unit`, `capacity_units`, units and the copies a running request holds per part (`held_copies`), whether vLLM's estimate adds the align copy), and the result (units per request in vLLM's estimate and its per-part split `request_parts` at `max_model_len`, the units admission holds `admission_units_at_max_model_len`, max concurrency under this and the other `kv_overhead`, `capacity_tokens` when every part grows per token). `simulator kv-cache <config>` prints it per GPU for reading, or the same JSON with `--json` |
 
 `network_event` remains a reserved schema with no writer; production transfer
 logging uses the richer `gpu_cluster` stream.
@@ -76,10 +108,15 @@ observation copied at successful admission. A null hit means the request never
 reached prefix resolution; zero is a resolved cache miss. Consumers derive miss
 tokens as `declared - hit` and the hit rate from those two counts rather than
 depending on another redundant column. `fresh_prompt_tokens` separately records
-the immutable new suffix, while `prefill_processed` records work actually done.
+the immutable new suffix, while `prefill_processed` records work actually done;
+`target_output_tokens` is the output length the request asks for, and
+`num_output_tokens` what it produced.
 Once a request has produced its first output token, conservation therefore has
 the exact request-level invariant
 `prefix_cache_hit_tokens + prefill_processed = fresh_prompt_tokens + declared_prefix_tokens`.
+A pinned prefix (the independent format's `prefix_len` column) is declared and
+always hit: `declared_prefix_tokens = prefix_cache_hit_tokens = prefix_len`. It
+writes no `prefix_cache_event` row because it never enters the shared cache.
 
 The nullable `declared_ttft_slo_ms`, `declared_tpot_slo_ms`, and
 `declared_e2e_slo_ms` columns preserve the trace's per-request obligations.
@@ -128,7 +165,9 @@ variants pair each operation with only its legal reason family. `operation` and
 The row's `request_id` identifies the operation trigger and `session_id`
 identifies the mutated entry. `requested_tokens` and `hit_tokens` explain an
 `activate`; for a partial declaration the entire count-only entry is removed but
-only the declared portion is a hit. This stream does not mirror active decode
+only the declared portion is a hit, and only up to the entry's last resume
+position. `full_hit_tokens` is the hit the entry would give if every position
+were resumable; its gap to `hit_tokens` is what resume positions cost. This stream does not mirror active decode
 growth and does not maintain a second cache ledger: `PrefixCache` returns the
 mutation receipts that are written verbatim. `kv_snapshot` remains the compact
 occupancy view; `prefix_cache_event` is the exact diagnostic replay.
@@ -154,7 +193,8 @@ path), with a `"null"` fallback if serialization fails — never panicking the r
 
 ## Up / down
 
-- **Above (writers):** the L7 `sim` loop (`LoggerSession` + `run_meta`), each
+- **Above (writers):** the L7 `sim` loop (`LoggerSession` + `run_meta` +
+  `kv_cache`), each
   KV-owning L5 worker (`CostLogger` + `KvSampler`), and the shared `GpuCluster`
   (`NetworkLogger` for PD/AFD transfers).
 - **Below (used):** Arrow / parquet (`arrow_array`, `arrow_schema`, `parquet`

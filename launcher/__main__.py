@@ -1,11 +1,13 @@
-"""VibeSim launcher CLI dispatch — no simulation logic (L7 design).
+"""ServingStudioSim launcher CLI dispatch — no simulation logic (L7 design).
 
 Modes:
 
     python -m launcher PRESET.{yaml,yml,json} [MORE_PRESETS ...] [run options]
     python -m launcher timing-predict CONFIG.{yaml,yml,json} [MORE_CONFIGS ...]
-    python -m launcher kernel-profile {list,query,count-missing,run,measure} ...
+    python -m launcher kernel-profile
+        {list,query,count-missing,run,measure,merge-db,audit-provenance} ...
     python -m launcher alignment {sim,profile,timing-predict,analyze} ...
+    python -m launcher alignment-campaign {check,render,run,label,extract,compare} ...
     python -m launcher list-params [--human] [--build-type PROFILE]
 
 The default mode runs or sweeps deployment simulations. Its run options also
@@ -14,6 +16,15 @@ enumeration (`--emit-backends`), and simulator wallclock profiling (`--profile`)
 paths. YAML and JSON are accepted for simulation presets, timing-predict configs,
 and alignment stage configs.
 
+Global options (`--no-gpu`, `--remote NAME`, `--remote-set K=V`) may appear
+anywhere on the line of any mode; `launcher/cli.py` takes them off before
+dispatch. `--no-gpu` guarantees the command uses no GPU: it sets
+`SERVINGSTUDIO_NO_GPU=1` (which has the same effect when set directly) and
+empties `CUDA_VISIBLE_DEVICES` for every child. A step that would need one --
+profiling a missing `profile.db` row, an alignment capture -- fails and names
+itself instead. See `profiling/gpu_policy.py`. `--remote` runs the command on
+another machine (`launcher/remote`).
+
 Single versus batch execution is decided by the number of expanded configs.
 Sweep expansion belongs to `launcher.schema`. No `--web` / `--tui` / `--gui`
 (UI deleted per discussion.md).
@@ -21,11 +32,13 @@ Sweep expansion belongs to `launcher.schema`. No `--web` / `--tui` / `--gui`
 
 from __future__ import annotations
 
-import copy
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
+from .cli import UsageError, apply_dotted, dispatch, modes_help
+from .corpus import CorpusError, resolve_hf_references
 from .schema import (
     _format_log_dir,
     expand_sweep_params,
@@ -46,6 +59,18 @@ from .schema.loader import (
     schema_path,
 )
 
+# The axis a multi-preset batch adds, valued by each preset's file stem.
+BATCH_PRESET_AXIS = "preset"
+
+
+def _positive_int(text: str) -> int:
+    import argparse
+
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
 
 def _build_argparse():
     """The launcher's argparse: positional preset paths + repeatable
@@ -55,14 +80,8 @@ def _build_argparse():
 
     parser = argparse.ArgumentParser(
         prog="python -m launcher",
-        description="VibeSim launcher simulation mode — run or sweep YAML/JSON presets.",
-        epilog=(
-            "Other modes:\n"
-            "  python -m launcher timing-predict CONFIG.yaml|json [...]\n"
-            "  python -m launcher kernel-profile {list,query,count-missing,run,measure} ...\n"
-            "  python -m launcher alignment {sim,profile,timing-predict,analyze} ...\n"
-            "  python -m launcher list-params [--human]"
-        ),
+        description="ServingStudioSim launcher simulation mode — run or sweep YAML/JSON presets.",
+        epilog=modes_help(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -90,10 +109,30 @@ def _build_argparse():
         "exit without building caches or running.",
     )
     parser.add_argument(
+        "--kv-report",
+        action="store_true",
+        help="Print each KV pool's layout, the charge of one request at "
+        "max_model_len and the resulting max concurrency, for every distinct "
+        "candidate — then exit. Structure only: no profile.db, GPU or run.",
+    )
+    parser.add_argument(
+        "--kv-report-json",
+        action="store_true",
+        help="As --kv-report, as one JSON document (`raw/kv_cache.json` per run).",
+    )
+    parser.add_argument(
         "--refresh",
         action="store_true",
         help="Re-run every run, ignoring `.complete` markers (default: resume — "
         "skip runs already marked complete).",
+    )
+    parser.add_argument(
+        "--parallelism",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="Most runs of a sweep in flight at once (default: 200). Lower it when "
+        "each run needs a lot of memory.",
     )
     parser.add_argument(
         "--build-type",
@@ -114,10 +153,35 @@ def _build_argparse():
         help="perf sampling frequency for --profile (default: 499).",
     )
     parser.add_argument(
+        "--energy",
+        dest="energy",
+        action="store_true",
+        default=None,
+        help="Measure the NVML energy window while profiling, and refuse to run on "
+        "cached rows that lack it (energy_j = 0.0 means 'not measured'). Default "
+        "comes from the preset's `energy:` key, which itself defaults to false: "
+        "the window is a second ~500 ms loop per spec and the largest single cost "
+        "in a cache fill.",
+    )
+    parser.add_argument(
+        "--no-energy",
+        dest="energy",
+        action="store_false",
+        help="Skip the energy window even if the preset asks for it.",
+    )
+    parser.add_argument(
         "--no-analyze",
         action="store_true",
         help="Skip the per-run analyzer (Rust SLO compute + Python plots) that "
         "otherwise runs after each successful run.",
+    )
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Run the analyzer but render no PNGs (per run or for the sweep). "
+        "Reports, payloads and traces are still written, so the Analyzer UI works; "
+        "on a large sweep the PNGs cost more CPU than the simulations. Draw one run "
+        "later with `python analyzer/python render <log_dir>`.",
     )
     parser.add_argument(
         "--emit-backends",
@@ -132,40 +196,12 @@ def _build_argparse():
     return parser
 
 
-def _set_path(tree: dict, dotted: str, value) -> None:
-    """Set `value` at a dotted path into the config tree, e.g.
-    `io.log_dir`, `pools.main.groups.0.arch.tp_size`. Integer segments index
-    into lists; everything else into dicts (auto-vivifying missing dicts)."""
-    parts = dotted.split(".")
-    node = tree
-    for part in parts[:-1]:
-        if isinstance(node, list):
-            node = node[int(part)]
-        else:
-            node = node.setdefault(part, {})
-    last = parts[-1]
-    if isinstance(node, list):
-        node[int(last)] = value
-    else:
-        node[last] = value
-
-
 def _apply_overrides(preset: dict, overrides: list[str]) -> dict:
-    """Apply `--override path=value` into the config tree. The path is dotted
-    (`io.log_dir`, `pools.main.groups.0.arch.tp_size`); values are parsed as JSON
-    when possible (`tp_size=4`→int, `fp8=true`→bool, `[1,2]`→list) and otherwise
-    kept as a bare string (`model_config=model/x.json`)."""
-    out = copy.deepcopy(preset)
-    for item in overrides:
-        if "=" not in item:
-            sys.exit(f"bad --override {item!r}; expected path=value")
-        key, _, raw = item.partition("=")
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError:
-            value = raw  # bare string
-        _set_path(out, key.strip(), value)
-    return out
+    """Apply `--override path=value` into the config tree (`cli.apply_dotted`)."""
+    try:
+        return apply_dotted(preset, overrides)
+    except UsageError as exc:
+        sys.exit(f"bad --override: {exc}")
 
 
 def _params_line(pdef: dict) -> str:
@@ -247,9 +283,15 @@ def _emit_backends(args, schema: Registry) -> int:
     # kernel role sets (e.g. tp=1 has no all_reduce) can't share one backends file,
     # so reject at emit; runs that differ only in shape share it (shapes → `(varies)`).
     # `_format_log_dir` templates each `log_dir` so a reject names the run (…/tp1).
-    normalized = [_format_log_dir(normalize_params(c, schema)) for c in candidates]
     try:
+        # The builder reads a corpus to size its sweep, so it needs the file.
+        normalized = [
+            resolve_hf_references(_format_log_dir(normalize_params(c, schema))) for c in candidates
+        ]
         roles = emit_roles(normalized, args.build_type)
+    except CorpusError as exc:
+        print(f"[invalid] {source}: {exc}", file=sys.stderr)
+        return 2
     except BackendEnumError as exc:
         print(f"[invalid] {source}: emit-backends failed: {exc}", file=sys.stderr)
         return 2
@@ -264,6 +306,73 @@ def _emit_backends(args, schema: Registry) -> int:
     return 0
 
 
+class InvalidPreset(ValueError):
+    """A preset that does not expand; ``errors`` are its problems, one line each."""
+
+    def __init__(self, errors: list[str]):
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+def expand_preset(
+    preset: dict,
+    schema: Registry,
+    source: str,
+    *,
+    axis: str | None = None,
+    label: str | None = None,
+) -> list[dict]:
+    """Validate + expand ONE config preset into normalized, log_dir-templated
+    candidates, with its `hf://` references fetched to local files; raises
+    :class:`InvalidPreset` with every problem. When `axis`/`label` are given (a
+    `variants` manifest branch), tag each run's `_env` with `{axis: label}` so
+    the file becomes a named aggregation axis, and prefix its `log_dir` with the
+    label so cross-file runs never collide."""
+    # Fold `backends_file` + inline `backends` into one nested `backends` block
+    # BEFORE validation (so `backends_file` is gone) and before expansion (so its
+    # `${var}` values are swept). Un-flattens the file's `pool/role` keys.
+    try:
+        preset = _merge_backends_file(preset, source)
+    except PresetError as exc:
+        raise InvalidPreset([str(exc)]) from exc
+    errors = validate_params(preset, schema)
+    if errors:
+        raise InvalidPreset(errors)
+
+    candidates: list[dict] = []
+    for candidate in expand_sweep_params(preset, schema):
+        # Post-expansion gate: placeholders are now concrete, so the deferred
+        # type/choice checks run for real BEFORE normalize coerces.
+        post_errors = validate_expanded(candidate, schema)
+        if post_errors:
+            raise InvalidPreset(post_errors)
+        if axis is not None:
+            env = candidate.setdefault("_env", {})
+            if axis in env:
+                # The manifest's file axis would overwrite an inner sweep/compound/
+                # derived binding of the same name, corrupting _env + log_dir.
+                raise InvalidPreset(
+                    [
+                        f"variants axis {axis!r} collides with a sweep/compound/derived "
+                        "name in this preset; rename the manifest axis so the file axis "
+                        "stays distinct"
+                    ]
+                )
+            env[axis] = label
+        cand = _format_log_dir(normalize_params(candidate, schema))
+        # Recordings the preset names by repository and revision rather than
+        # carrying in git. Resolved here so the binary only ever sees a path,
+        # and so an unfetchable one fails before a GPU is allocated.
+        try:
+            cand = resolve_hf_references(cand)
+        except CorpusError as exc:
+            raise InvalidPreset([str(exc)]) from exc
+        if axis is not None:
+            cand["io"]["log_dir"] = f"{label}/{cand['io']['log_dir']}"
+        candidates.append(cand)
+    return candidates
+
+
 def _expand_preset(
     preset: dict,
     schema: Registry,
@@ -272,53 +381,13 @@ def _expand_preset(
     axis: str | None = None,
     label: str | None = None,
 ) -> list[dict] | None:
-    """Validate + expand ONE config preset into normalized, log_dir-templated
-    candidates. Returns the candidate list, or `None` if the preset is invalid
-    (errors already printed). When `axis`/`label` are given (a `variants` manifest
-    branch), tag each run's `_env` with `{axis: label}` so the file becomes a named
-    aggregation axis, and prefix its `log_dir` with the label so cross-file runs
-    never collide."""
-    # Fold `backends_file` + inline `backends` into one nested `backends` block
-    # BEFORE validation (so `backends_file` is gone) and before expansion (so its
-    # `${var}` values are swept). Un-flattens the file's `pool/role` keys.
+    """:func:`expand_preset`, or `None` with its errors printed."""
     try:
-        preset = _merge_backends_file(preset, source)
-    except PresetError as exc:
-        print(f"[invalid] {source}: {exc}", file=sys.stderr)
-        return None
-    errors = validate_params(preset, schema)
-    if errors:
-        for error in errors:
+        return expand_preset(preset, schema, source, axis=axis, label=label)
+    except InvalidPreset as exc:
+        for error in exc.errors:
             print(f"[invalid] {source}: {error}", file=sys.stderr)
         return None
-
-    candidates: list[dict] = []
-    for candidate in expand_sweep_params(preset, schema):
-        # Post-expansion gate: placeholders are now concrete, so the deferred
-        # type/choice checks run for real BEFORE normalize coerces.
-        post_errors = validate_expanded(candidate, schema)
-        if post_errors:
-            for error in post_errors:
-                print(f"[invalid] {source}: {error}", file=sys.stderr)
-            return None
-        if axis is not None:
-            env = candidate.setdefault("_env", {})
-            if axis in env:
-                # The manifest's file axis would overwrite an inner sweep/compound/
-                # derived binding of the same name, corrupting _env + log_dir.
-                print(
-                    f"[invalid] {source}: variants axis {axis!r} collides with a "
-                    "sweep/compound/derived name in this preset; rename the manifest "
-                    "axis so the file axis stays distinct",
-                    file=sys.stderr,
-                )
-                return None
-            env[axis] = label
-        cand = _format_log_dir(normalize_params(candidate, schema))
-        if axis is not None:
-            cand["io"]["log_dir"] = f"{label}/{cand['io']['log_dir']}"
-        candidates.append(cand)
-    return candidates
 
 
 def _expand_manifest(
@@ -402,59 +471,102 @@ def _expand_manifest(
     return merged
 
 
+def _apply_energy_policy(
+    flag: bool | None,
+    preset_values: list[bool | None],
+    preset_paths: list[str],
+) -> bool:
+    """Resolve the energy policy for this batch and record it for the workers.
+
+    Order: an explicit `--energy`/`--no-energy` wins, else the preset's `energy:`
+    key, else off. Off is the default because the NVML window is a second
+    ~500 ms loop per spec -- on a clean tp4/ep4 fill it cost more than the timing
+    it accompanies.
+
+    "Else off" is left to ``energy_enabled()``'s own default rather than settled
+    here, so that an exported ``VIBESIM_PROFILE_ENERGY`` still has a vote when
+    nothing in the invocation states a policy. Settling it unconditionally meant
+    ``VIBESIM_PROFILE_ENERGY=1 python -m launcher preset.yaml`` measured no
+    energy, and the CLI already guards the same way.
+
+    The policy is process state, not a signature parameter, because the profiler
+    that honours it runs in a worker subprocess (sometimes a container) several
+    frames below here. Turning it on also turns on the requirement that every
+    row the simulator consumes actually carries energy, so a cache filled
+    without it fails loudly instead of reporting zero joules.
+
+    A batch shares one process and therefore one policy, so presets that
+    disagree are an error rather than a silent last-wins.
+    """
+
+    from profiling.profilers.energy import set_energy_enabled, set_require_measured_energy
+
+    if flag is None:
+        stated = {value for value in preset_values if value is not None}
+        if len(stated) > 1:
+            print(
+                "[invalid] presets disagree on `energy:` "
+                f"({', '.join(sorted(str(v) for v in stated))}) and one batch shares "
+                f"one measurement policy: {', '.join(preset_paths)}. Pass --energy or "
+                "--no-energy to settle it, or split the batch.",
+                file=sys.stderr,
+            )
+            return False
+        for value in stated:
+            if not isinstance(value, bool):
+                print(
+                    f"[invalid] `energy:` must be true or false, got {value!r}",
+                    file=sys.stderr,
+                )
+                return False
+        if not stated:
+            return True
+        enabled = stated.pop()
+    else:
+        enabled = flag
+
+    set_energy_enabled(enabled)
+    set_require_measured_energy(enabled)
+    return True
+
+
+def list_params(argv: list[str]) -> int:
+    """`list-params`: dump the Rust-authoritative schema of the built binary."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m launcher list-params",
+        description="Print the simulator's parameter schema (JSON, or a table with --human).",
+    )
+    parser.add_argument("--human", action="store_true", help="Print a readable table.")
+    parser.add_argument(
+        "--build-type", default="release", help="Cargo profile of the schema (default: release)."
+    )
+    args = parser.parse_args(argv)
+    try:
+        schema = load_schema(args.build_type)
+    except SchemaNotFound as exc:
+        sys.exit(str(exc))
+    _print_params_table(schema, args.human, args.build_type)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
+    return dispatch(list(sys.argv[1:] if argv is None else argv), simulation=run_simulation)
 
-    # `alignment` exposes explicit workflow stages. Its `sim` handler re-enters
-    # this main function, so dispatch must short-circuit before preset parsing.
-    if argv and argv[0] == "alignment":
-        from .alignment import main as run_alignment
 
-        return run_alignment(argv[1:])
+@dataclass(frozen=True)
+class SimulationPlan:
+    """A validated simulation batch, ready to run here or ship (`launcher/remote`)."""
 
-    # `timing-predict` runs the offline per-building-block timing predictor. Its
-    # config is a minimal arch+cases file, NOT a deployment RunConfig, so it has its
-    # own handler that bypasses schema expansion / sweeps entirely.
-    if argv and argv[0] == "timing-predict":
-        from .timing_predict import main as run_timing_predict
+    candidates: list[dict]
+    # The last preset loaded, as `metadata.write_shared_metadata` records it.
+    preset: dict
+    schema: Registry
+    analyze_subjects: list[str] | None
 
-        return run_timing_predict(argv[1:])
 
-    # Keep L1 profiling ownership in ``profiling.cli`` while exposing one
-    # operator-facing VibeSim command surface alongside timing-predict and sim.
-    if argv and argv[0] == "kernel-profile":
-        from profiling.cli import main as run_kernel_profile
-
-        return run_kernel_profile(
-            argv[1:],
-            prog="python -m launcher kernel-profile",
-        )
-
-    if argv and argv[0] == "migrate-artifact-kinds":
-        from .migrate_artifact_kinds import main as migrate_artifact_kinds
-
-        return migrate_artifact_kinds(argv[1:])
-
-    # `list-params` subcommand short-circuits before any preset handling.
-    if argv and argv[0] == "list-params":
-        human = "--human" in argv[1:]
-        build_type = "release"
-        if "--build-type" in argv:
-            build_type = argv[argv.index("--build-type") + 1]
-        try:
-            schema = load_schema(build_type)
-        except SchemaNotFound as exc:
-            sys.exit(str(exc))
-        _print_params_table(schema, human, build_type)
-        return 0
-
-    args = _build_argparse().parse_args(argv)
-    if not args.presets:
-        sys.exit(
-            "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
-            "(or choose timing-predict, kernel-profile, alignment, or list-params)"
-        )
-
+def _built_schema(args) -> Registry:
     # INV-8 / design §1.2.3: the single shared build per batch. Building also
     # runs `list-params` → deployment_schema.json (§1.2.7), so this is what
     # guarantees the load_schema below reads a schema matching the just-built
@@ -463,19 +575,31 @@ def main(argv: list[str] | None = None) -> int:
     from .exec import cargo_build
 
     if not cargo_build(args.build_type, build_analyzer=not args.no_analyze):
-        sys.exit("build failed; cannot produce deployment schema (see errors above)")
+        sys.exit("launcher preparation failed (see stage-specific error above)")
 
     try:
-        schema = load_schema(args.build_type)
+        return load_schema(args.build_type)
     except SchemaNotFound as exc:
         sys.exit(str(exc))
 
-    if args.emit_backends is not None:
-        return _emit_backends(args, schema)
 
+def plan_simulation(args) -> SimulationPlan | int:
+    """Build, then load, expand and validate every preset of the batch.
+
+    Returns the plan, or the exit code after printing why there is none.
+    """
+    schema = _built_schema(args)
+    stems = [Path(path).stem for path in args.presets]
+    if len(args.presets) > 1 and len(set(stems)) != len(stems):
+        print(
+            f"[invalid] presets in one batch need distinct file names: {stems}",
+            file=sys.stderr,
+        )
+        return 2
     all_candidates: list[dict] = []
     last_preset: dict = {}
     analyze_subjects: list[str] | None = None
+    preset_energy: list[bool | None] = []
     for preset_path in args.presets:
         try:
             preset = _load_preset(Path(preset_path))
@@ -486,6 +610,10 @@ def main(argv: list[str] | None = None) -> int:
         # `analyze_subjects` is a launcher-only key (which post-run analyzer
         # subjects to render). Pop it BEFORE schema validation / sweep expansion
         # so it never reaches the simulator CLI; omit = all applicable subjects.
+        # `energy` is launcher-only measurement policy with no RunConfig field,
+        # so it is popped here for the same reason as `analyze_subjects`: past
+        # this point the tree is the simulator's payload.
+        preset_energy.append(preset.pop("energy", None))
         subjects = preset.pop("analyze_subjects", None)
         if subjects is not None:
             if not (isinstance(subjects, list) and all(isinstance(s, str) for s in subjects)):
@@ -506,9 +634,30 @@ def main(argv: list[str] | None = None) -> int:
             cands = _expand_preset(preset, schema, preset_path)
         if cands is None:
             return 2
+        if len(args.presets) > 1:
+            # A batch of presets is one experiment: the file is its own axis, so
+            # runs from different presets never share a manifest coordinate.
+            for cand in cands:
+                env = cand.setdefault("_env", {})
+                if BATCH_PRESET_AXIS in env:
+                    print(
+                        f"[invalid] {preset_path}: sweep name {BATCH_PRESET_AXIS!r} collides "
+                        "with the batch's preset axis; rename it",
+                        file=sys.stderr,
+                    )
+                    return 2
+                env[BATCH_PRESET_AXIS] = Path(preset_path).stem
         all_candidates.extend(cands)
 
-    print(f"[plan] {len(all_candidates)} run(s) across {len(args.presets)} preset(s)")
+    if not _apply_energy_policy(args.energy, preset_energy, args.presets):
+        return 2
+
+    # A JSON report owns stdout; the plan line is a diagnostic there.
+    plan_stream = sys.stderr if getattr(args, "kv_report_json", False) else sys.stdout
+    print(
+        f"[plan] {len(all_candidates)} run(s) across {len(args.presets)} preset(s)",
+        file=plan_stream,
+    )
     if not all_candidates:
         sys.exit(
             "no runs after expansion — an empty sweep dim or constraints that reject "
@@ -544,6 +693,30 @@ def main(argv: list[str] | None = None) -> int:
             f"{len(all_candidates)}; narrow it (e.g. via --override) to a single run"
         )
 
+    return SimulationPlan(all_candidates, last_preset, schema, analyze_subjects)
+
+
+def parse_simulation_args(argv: list[str]):
+    args = _build_argparse().parse_intermixed_args(argv)
+    if not args.presets:
+        sys.exit(
+            "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
+            "(or choose timing-predict, kernel-profile, alignment, or list-params)"
+        )
+    return args
+
+
+def run_simulation(argv: list[str]) -> int:
+    """The default mode: run or sweep simulation presets."""
+    args = parse_simulation_args(argv)
+    if args.emit_backends is not None:
+        return _emit_backends(args, _built_schema(args))
+    plan = plan_simulation(args)
+    if isinstance(plan, int):
+        return plan
+    all_candidates = plan.candidates
+    last_preset, schema, analyze_subjects = plan.preset, plan.schema, plan.analyze_subjects
+
     if args.dry_run:
         for candidate in all_candidates:
             print(json.dumps(strip_internal(candidate), default=str))
@@ -553,6 +726,11 @@ def main(argv: list[str] | None = None) -> int:
         from .cache_build import report_cache_coverage
 
         return report_cache_coverage(all_candidates, schema, args.build_type)
+
+    if args.kv_report or args.kv_report_json:
+        from .kv_report import report_kv_cache
+
+        return report_kv_cache(all_candidates, args.build_type, as_json=args.kv_report_json)
 
     if args.profile:
         from .exec import perf_available
@@ -574,6 +752,7 @@ def main(argv: list[str] | None = None) -> int:
             profile_freq=args.profile_freq,
             analyze=not args.no_analyze,
             analyze_subjects=analyze_subjects,
+            plot=not args.no_plot,
         )
         return 0 if ok else 1
     return run_sweep(
@@ -582,8 +761,10 @@ def main(argv: list[str] | None = None) -> int:
         schema,
         args.build_type,
         refresh=args.refresh,
+        **({"parallelism": args.parallelism} if args.parallelism else {}),
         analyze=not args.no_analyze,
         analyze_subjects=analyze_subjects,
+        plot=not args.no_plot,
     )
 
 

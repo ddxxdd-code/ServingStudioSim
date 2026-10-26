@@ -1,0 +1,3859 @@
+//! GLM-5.2 NVIDIA NVFP4 architecture aligned to vLLM on B200.
+//!
+//! Tensor parallelism and expert parallelism use the same configurable rank
+//! group. EP4 is the profiled preset, while expert ownership and attention-head
+//! sharding are derived from `ep_size` so EP8 can use the same graph. The DSA
+//! indexer remains replicated at the checkpoint's 32 heads, matching the trace.
+//!
+//! The checkpoint quantizes routed expert linears only. Attention, dense FFN,
+//! and shared experts remain BF16; routed experts use explicit TRTLLM NVFP4
+//! activation quantization and fused MoE leaves. Sparse MLA uses the traced B200
+//! FlashInfer TRTLLM-gen path with FP8 E4M3 query/cache and BF16 output.
+//!
+//! Communication is rank-local compute followed by group all-reduce. vLLM
+//! fuses the attention all-reduce with the following residual RMSNorm below a
+//! GPU-specific size limit; this graph selects that measured fused leaf and
+//! retains standalone all-reduce + norm as the large-shape fallback.
+//!
+//! The checkpoint advertises a 1,048,576-token context, while the deployment's
+//! configured `max_model_len` determines the padded DSA logits allocation.
+
+use std::sync::Arc;
+
+use anyhow::Result;
+
+use crate::arch::contract::{
+    ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchInput, SpeculativeUnifiedModel,
+    UnifiedArchInput,
+};
+use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
+use crate::common::Fabric;
+use crate::op::attention::DsaSparseMlaExactVarlenConfig;
+use crate::op::Op;
+use crate::timing::bridge::DType;
+use crate::timing::expert_demand::ExpertDemand;
+use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
+use crate::timing::kernels::{
+    AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
+    AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
+    AllReduceResidualRmsNormKernel, AllReduceResidualRmsNormKernelConfig,
+    AllReduceResidualRmsNormKernelInput, AllReduceResidualRmsNormSpec, ElementwiseKernel,
+    ElementwiseKernelConfig, ElementwiseKernelInput, ResidualRmsNormKernel,
+    ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, SingleGemmKernel,
+    SingleGemmKernelConfig, SingleGemmKernelInput, MAX_LAUNCH_QUERY_ROWS,
+};
+use crate::timing::{
+    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
+    LeafMetrics, PerfApiBridge, Probe, SlotInput,
+};
+use crate::worklet::{
+    Bf16MoeLocalWorklet, Bf16MoeLocalWorkletConfig, Bf16MoeLocalWorkletInput,
+    Bf16MoeLocalWorkletResolved, Glm52DenseFfnLocalWorklet, Glm52DenseFfnLocalWorkletConfig,
+    Glm52DenseFfnLocalWorkletInput, Glm52DenseFfnLocalWorkletResolved, Glm52MoeRouterLocalWorklet,
+    Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
+    Glm52MoeRouterLocalWorkletResolved, Glm52MtpHeadLocalWorklet, Glm52MtpHeadLocalWorkletConfig,
+    Glm52MtpHeadLocalWorkletInput, Glm52MtpHeadLocalWorkletResolved, Glm52MtpPreludeLocalWorklet,
+    Glm52MtpPreludeLocalWorkletConfig, Glm52MtpPreludeLocalWorkletInput,
+    Glm52MtpPreludeLocalWorkletResolved, Glm52SharedExpertLocalWorklet,
+    Glm52SharedExpertLocalWorkletConfig, Glm52SharedExpertLocalWorkletInput,
+    Glm52SharedExpertLocalWorkletResolved, Nvfp4MoeLocalWorklet, Nvfp4MoeLocalWorkletConfig,
+    Nvfp4MoeLocalWorkletInput, Nvfp4MoeLocalWorkletResolved, VllmGlm52DsaAttnLocalDecodeInput,
+    VllmGlm52DsaAttnLocalWorklet, VllmGlm52DsaAttnLocalWorkletConfig,
+    VllmGlm52DsaAttnLocalWorkletInput, VllmGlm52DsaAttnLocalWorkletResolved,
+};
+
+const ARCH_KIND: &str = "glm52_vllm_nvfp4_dsa_moe";
+pub(crate) const NUM_LAYERS: u32 = 78;
+pub(crate) const NUM_DENSE_LAYERS: u32 = 3;
+pub(crate) const NUM_INITIAL_SHARED_LAYERS: u32 = 3;
+const NUM_SPARSE_CYCLES: u32 = 18;
+const NUM_SHARED_PER_CYCLE: u32 = 3;
+pub(crate) const HIDDEN_DIM: u32 = 6_144;
+const DENSE_INTERMEDIATE_DIM: u32 = 12_288;
+const NUM_ATTN_HEADS: u32 = 64;
+const RAW_NUM_KV_HEADS: u32 = 64;
+const SPARSE_NUM_KV_HEADS: u32 = 1;
+const Q_LORA_RANK: u32 = 2_048;
+const KV_LORA_RANK: u32 = 512;
+const QK_NOPE_HEAD_DIM: u32 = 192;
+const ROPE_DIM: u32 = 64;
+const V_HEAD_DIM: u32 = 256;
+const MODEL_INDEX_HEADS: u32 = 32;
+/// vLLM launches the indexer logits kernels at the model's 32 heads: B200
+/// captures run `sm100_*mqa_logits<32, 128, ...>`, and `sparse_attn_indexer.py`
+/// passes `q_quant` to them unpadded.
+const PROFILE_INDEX_HEADS: u32 = 32;
+const INDEX_HEAD_DIM: u32 = 128;
+const INDEX_TOP_K: u32 = 2_048;
+pub(crate) const CHECKPOINT_MAX_CONTEXT: u32 = 1_048_576;
+const NUM_EXPERTS: u32 = 256;
+const ROUTER_TOP_K: u32 = 8;
+const MOE_INTERMEDIATE_DIM: u32 = 2_048;
+const NUM_SHARED_EXPERTS: u32 = 1;
+/// vLLM's `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD` default: `shared_experts.py`
+/// runs the shared expert on the auxiliary stream only when the batch has at
+/// most this many tokens. CUDA-graph padding cannot cross it, since 256 is a
+/// capture size.
+const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
+const VOCAB_SIZE: u32 = 154_880;
+const NUM_MTP_LAYERS: u32 = 1;
+const CACHE_BLOCK_SIZE: u32 = 64;
+const QUANT_BLOCK_SIZE: u32 = 128;
+const SOFTMAX_SCALE_DENOMINATOR: u32 = 16;
+pub(crate) const FULL_INDEX_LAYERS: [u32; 21] = [
+    0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74,
+];
+
+const RESIDUAL_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
+const RMS_NORM_BACKENDS: &[&str] = &["flashinfer"];
+const SINGLE_GEMM_BACKENDS: &[&str] = &["torch_linear"];
+const VLLM_BF16_LINEAR_BACKENDS: &[&str] = &["torch_linear_vllm"];
+const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
+// The MLA query RoPE is not a streaming pointwise leaf: vLLM feeds the roped
+// q straight back into the attention op, so inductor fuses it into a kernel
+// that rewrites all of q. Its own L1 kind measures that fusion.
+const MAIN_ROPE_BACKENDS: &[&str] = &["vllm_inductor"];
+const FP8_SINGLE_GEMM_BACKENDS: &[&str] = &["deepgemm"];
+// vLLM quantises dense and routed activations with two different kernels.
+// Dense linears call its own `per_token_group_quant_8bit_kernel` (backend
+// `vllm_cuda`); only the routed grouped GEMM reaches TensorRT-LLM's
+// `scale_1x128_kernel` (backend `flashinfer_trtllm`). Both appear in the same
+// nsys iteration, so this is not a shape or a backend preference -- feeding the
+// dense leaves the routed curve over-predicted them ~2.05x at prefill.
+const DENSE_FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
+const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb"];
+const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up"];
+const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
+const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
+const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
+const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
+const NVFP4_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
+const NVFP4_FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100"];
+const BF16_FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100"];
+// Generic collective fallbacks remain available above FlashInfer's workspace
+// limit. Both FlashInfer attention-boundary fusion and standalone FFN
+// all-reduce use shape-aware leaves because vLLM's selection and PDL behavior
+// depend on token count, not only payload bytes.
+const ALLREDUCE_BACKENDS: &[&str] = &["nccl", "nvshmem"];
+const FUSED_ALLREDUCE_BACKENDS: &[&str] = &["flashinfer_trtllm"];
+
+// Leaf counts are properties of the accepted L2/L3 sections. `build` verifies
+// the compiled tree against these formulas, so drift cannot be hidden by a
+// stale handwritten expectation.
+#[cfg(test)]
+const ATTN_FULL_SLOTS: usize = 29;
+#[cfg(test)]
+const ATTN_SHARED_SLOTS: usize = 14;
+#[cfg(test)]
+const DENSE_FFN_SLOTS: usize = 4;
+#[cfg(test)]
+const ROUTER_SLOTS: usize = 2;
+#[cfg(test)]
+/// Input quantization plus one overlap-aware whole fused-MoE leaf.
+const NVFP4_EXPERT_SLOTS: usize = 2;
+#[cfg(test)]
+/// The BF16 path quantizes nothing, so it is the fused-MoE leaf alone.
+const BF16_EXPERT_SLOTS: usize = 1;
+#[cfg(test)]
+const SHARED_EXPERT_SLOTS: usize = 3;
+#[cfg(test)]
+const MTP_PRELUDE_SLOTS: usize = 6;
+#[cfg(test)]
+const MTP_HEAD_SLOTS: usize = 3;
+
+#[derive(Clone, Debug)]
+pub struct Glm52VllmNvfp4DsaMoeParallel {
+    pub ep_size: u16,
+    pub nvl_num_gpu: u16,
+    pub max_model_len: u32,
+    pub gpu_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Glm52VllmNvfp4DsaMoeConfigs {
+    pub model: Glm52ModelCfg,
+    pub parallel: Glm52VllmNvfp4DsaMoeParallel,
+    pub mtp_mode: Glm52MtpMode,
+    pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorkletConfig,
+    pub dense_ffn: Glm52DenseFfnLocalWorkletConfig,
+    pub initial_shared_attention: VllmGlm52DsaAttnLocalWorkletConfig,
+    pub cycle_full_attention: VllmGlm52DsaAttnLocalWorkletConfig,
+    pub cycle_shared_attention: VllmGlm52DsaAttnLocalWorkletConfig,
+    pub sparse_router: Glm52MoeRouterLocalWorkletConfig,
+    pub shared_expert: Glm52SharedExpertLocalWorkletConfig,
+    /// One identity-free active-count-ranked workload per TP/EP rank. Each
+    /// worklet owns the entire physical TRTLLM NVFP4 fused-MoE callable.
+    pub nvfp4_moe: Vec<Nvfp4MoeLocalWorkletConfig>,
+    /// The MTP layer's routed experts. The checkpoint quantizes the 78 body
+    /// layers and leaves this one in BF16, so it is a different L1 callable
+    /// with different args -- not `nvfp4_moe` at another shape.
+    pub mtp_bf16_moe: Option<Vec<Bf16MoeLocalWorkletConfig>>,
+    /// The same experts under the proposer's later calls, whose one row per
+    /// request carries no verify block. Present exactly when
+    /// `mtp_recurrent_attention` is.
+    pub mtp_recurrent_bf16_moe: Option<Vec<Bf16MoeLocalWorkletConfig>>,
+    pub tp_allreduce: AllReduceKernelConfig,
+    pub tp_allreduce_fusion: AllReduceFusionKernelConfig,
+    pub tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
+    pub embedding: ElementwiseKernelConfig,
+    pub final_norm: ResidualRmsNormKernelConfig,
+    pub lm_head: SingleGemmKernelConfig,
+    pub mtp_prelude: Option<Glm52MtpPreludeLocalWorkletConfig>,
+    /// The proposer's first call, which forwards the whole scheduled batch.
+    pub mtp_attention: Option<VllmGlm52DsaAttnLocalWorkletConfig>,
+    /// The proposer's later calls, one query row per request. Present only when
+    /// the recipe asks for a draft deeper than one.
+    pub mtp_recurrent_attention: Option<VllmGlm52DsaAttnLocalWorkletConfig>,
+    pub mtp_head: Option<Glm52MtpHeadLocalWorkletConfig>,
+    /// Candidate positions the recipe asks the proposer to draft per request.
+    /// `None` is an ordinary recipe, and only `Some` may build a speculative
+    /// model -- the two are checked against each other at build time.
+    pub speculative_draft_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Glm52VllmNvfp4DsaMoeResolved {
+    pub raw_cfg: Glm52VllmNvfp4DsaMoeConfigs,
+    pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorkletResolved,
+    pub dense_ffn: Glm52DenseFfnLocalWorkletResolved,
+    pub initial_shared_attention: VllmGlm52DsaAttnLocalWorkletResolved,
+    pub cycle_full_attention: VllmGlm52DsaAttnLocalWorkletResolved,
+    pub cycle_shared_attention: VllmGlm52DsaAttnLocalWorkletResolved,
+    pub sparse_router: Glm52MoeRouterLocalWorkletResolved,
+    pub shared_expert: Glm52SharedExpertLocalWorkletResolved,
+    pub nvfp4_moe: Vec<Nvfp4MoeLocalWorkletResolved>,
+    pub mtp_bf16_moe: Option<Vec<Bf16MoeLocalWorkletResolved>>,
+    pub mtp_recurrent_bf16_moe: Option<Vec<Bf16MoeLocalWorkletResolved>>,
+    pub tp_allreduce: AllReduceKernelConfig,
+    pub tp_allreduce_fusion: AllReduceFusionKernelConfig,
+    pub tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
+    pub embedding: ElementwiseKernelConfig,
+    pub final_norm: ResidualRmsNormKernelConfig,
+    pub lm_head: SingleGemmKernelConfig,
+    pub mtp_prelude: Option<Glm52MtpPreludeLocalWorkletResolved>,
+    pub mtp_attention: Option<VllmGlm52DsaAttnLocalWorkletResolved>,
+    pub mtp_recurrent_attention: Option<VllmGlm52DsaAttnLocalWorkletResolved>,
+    pub mtp_head: Option<Glm52MtpHeadLocalWorkletResolved>,
+}
+
+pub(crate) fn fit_failed(reason: impl Into<String>) -> BuildError {
+    BuildError::FitFailed {
+        kind: ARCH_KIND,
+        reason: reason.into(),
+    }
+}
+
+/// The TP boundaries are FlashInfer's fused all-reduce over the EP group, so
+/// a graph that builds them needs a measured fusion workspace at `ep_size`.
+fn refuse_unfused_all_reduce(parallel: &Glm52VllmNvfp4DsaMoeParallel) -> Result<(), BuildError> {
+    let ep_size = u32::from(parallel.ep_size);
+    match fused_all_reduce_refusal(FUSED_ALLREDUCE_BACKENDS, &parallel.gpu_name, ep_size) {
+        Some(reason) => Err(fit_failed(format!("ep_size {ep_size}: {reason}"))),
+        None => Ok(()),
+    }
+}
+
+fn attention_config(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    include_indexer: bool,
+    fp8: bool,
+    decode_next_n: u32,
+) -> VllmGlm52DsaAttnLocalWorkletConfig {
+    let (gemm_dtype, gemm_backends) = if fp8 {
+        (DType::Fp8E4m3, FP8_SINGLE_GEMM_BACKENDS)
+    } else {
+        (DType::Bf16, SINGLE_GEMM_BACKENDS)
+    };
+    VllmGlm52DsaAttnLocalWorkletConfig {
+        fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
+        include_indexer,
+        tp_size: parallel.ep_size,
+        residual_rms_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
+        rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
+        single_gemm_backends: gemm_backends.to_vec(),
+        main_rope_backends: MAIN_ROPE_BACKENDS.to_vec(),
+        q_absorb_backends: Q_ABSORB_BACKENDS.to_vec(),
+        v_up_backends: V_UP_BACKENDS.to_vec(),
+        indexer_gemm_backends: gemm_backends.to_vec(),
+        indexer_elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        index_cache_append_backends: INDEX_CACHE_AND_TOPK_BACKENDS.to_vec(),
+        index_prefill_logits_backends: INDEX_LOGITS_BACKENDS.to_vec(),
+        index_prefill_topk_backends: INDEX_CACHE_AND_TOPK_BACKENDS.to_vec(),
+        index_decode_logits_backends: INDEX_LOGITS_BACKENDS.to_vec(),
+        index_decode_topk_backends: INDEX_CACHE_AND_TOPK_BACKENDS.to_vec(),
+        sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
+        sparse_mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
+        sparse_elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        sparse_index_remap_backends: vec!["vllm_triton"],
+        gpu_name: parallel.gpu_name.clone(),
+        hidden_dim: model.hidden_dim.clone(),
+        num_attention_heads: model.num_attention_heads.clone(),
+        num_kv_heads: Dim::param("sparse_num_kv_heads", SPARSE_NUM_KV_HEADS),
+        q_lora_rank: model.q_lora_rank.clone(),
+        kv_lora_rank: model.kv_lora_rank.clone(),
+        qk_nope_head_dim: model.qk_nope_head_dim.clone(),
+        rope_dim: model.rope_dim.clone(),
+        v_head_dim: model.v_head_dim.clone(),
+        model_num_index_heads: model.model_num_index_heads.clone(),
+        profile_num_index_heads: Dim::param("profile_num_index_heads", PROFILE_INDEX_HEADS),
+        index_head_dim: model.index_head_dim.clone(),
+        selected_k: model.index_top_k,
+        max_model_len: Dim::param("max_model_len", parallel.max_model_len),
+        rope_max_position: model.max_context.clone(),
+        logits_row_stride: Dim::param("logits_row_stride", parallel.max_model_len),
+        cache_block_size: CACHE_BLOCK_SIZE,
+        quant_block_size: QUANT_BLOCK_SIZE,
+        softmax_scale_denominator: SOFTMAX_SCALE_DENOMINATOR,
+        base_dtype: DType::Bf16,
+        gemm_dtype,
+        index_cache_dtype: DType::Fp8E4m3,
+        index_q_dtype: DType::Fp8E4m3,
+        scale_dtype: DType::Fp32,
+        weight_dtype: DType::Fp32,
+        logits_dtype: DType::Fp32,
+        index_dtype: "int32".to_string(),
+        index_scale_format: "ue8m0".to_string(),
+        index_cache_format: "page_planar_fp8_fp32_scale".to_string(),
+        index_prefill_span_mode: "single_causal_tail".to_string(),
+        index_decode_context_mode: "uniform".to_string(),
+        index_decode_page_mapping: "unique_scattered".to_string(),
+        rope_is_neox_style: false,
+        index_clean_logits: false,
+        // Production selected indices are top-k ordered and page-local; this is
+        // the smallest supported deterministic profiling identity.
+        sparse_index_distribution: "recent_contiguous".to_string(),
+        sparse_cache_layout: "hnd_paged_mqa_fp8_latent_rope".to_string(),
+        sparse_mla_cache_format: "plain".to_string(),
+        sparse_attention_q_dtype: DType::Fp8E4m3,
+        sparse_attention_cache_dtype: DType::Fp8E4m3,
+        sparse_attention_output_dtype: DType::Bf16,
+        sparse_exact_varlen: Some(DsaSparseMlaExactVarlenConfig {
+            prefill_backends: vec!["flashinfer_trtllm_fp8"],
+            max_model_len: parallel.max_model_len,
+            prefill_index_distribution: "recent_contiguous".to_string(),
+            page_table_mapping: Some("request_contiguous".to_string()),
+        }),
+        decode_next_n,
+    }
+}
+
+pub fn build_configs(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    body_demand: &ExpertDemand,
+    // `mtp_demand` is required exactly when `mtp_mode` is not `Off`: there is
+    // nothing to resolve it from otherwise, and a build that never reaches the
+    // MTP layer must not fail on evidence it will not use.
+    mtp_demand: Option<&ExpertDemand>,
+    fp8: bool,
+    mtp_mode: Glm52MtpMode,
+) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
+    // Every decode request submits one query row, so the sparse-MLA leaves
+    // sweep the width-1 identity and there is no recurrent draft pass.
+    build_configs_for_decode(
+        model,
+        parallel,
+        body_demand,
+        mtp_demand,
+        None,
+        fp8,
+        mtp_mode,
+        1,
+        None,
+    )
+}
+
+/// The same recipe with a `draft_tokens`-deep MTP proposer in front of it.
+///
+/// `mtp_demand` is the MTP layer's own routed demand. It is one layer with its
+/// own load, which a corpus expresses as a layer slice of the same artifact and
+/// a marginal can only express as a second file. The proposer's first call
+/// forwards the target's verify blocks and `mtp_recurrent_demand` prices the
+/// one-row-per-request calls after it; a corpus samples the two at different
+/// widths, and a marginal gives the same answer to both.
+#[allow(clippy::too_many_arguments)]
+pub fn build_speculative_configs(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    body_demand: &ExpertDemand,
+    mtp_demand: &ExpertDemand,
+    mtp_recurrent_demand: &ExpertDemand,
+    fp8: bool,
+    mtp_mode: Glm52MtpMode,
+    draft_tokens: u32,
+) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
+    if draft_tokens == 0 {
+        return Err(fit_failed("speculative draft_tokens must be positive"));
+    }
+    if mtp_mode == Glm52MtpMode::Off {
+        return Err(fit_failed(
+            "speculative GLM-5.2 build requires mtp_mode != off",
+        ));
+    }
+    // The target verifies the drafted positions and the token they extend, so
+    // one decode request submits `draft_tokens + 1` query rows per iteration.
+    let decode_next_n = draft_tokens
+        .checked_add(1)
+        .ok_or_else(|| fit_failed("speculative draft_tokens + 1 overflows u32"))?;
+    build_configs_for_decode(
+        model,
+        parallel,
+        body_demand,
+        Some(mtp_demand),
+        Some(mtp_recurrent_demand),
+        fp8,
+        mtp_mode,
+        decode_next_n,
+        Some(draft_tokens),
+    )
+}
+
+/// The target of a speculative deployment whose proposer is not the MTP layer.
+///
+/// It verifies `draft_tokens + 1` rows per decode request like any speculative
+/// target, but runs no MTP layer: a separate draft checkpoint (GLM-5.3's
+/// DFlash2) owns the proposal, so the target carries no MTP configs and no MTP
+/// state. The proposer's own model builds the draft stage.
+pub fn build_verify_configs(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    body_demand: &ExpertDemand,
+    fp8: bool,
+    draft_tokens: u32,
+) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
+    if draft_tokens == 0 {
+        return Err(fit_failed("speculative draft_tokens must be positive"));
+    }
+    let decode_next_n = draft_tokens
+        .checked_add(1)
+        .ok_or_else(|| fit_failed("speculative draft_tokens + 1 overflows u32"))?;
+    build_configs_for_decode(
+        model,
+        parallel,
+        body_demand,
+        None,
+        None,
+        fp8,
+        Glm52MtpMode::Off,
+        decode_next_n,
+        Some(draft_tokens),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_configs_for_decode(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    body_demand: &ExpertDemand,
+    mtp_demand: Option<&ExpertDemand>,
+    mtp_recurrent_demand: Option<&ExpertDemand>,
+    fp8: bool,
+    mtp_mode: Glm52MtpMode,
+    decode_next_n: u32,
+    speculative_draft_tokens: Option<u32>,
+) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
+    validate_model_cfg(model).map_err(fit_failed)?;
+    if parallel.ep_size == 0 {
+        return Err(fit_failed("ep_size must be positive"));
+    }
+    if NUM_EXPERTS % u32::from(parallel.ep_size) != 0 {
+        return Err(fit_failed(format!(
+            "num_experts {NUM_EXPERTS} must be divisible by ep_size {}",
+            parallel.ep_size
+        )));
+    }
+    // The TP boundaries are FlashInfer's fused all-reduce over the EP group.
+    // EP1 is the one-GPU pipeline stage or DP rank, which builds no
+    // all-reduce; graphs that do build one check in `Glm52TargetForward::build`.
+    if parallel.ep_size > 1 {
+        refuse_unfused_all_reduce(parallel)?;
+    }
+    if parallel.nvl_num_gpu == 0
+        || parallel.nvl_num_gpu > parallel.ep_size
+        || parallel.ep_size % parallel.nvl_num_gpu != 0
+    {
+        return Err(fit_failed(format!(
+            "nvl_num_gpu {} must be a positive divisor of ep_size {}",
+            parallel.nvl_num_gpu, parallel.ep_size
+        )));
+    }
+    if !(1..=CHECKPOINT_MAX_CONTEXT).contains(&parallel.max_model_len) {
+        return Err(fit_failed(format!(
+            "max_model_len {} must be in 1..={CHECKPOINT_MAX_CONTEXT}",
+            parallel.max_model_len
+        )));
+    }
+    let mtp_demand = match (mtp_mode, mtp_demand) {
+        (Glm52MtpMode::Off, _) => None,
+        (_, Some(demand)) => Some(demand),
+        (_, None) => {
+            return Err(fit_failed(
+                "an MTP layer needs its own expert demand; none was resolved",
+            ))
+        }
+    };
+    if body_demand.num_experts() != NUM_EXPERTS as usize
+        || mtp_demand.is_some_and(|demand| demand.num_experts() != NUM_EXPERTS as usize)
+    {
+        return Err(fit_failed(format!(
+            "expert demand covers {} / {:?} experts, expected {NUM_EXPERTS}",
+            body_demand.num_experts(),
+            mtp_demand.map(ExpertDemand::num_experts)
+        )));
+    }
+    if fp8 {
+        return Err(fit_failed(
+            "glm52_vllm_nvfp4_dsa_moe requires fp8=false; NVFP4 routed weights are encoded by the architecture",
+        ));
+    }
+    let (gemm_dtype, gemm_backends) = if fp8 {
+        (DType::Fp8E4m3, FP8_SINGLE_GEMM_BACKENDS)
+    } else {
+        (DType::Bf16, SINGLE_GEMM_BACKENDS)
+    };
+    let gpu = parallel.gpu_name.clone();
+    let dense_full_index_attention = attention_config(model, parallel, true, fp8, decode_next_n);
+    let initial_shared_attention = attention_config(model, parallel, false, fp8, decode_next_n);
+    let cycle_full_attention = attention_config(model, parallel, true, fp8, decode_next_n);
+    let cycle_shared_attention = attention_config(model, parallel, false, fp8, decode_next_n);
+    let hidden_bytes = HIDDEN_DIM
+        .checked_mul(DType::Bf16.size_bytes())
+        .ok_or_else(|| fit_failed("hidden byte width overflows u32"))?;
+    let embedding_input = hidden_bytes
+        .checked_add(8)
+        .ok_or_else(|| fit_failed("embedding input byte rate overflows u32"))?;
+    // The proposer's first call is not a one-row decode. It forwards the
+    // target's complete scheduled-token batch so the MTP layer can fill its own
+    // attention state, then samples only request endpoints; later calls are one
+    // row per request. `IndexShare` reuses a previous layer's top-k, which the
+    // first call cannot do because it is the call that builds the state -- so
+    // when speculating, the first pass always computes the indexer and only the
+    // recurrent passes may share it.
+    let mtp_attention = match mtp_mode {
+        Glm52MtpMode::Off => None,
+        Glm52MtpMode::FullIndex | Glm52MtpMode::IndexShare => Some(attention_config(
+            model,
+            parallel,
+            mtp_mode == Glm52MtpMode::FullIndex || speculative_draft_tokens.is_some(),
+            fp8,
+            decode_next_n,
+        )),
+    };
+    // A one-deep draft has no pass after its first, so it has no recurrent
+    // config to build.
+    let mtp_recurrent_attention = match (mtp_mode, speculative_draft_tokens) {
+        (Glm52MtpMode::Off, _) | (_, None | Some(1)) => None,
+        (Glm52MtpMode::FullIndex, Some(_)) => Some(attention_config(model, parallel, true, fp8, 1)),
+        (Glm52MtpMode::IndexShare, Some(_)) => {
+            Some(attention_config(model, parallel, false, fp8, 1))
+        }
+    };
+    let mtp_prelude = (mtp_mode != Glm52MtpMode::Off).then(|| Glm52MtpPreludeLocalWorkletConfig {
+        elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
+        gemm_backends: gemm_backends.to_vec(),
+        gpu_name: gpu.clone(),
+        hidden_dim: model.hidden_dim.clone(),
+        vocab_size: model.vocab_size.clone(),
+        dtype: DType::Bf16,
+        gemm_dtype,
+        token_id_bytes: 8,
+        position_bytes: 8,
+    });
+    let mtp_head = (mtp_mode != Glm52MtpMode::Off).then(|| Glm52MtpHeadLocalWorkletConfig {
+        elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
+        gemm_backends: gemm_backends.to_vec(),
+        gpu_name: gpu.clone(),
+        hidden_dim: model.hidden_dim.clone(),
+        vocab_size: model.vocab_size.clone(),
+        // Same divisor the main lm_head below uses: this arch runs the EP group
+        // as its TP group, and the MTP head is that same `ParallelLMHead`.
+        tp_size: parallel.ep_size,
+        dtype: DType::Bf16,
+        gemm_dtype,
+    });
+
+    let nvfp4_moe = Nvfp4MoeLocalWorkletConfig::split_for_ep(
+        Nvfp4MoeLocalWorkletConfig {
+            hidden: model.hidden_dim.clone(),
+            moe_intermediate: model.moe_intermediate_dim.clone(),
+            num_experts: model.num_experts.clone(),
+            ep_size: parallel.ep_size,
+            // This arch shards experts and leaves each expert's intermediate
+            // width whole. A pure-TP consumer sets its real TP degree instead.
+            tp_size: 1,
+            top_k: model.router_top_k,
+            activation_dtype: DType::Bf16,
+            gpu_name: gpu.clone(),
+            quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
+            moe_backends: NVFP4_FUSED_MOE_BACKENDS.to_vec(),
+            weight_format: DType::Nvfp4E2m1,
+            activation_format: None,
+            group_size: 16,
+            routing_method: "minimax2".to_string(),
+            n_group: 1,
+            topk_group: 1,
+            routed_scaling_numerator: 5,
+            routed_scaling_denominator: 2,
+            expert_demand: ExpertDemand::Popularity {
+                layerwise_global_ppm: Vec::new(),
+            },
+            folded_rank_position: 0,
+        },
+        body_demand.clone(),
+    );
+    // The MTP layer is one layer, so its EP workload fold sees a single layer
+    // of routing evidence rather than the 75 the body folds over.
+    let mtp_experts = |demand: &ExpertDemand| {
+        Bf16MoeLocalWorkletConfig::split_for_ep(
+            Bf16MoeLocalWorkletConfig {
+                hidden: model.hidden_dim.clone(),
+                moe_intermediate: model.moe_intermediate_dim.clone(),
+                num_experts: model.num_experts.clone(),
+                ep_size: parallel.ep_size,
+                tp_size: 1,
+                top_k: model.router_top_k,
+                dtype: DType::Bf16,
+                gpu_name: gpu.clone(),
+                moe_backends: BF16_FUSED_MOE_BACKENDS.to_vec(),
+                routing_method: "minimax2".to_string(),
+                n_group: 1,
+                topk_group: 1,
+                routed_scaling_numerator: 5,
+                routed_scaling_denominator: 2,
+                expert_demand: ExpertDemand::Popularity {
+                    layerwise_global_ppm: Vec::new(),
+                },
+                folded_rank_position: 0,
+            },
+            demand.clone(),
+        )
+    };
+    let mtp_bf16_moe = mtp_demand.map(mtp_experts);
+    let mtp_recurrent_bf16_moe = match (&mtp_recurrent_attention, mtp_recurrent_demand) {
+        (None, _) => None,
+        (Some(_), Some(demand)) => Some(mtp_experts(demand)),
+        (Some(_), None) => {
+            return Err(fit_failed(
+                "a recurrent draft pass needs its own MTP expert demand",
+            ))
+        }
+    };
+
+    Ok(Glm52VllmNvfp4DsaMoeConfigs {
+        model: model.clone(),
+        parallel: parallel.clone(),
+        mtp_mode,
+        dense_full_index_attention,
+        dense_ffn: Glm52DenseFfnLocalWorkletConfig {
+            residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
+            gemm_backends: gemm_backends.to_vec(),
+            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            tp_size: parallel.ep_size,
+            gpu_name: gpu.clone(),
+            hidden_dim: model.hidden_dim.clone(),
+            intermediate_dim: model.dense_intermediate_dim.clone(),
+            dtype: DType::Bf16,
+            gemm_dtype,
+        },
+        initial_shared_attention,
+        cycle_full_attention,
+        cycle_shared_attention,
+        sparse_router: Glm52MoeRouterLocalWorkletConfig {
+            residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
+            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            proxy_gemm_backends: VLLM_BF16_LINEAR_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            hidden_dim: model.hidden_dim.clone(),
+            num_experts: model.num_experts.clone(),
+            top_k: model.router_top_k,
+            n_group: 1,
+            topk_group: 1,
+            base_dtype: DType::Bf16,
+            router_semantic_dtype: DType::Fp32,
+            // vLLM leaves the replicated router unquantized and calls BF16
+            // F.linear in its pinned PyTorch/CUDA environment.
+            proxy_gemm_dtype: DType::Bf16,
+            index_dtype: "int32".to_string(),
+            scoring_func: "sigmoid".to_string(),
+            topk_method: "noaux_tc".to_string(),
+            norm_topk_prob: true,
+            routed_scaling_numerator: 5,
+            routed_scaling_denominator: 2,
+            include_router_input_cast: false,
+            include_router_select: false,
+        },
+        shared_expert: Glm52SharedExpertLocalWorkletConfig {
+            // These unquantized projections are F.linear calls inside vLLM's
+            // pinned Torch/CUDA environment, like the router above.
+            gemm_backends: VLLM_BF16_LINEAR_BACKENDS.to_vec(),
+            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            tp_size: parallel.ep_size,
+            gpu_name: gpu.clone(),
+            hidden_dim: model.hidden_dim.clone(),
+            moe_intermediate_dim: model.moe_intermediate_dim.clone(),
+            n_shared_experts: model.num_shared_experts,
+            dtype: DType::Bf16,
+            gemm_dtype,
+        },
+        nvfp4_moe,
+        mtp_bf16_moe,
+        mtp_recurrent_bf16_moe,
+        tp_allreduce: AllReduceKernelConfig {
+            backends: ALLREDUCE_BACKENDS.to_vec(),
+            gpu_name: parallel.gpu_name.clone(),
+            num_gpus: u32::from(parallel.ep_size),
+            fabric: Fabric::Nvlink,
+        },
+        tp_allreduce_fusion: AllReduceFusionKernelConfig {
+            backends: FUSED_ALLREDUCE_BACKENDS.to_vec(),
+            gpu_name: parallel.gpu_name.clone(),
+            num_gpus: u32::from(parallel.ep_size),
+            hidden_dim: model.hidden_dim.get(),
+            dtype: DType::Bf16,
+            fabric: Fabric::Nvlink,
+            fused_token_limit: None,
+        },
+        tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig {
+            backends: FUSED_ALLREDUCE_BACKENDS.to_vec(),
+            gpu_name: parallel.gpu_name.clone(),
+            num_gpus: u32::from(parallel.ep_size),
+            hidden_dim: model.hidden_dim.get(),
+            dtype: DType::Bf16,
+            fabric: Fabric::Nvlink,
+            strategy: "auto".to_string(),
+            launch_with_pdl: true,
+            fp32_acc: true,
+            fused_token_limit: None,
+        },
+        embedding: ElementwiseKernelConfig {
+            backends: ELEMENTWISE_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            input_bytes_per_token: embedding_input.into(),
+            output_bytes_per_token: hidden_bytes.into(),
+        },
+        final_norm: ResidualRmsNormKernelConfig {
+            backends: RESIDUAL_NORM_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            hidden: model.hidden_dim.clone(),
+            dtype: DType::Bf16,
+        },
+        // lm_head is NOT quantised. The GLM-5.2-FP8 checkpoint lists `lm_head`
+        // and `model.embed_tokens` in `quantization_config.modules_to_not_convert`,
+        // and the safetensors header confirms `lm_head.weight` is BF16
+        // [154880, 6144]. It therefore has no input_quant leaf and runs the
+        // plain BF16 GEMM (`nvjet_tst_*`, cuBLASLt) in the trace.
+        //
+        // Following `fp8` here priced 0.886 GiB of weights instead of 1.77 GiB:
+        // 232.25 us against 463.46 us measured, a ratio of 0.5011. The BF16 DRAM
+        // floor alone is ~396 us, so the FP8 value was not even reachable.
+        lm_head: SingleGemmKernelConfig {
+            backends: SINGLE_GEMM_BACKENDS.to_vec(),
+            gpu_name: gpu,
+            // ParallelLMHead shards the vocabulary dimension across TP ranks.
+            // This arch uses the EP group as its TP group, so each rank owns
+            // vocab_size / ep_size output rows rather than the global matrix.
+            n: model.vocab_size.clone() / u32::from(parallel.ep_size),
+            k: model.hidden_dim.clone(),
+            dtype: DType::Bf16,
+        },
+        mtp_prelude,
+        mtp_attention,
+        mtp_recurrent_attention,
+        mtp_head,
+        speculative_draft_tokens,
+    })
+}
+
+fn validate_model_cfg(model: &Glm52ModelCfg) -> std::result::Result<(), String> {
+    for (name, actual, required) in [
+        ("hidden_dim", model.hidden_dim.get(), HIDDEN_DIM),
+        (
+            "dense_intermediate_dim",
+            model.dense_intermediate_dim.get(),
+            DENSE_INTERMEDIATE_DIM,
+        ),
+        (
+            "num_attention_heads",
+            model.num_attention_heads.get(),
+            NUM_ATTN_HEADS,
+        ),
+        (
+            "raw_num_kv_heads",
+            model.raw_num_kv_heads.get(),
+            RAW_NUM_KV_HEADS,
+        ),
+        ("q_lora_rank", model.q_lora_rank.get(), Q_LORA_RANK),
+        ("kv_lora_rank", model.kv_lora_rank.get(), KV_LORA_RANK),
+        (
+            "qk_nope_head_dim",
+            model.qk_nope_head_dim.get(),
+            QK_NOPE_HEAD_DIM,
+        ),
+        ("rope_dim", model.rope_dim.get(), ROPE_DIM),
+        ("v_head_dim", model.v_head_dim.get(), V_HEAD_DIM),
+        (
+            "model_num_index_heads",
+            model.model_num_index_heads.get(),
+            MODEL_INDEX_HEADS,
+        ),
+        ("index_head_dim", model.index_head_dim.get(), INDEX_HEAD_DIM),
+        ("index_top_k", model.index_top_k, INDEX_TOP_K),
+        (
+            "max_context",
+            model.max_context.get(),
+            CHECKPOINT_MAX_CONTEXT,
+        ),
+        ("num_experts", model.num_experts.get(), NUM_EXPERTS),
+        ("router_top_k", model.router_top_k, ROUTER_TOP_K),
+        (
+            "moe_intermediate_dim",
+            model.moe_intermediate_dim.get(),
+            MOE_INTERMEDIATE_DIM,
+        ),
+        (
+            "num_shared_experts",
+            model.num_shared_experts,
+            NUM_SHARED_EXPERTS,
+        ),
+        ("vocab_size", model.vocab_size.get(), VOCAB_SIZE),
+        ("num_layers", model.num_layers, NUM_LAYERS),
+        ("num_mtp_layers", model.num_mtp_layers, NUM_MTP_LAYERS),
+    ] {
+        if actual != required {
+            return Err(format!("{name} must be {required}, got {actual}"));
+        }
+    }
+    if model.dtype != DType::Bf16 || model.router_semantic_dtype != DType::Fp32 {
+        return Err("model dtypes must be BF16 base and FP32 router semantics".to_string());
+    }
+    if model.full_index_layers != FULL_INDEX_LAYERS {
+        return Err("full-index layer schedule must match GLM-5.2".to_string());
+    }
+    let expected_indexers: Vec<String> = (0..NUM_LAYERS)
+        .map(|layer| {
+            if FULL_INDEX_LAYERS.contains(&layer) {
+                "full"
+            } else {
+                "shared"
+            }
+            .to_string()
+        })
+        .collect();
+    if model.indexer_types != expected_indexers {
+        return Err("indexer_types must match GLM-5.2".to_string());
+    }
+    let expected_mlp: Vec<String> = (0..NUM_LAYERS)
+        .map(|layer| {
+            if layer < NUM_DENSE_LAYERS {
+                "dense"
+            } else {
+                "sparse"
+            }
+            .to_string()
+        })
+        .collect();
+    if model.mlp_layer_types != expected_mlp {
+        return Err("mlp_layer_types must match GLM-5.2".to_string());
+    }
+    if !model.index_share_for_mtp_iteration {
+        return Err("index_share_for_mtp_iteration must be enabled".to_string());
+    }
+    Ok(())
+}
+
+pub fn resolve_configs(cfgs: &Glm52VllmNvfp4DsaMoeConfigs) -> Glm52VllmNvfp4DsaMoeResolved {
+    Glm52VllmNvfp4DsaMoeResolved {
+        dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
+            &cfgs.dense_full_index_attention,
+        ),
+        dense_ffn: Glm52DenseFfnLocalWorklet::resolve_config(&cfgs.dense_ffn),
+        initial_shared_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
+            &cfgs.initial_shared_attention,
+        ),
+        cycle_full_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
+            &cfgs.cycle_full_attention,
+        ),
+        cycle_shared_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
+            &cfgs.cycle_shared_attention,
+        ),
+        sparse_router: Glm52MoeRouterLocalWorklet::resolve_config(&cfgs.sparse_router),
+        shared_expert: Glm52SharedExpertLocalWorklet::resolve_config(&cfgs.shared_expert),
+        nvfp4_moe: cfgs
+            .nvfp4_moe
+            .iter()
+            .map(Nvfp4MoeLocalWorklet::resolve_config)
+            .collect(),
+        mtp_bf16_moe: cfgs.mtp_bf16_moe.as_ref().map(|configs| {
+            configs
+                .iter()
+                .map(Bf16MoeLocalWorklet::resolve_config)
+                .collect()
+        }),
+        mtp_recurrent_bf16_moe: cfgs.mtp_recurrent_bf16_moe.as_ref().map(|configs| {
+            configs
+                .iter()
+                .map(Bf16MoeLocalWorklet::resolve_config)
+                .collect()
+        }),
+        tp_allreduce: cfgs.tp_allreduce.clone(),
+        tp_allreduce_fusion: cfgs.tp_allreduce_fusion.clone(),
+        tp_allreduce_fused: cfgs.tp_allreduce_fused.clone(),
+        embedding: cfgs.embedding.clone(),
+        final_norm: cfgs.final_norm.clone(),
+        lm_head: cfgs.lm_head.clone(),
+        mtp_prelude: cfgs
+            .mtp_prelude
+            .as_ref()
+            .map(Glm52MtpPreludeLocalWorklet::resolve_config),
+        mtp_attention: cfgs
+            .mtp_attention
+            .as_ref()
+            .map(VllmGlm52DsaAttnLocalWorklet::resolve_config),
+        mtp_recurrent_attention: cfgs
+            .mtp_recurrent_attention
+            .as_ref()
+            .map(VllmGlm52DsaAttnLocalWorklet::resolve_config),
+        mtp_head: cfgs
+            .mtp_head
+            .as_ref()
+            .map(Glm52MtpHeadLocalWorklet::resolve_config),
+        raw_cfg: cfgs.clone(),
+    }
+}
+
+/// The routed-expert compute of one sparse layer, at the precision that layer's
+/// experts are actually stored in.
+///
+/// GLM-5.2's 78 body layers are quantized to NVFP4, but the MTP layer's experts
+/// are not -- the checkpoint ships them in BF16. The two go through different
+/// L1 callables with different args, so the precision has to be a variant here
+/// rather than a flag: there is no shared kernel identity to parameterize.
+enum Glm52RoutedExperts {
+    /// One per EP child, ordered by identity-free active-expert workload.
+    Nvfp4(Vec<Nvfp4MoeLocalWorklet>),
+    Bf16(Vec<Bf16MoeLocalWorklet>),
+}
+
+impl Glm52RoutedExperts {
+    fn precision_label(&self) -> &'static str {
+        match self {
+            Self::Nvfp4(_) => "NVFP4",
+            Self::Bf16(_) => "BF16",
+        }
+    }
+
+    /// One node per EP child: that child's shared expert and its routed slice.
+    ///
+    /// The shared expert is compiled inside each child because it runs on every
+    /// rank, so the `Max` above this bills one rank's whole FFN, not a shared
+    /// expert added to the busiest rank's routed slice.
+    ///
+    /// vLLM launches the shared expert on an auxiliary stream only when the
+    /// batch has at most [`SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD`] tokens, where
+    /// it hides underneath the routed experts; a larger batch runs it serially.
+    /// The tree shape is fixed (INV-1), so each child mints the shared expert
+    /// twice -- concurrent with the routed slice, and serial after it -- and
+    /// `eval_with_shared` fills the one the batch size selects. `Parallel`
+    /// still sums work (INV-4), so the hidden copy's flops and bytes count.
+    fn compile_with_shared(
+        &self,
+        shared_expert: &Glm52SharedExpertLocalWorklet,
+        builder: &mut CostTreeBuilder,
+    ) -> Vec<CostNode> {
+        fn child(
+            shared_expert: &Glm52SharedExpertLocalWorklet,
+            builder: &mut CostTreeBuilder,
+            routed: impl FnOnce(&mut CostTreeBuilder) -> CostNode,
+        ) -> CostNode {
+            let concurrent = shared_expert.compile(builder);
+            let routed = routed(builder);
+            CostNode::Sum(vec![
+                CostNode::Parallel {
+                    overlap: 1.0,
+                    children: vec![concurrent, routed],
+                },
+                shared_expert.compile(builder),
+            ])
+        }
+        match self {
+            Self::Nvfp4(experts) => experts
+                .iter()
+                .map(|expert| child(shared_expert, builder, |b| expert.compile(b)))
+                .collect(),
+            Self::Bf16(experts) => experts
+                .iter()
+                .map(|expert| child(shared_expert, builder, |b| expert.compile(b)))
+                .collect(),
+        }
+    }
+
+    fn eval_with_shared(
+        &self,
+        shared_expert: &Glm52SharedExpertLocalWorklet,
+        batch_tokens: u32,
+        overlapped: bool,
+        ev: &mut Evaluator,
+    ) {
+        let shared = Glm52SharedExpertLocalWorkletInput { batch_tokens };
+        match self {
+            Self::Nvfp4(experts) => {
+                for expert in experts {
+                    shared_expert.eval_or_zero(&shared, !overlapped, ev);
+                    expert.eval(
+                        &Nvfp4MoeLocalWorkletInput {
+                            num_tokens: batch_tokens,
+                        },
+                        ev,
+                    );
+                    shared_expert.eval_or_zero(&shared, overlapped, ev);
+                }
+            }
+            Self::Bf16(experts) => {
+                for expert in experts {
+                    shared_expert.eval_or_zero(&shared, !overlapped, ev);
+                    expert.eval(
+                        &Bf16MoeLocalWorkletInput {
+                            num_tokens: batch_tokens,
+                        },
+                        ev,
+                    );
+                    shared_expert.eval_or_zero(&shared, overlapped, ev);
+                }
+            }
+        }
+    }
+}
+
+/// One sparse decoder layer: DSA attention, the router, and the shared plus
+/// routed experts, with the TP/EP collectives at its two boundaries when the
+/// layer runs over a rank group.
+pub(crate) struct Glm52SparseBody {
+    name: String,
+    attention: VllmGlm52DsaAttnLocalWorklet,
+    router: Glm52MoeRouterLocalWorklet,
+    routed_experts: Glm52RoutedExperts,
+    shared_expert: Glm52SharedExpertLocalWorklet,
+    /// `None` for a rank-local layer, which reduces nothing: the pipeline
+    /// stages run every head and expert on one GPU. It then mints no
+    /// collective leaf, and the router's standalone residual RMSNorm always
+    /// bills the post-attention norm that a fused all-reduce would otherwise own.
+    collectives: Option<Glm52SparseCollectives>,
+    ep_size: u16,
+    top_k: u32,
+}
+
+/// The two TP/EP boundaries of a sparse layer: the attention output's
+/// all-reduce (fused with the next residual RMSNorm below its size limit) and
+/// the MoE output's all-reduce (fused below its own limit).
+struct Glm52SparseCollectives {
+    attention_allreduce: Op<AllReduceKernel>,
+    attention_allreduce_fused: Op<AllReduceResidualRmsNormKernel>,
+    attention_allreduce_max_fused_tokens: u32,
+    ffn_allreduce_fallback: Op<AllReduceKernel>,
+    ffn_allreduce_fusion: Op<AllReduceFusionKernel>,
+    ffn_allreduce_max_fused_tokens: u32,
+}
+
+impl Glm52SparseCollectives {
+    fn build(
+        name: &str,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let attention_allreduce = build_atomic(
+            format!("{name}.attention.tp_allreduce"),
+            common.tp_allreduce.clone(),
+            AllReduceKernel::build,
+            bridge,
+        )?;
+        let attention_allreduce_fused = build_atomic(
+            format!("{name}.attention.tp_allreduce_residual_norm"),
+            common.tp_allreduce_fused.clone(),
+            AllReduceResidualRmsNormKernel::build,
+            bridge,
+        )?;
+        let attention_allreduce_max_fused_tokens =
+            AllReduceResidualRmsNormSpec::max_fused_tokens(&common.tp_allreduce_fused);
+        let ffn_allreduce_fallback = build_atomic(
+            format!("{name}.moe.tp_allreduce_fallback"),
+            common.tp_allreduce.clone(),
+            AllReduceKernel::build,
+            bridge,
+        )?;
+        let ffn_allreduce_fusion = build_atomic(
+            format!("{name}.moe.tp_allreduce"),
+            common.tp_allreduce_fusion.clone(),
+            AllReduceFusionKernel::build,
+            bridge,
+        )?;
+        let ffn_allreduce_max_fused_tokens =
+            AllReduceFusionSpec::max_fused_tokens(&common.tp_allreduce_fusion);
+        Ok(Self {
+            attention_allreduce,
+            attention_allreduce_fused,
+            attention_allreduce_max_fused_tokens,
+            ffn_allreduce_fallback,
+            ffn_allreduce_fusion,
+            ffn_allreduce_max_fused_tokens,
+        })
+    }
+
+    /// Whether the attention all-reduce takes the fused residual-RMSNorm path,
+    /// which then owns the post-attention norm.
+    fn attention_uses_fused(&self, total_tokens: u32) -> bool {
+        total_tokens > 0 && total_tokens <= self.attention_allreduce_max_fused_tokens
+    }
+
+    fn eval_attention(&self, total_tokens: u32, ev: &mut Evaluator) {
+        let use_fused = self.attention_uses_fused(total_tokens);
+        eval_atomic_or_zero(
+            &self.attention_allreduce,
+            AllReduceKernelInput {
+                message_size_bytes: u64::from(total_tokens) * u64::from(HIDDEN_DIM) * 2,
+            },
+            total_tokens == 0 || use_fused,
+            ev,
+        );
+        eval_atomic_or_zero(
+            &self.attention_allreduce_fused,
+            AllReduceResidualRmsNormKernelInput {
+                num_tokens: total_tokens,
+            },
+            !use_fused,
+            ev,
+        );
+    }
+
+    fn eval_ffn(&self, total_tokens: u32, ev: &mut Evaluator) {
+        let use_ffn_fusion =
+            total_tokens > 0 && total_tokens <= self.ffn_allreduce_max_fused_tokens;
+        eval_atomic_or_zero(
+            &self.ffn_allreduce_fallback,
+            AllReduceKernelInput {
+                message_size_bytes: u64::from(total_tokens) * u64::from(HIDDEN_DIM) * 2,
+            },
+            total_tokens == 0 || use_ffn_fusion,
+            ev,
+        );
+        eval_atomic_or_zero(
+            &self.ffn_allreduce_fusion,
+            AllReduceFusionKernelInput {
+                num_tokens: total_tokens,
+            },
+            !use_ffn_fusion,
+            ev,
+        );
+    }
+}
+
+impl Glm52SparseBody {
+    /// The NVFP4 body layer: layers 0..77.
+    fn build(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let routed_experts = Self::nvfp4_experts(&name, common, bridge)?;
+        Self::build_with_experts(name, attention, common, routed_experts, true, bridge)
+    }
+
+    /// The NVFP4 body layer on one GPU that owns every head and expert, so it
+    /// has no collective to build. Built from an EP1 recipe; the leaves are
+    /// named exactly as [`Self::build`] names them.
+    pub(crate) fn build_rank_local(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        if common.raw_cfg.parallel.ep_size != 1 {
+            return Err(fit_failed(format!(
+                "a rank-local sparse layer needs an EP1 recipe, got ep_size {}",
+                common.raw_cfg.parallel.ep_size
+            )));
+        }
+        let routed_experts = Self::nvfp4_experts(&name, common, bridge)?;
+        Self::build_with_experts(name, attention, common, routed_experts, false, bridge)
+    }
+
+    fn nvfp4_experts(
+        name: &str,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Glm52RoutedExperts, BuildError> {
+        // Every rank keeps the same slot name: the rank axis already shows up
+        // as the `Max` node's children, and a rank suffix would rename the
+        // slots a labeled kernel inventory refers to.
+        Ok(Glm52RoutedExperts::Nvfp4(
+            common
+                .nvfp4_moe
+                .iter()
+                .map(|rank_resolved| {
+                    Nvfp4MoeLocalWorklet::build(
+                        format!("{name}.moe.routed_experts"),
+                        rank_resolved.clone(),
+                        bridge,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    /// The BF16 MTP layer, whose experts the checkpoint does not quantize.
+    fn build_bf16(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        experts: &[Bf16MoeLocalWorkletResolved],
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let routed_experts = Glm52RoutedExperts::Bf16(
+            experts
+                .iter()
+                .map(|rank_resolved| {
+                    Bf16MoeLocalWorklet::build(
+                        format!("{name}.moe.routed_experts"),
+                        rank_resolved.clone(),
+                        bridge,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Self::build_with_experts(name, attention, common, routed_experts, true, bridge)
+    }
+
+    fn build_with_experts(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        routed_experts: Glm52RoutedExperts,
+        with_collectives: bool,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let attention =
+            VllmGlm52DsaAttnLocalWorklet::build(format!("{name}.attention"), attention, bridge)?;
+        let router = Glm52MoeRouterLocalWorklet::build(
+            format!("{name}.moe.router"),
+            common.sparse_router.clone(),
+            bridge,
+        )?;
+        let shared_expert = Glm52SharedExpertLocalWorklet::build(
+            format!("{name}.moe.shared_expert"),
+            common.shared_expert.clone(),
+            bridge,
+        )?;
+        let collectives = if with_collectives {
+            Some(Glm52SparseCollectives::build(&name, common, bridge)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            name,
+            attention,
+            router,
+            routed_experts,
+            shared_expert,
+            collectives,
+            ep_size: common.raw_cfg.parallel.ep_size,
+            top_k: common.raw_cfg.model.router_top_k,
+        })
+    }
+
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        let attention = labeled_max(
+            format!("{}.attention [Max over TP ranks]", self.name),
+            (0..self.ep_size)
+                .map(|_| self.attention.compile(builder))
+                .collect(),
+        );
+        let attention_collectives = self.collectives.as_ref().map(|collectives| {
+            [
+                collectives.attention_allreduce.compile(builder),
+                collectives.attention_allreduce_fused.compile(builder),
+            ]
+        });
+        // Leaves are numbered in the order they are declared here, and `eval`
+        // must push in the same order — so these statements follow the measured
+        // launch order, which is also the order the `Sum` below lists them in.
+        let router = labeled_max(
+            format!("{}.moe.router [Max over replicated TP/EP ranks]", self.name),
+            (0..self.ep_size)
+                .map(|_| self.router.compile(builder))
+                .collect(),
+        );
+        let experts_and_shared = labeled_max(
+            format!("{}.moe.local_experts [Max over TP/EP ranks]", self.name),
+            self.routed_experts
+                .compile_with_shared(&self.shared_expert, builder),
+        );
+        let ffn_collectives = self.collectives.as_ref().map(|collectives| {
+            [
+                collectives.ffn_allreduce_fallback.compile(builder),
+                collectives.ffn_allreduce_fusion.compile(builder),
+            ]
+        });
+        let precision = self.routed_experts.precision_label();
+        let (layer_label, moe_label) = if self.collectives.is_some() {
+            (
+                format!(
+                    "{} [sparse layer; TP=EP={}; top-{} {precision} routed experts]",
+                    self.name, self.ep_size, self.top_k
+                ),
+                format!(
+                    "{}.moe [router -> local shared+{precision} experts -> TP allreduce]",
+                    self.name
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "{} [sparse layer; rank-local, no collectives; top-{} {precision} routed experts]",
+                    self.name, self.top_k
+                ),
+                format!(
+                    "{}.moe [router -> local shared+{precision} experts]",
+                    self.name
+                ),
+            )
+        };
+        let mut layer = vec![attention];
+        layer.extend(attention_collectives.into_iter().flatten());
+        let mut moe = vec![router, experts_and_shared];
+        moe.extend(ffn_collectives.into_iter().flatten());
+        layer.push(CostNode::Labeled {
+            label: moe_label,
+            child: Box::new(CostNode::Sum(moe)),
+        });
+        CostNode::Labeled {
+            label: layer_label,
+            child: Box::new(CostNode::Sum(layer)),
+        }
+    }
+
+    pub(crate) fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
+        let group = &batch.groups[0];
+        for _ in 0..self.ep_size {
+            self.attention.eval(&group.attention_input, ev);
+        }
+        // Without a fused all-reduce the router's own leaf bills the
+        // post-attention residual RMSNorm.
+        let use_fused = self
+            .collectives
+            .as_ref()
+            .is_some_and(|collectives| collectives.attention_uses_fused(batch.total_tokens));
+        if let Some(collectives) = &self.collectives {
+            collectives.eval_attention(batch.total_tokens, ev);
+        }
+        for _ in 0..self.ep_size {
+            self.router.eval_with_post_attn_norm(
+                &Glm52MoeRouterLocalWorkletInput {
+                    batch_tokens: group.batch_tokens,
+                },
+                !use_fused,
+                ev,
+            );
+        }
+        let overlapped = group.batch_tokens <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD;
+        self.routed_experts.eval_with_shared(
+            &self.shared_expert,
+            group.batch_tokens,
+            overlapped,
+            ev,
+        );
+        if let Some(collectives) = &self.collectives {
+            collectives.eval_ffn(batch.total_tokens, ev);
+        }
+    }
+}
+
+/// One forward pass through the MTP layer: the prelude that assembles its
+/// input, the BF16 sparse decoder layer, and the head that samples from it.
+///
+/// A pass is parameterized by the batch it forwards and how many rows it
+/// samples, because those are the only things that differ between the single
+/// decode-only pass an ordinary iteration runs and the passes a draft stage
+/// chains. The three sections themselves are the same weights either way.
+struct Glm52MtpPass {
+    prelude: Glm52MtpPreludeLocalWorklet,
+    decoder: Glm52SparseBody,
+    head: Glm52MtpHeadLocalWorklet,
+}
+
+impl Glm52MtpPass {
+    fn build(
+        name: &str,
+        prelude: Glm52MtpPreludeLocalWorkletResolved,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        experts: Option<&[Bf16MoeLocalWorkletResolved]>,
+        head: Glm52MtpHeadLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        Ok(Self {
+            prelude: Glm52MtpPreludeLocalWorklet::build(
+                format!("{name}.prelude"),
+                prelude,
+                bridge,
+            )?,
+            decoder: Glm52SparseBody::build_bf16(
+                format!("{name}.decoder_sparse"),
+                attention,
+                common,
+                experts.ok_or_else(|| fit_failed("MTP expert configs are missing"))?,
+                bridge,
+            )?,
+            head: Glm52MtpHeadLocalWorklet::build(format!("{name}.head"), head, bridge)?,
+        })
+    }
+
+    /// `label_prefix` is the pass's own name, so chained passes stay distinct
+    /// in the cost log without renaming the leaves inside them.
+    fn compile(&self, builder: &mut CostTreeBuilder, ep_size: u16, label_prefix: &str) -> CostNode {
+        let prelude = labeled_max(
+            format!("{label_prefix}.prelude [Max over TP ranks]"),
+            (0..ep_size)
+                .map(|_| self.prelude.compile(builder))
+                .collect(),
+        );
+        let decoder = self.decoder.compile(builder);
+        let head = labeled_max(
+            format!("{label_prefix}.head [Max over TP ranks]"),
+            (0..ep_size).map(|_| self.head.compile(builder)).collect(),
+        );
+        CostNode::Sum(vec![prelude, decoder, head])
+    }
+
+    /// The prelude forwards every token in `batch`; the head samples only
+    /// `sample_rows` of them. The two differ whenever a pass forwards a wider
+    /// batch than it proposes from, which is what the first draft pass does.
+    fn eval(&self, batch: &NormalizedBatch, ep_size: u16, sample_rows: u32, ev: &mut Evaluator) {
+        let group = &batch.groups[0];
+        for _ in 0..ep_size {
+            self.prelude.eval(
+                &Glm52MtpPreludeLocalWorkletInput {
+                    batch_tokens: group.batch_tokens,
+                },
+                ev,
+            );
+        }
+        self.decoder.eval(batch, ev);
+        for _ in 0..ep_size {
+            self.head.eval(
+                &Glm52MtpHeadLocalWorkletInput {
+                    batch_tokens: sample_rows,
+                },
+                ev,
+            );
+        }
+    }
+}
+
+/// Layers 0..77 plus the output head: the forward pass every GLM-5.2 NVFP4
+/// deployment runs, speculating or not.
+///
+/// It is its own struct so that the two models can share it by composition
+/// rather than one wrapping the other. The ordinary model appends a decode-only
+/// MTP pass to this section; the speculative model appends a draft stage that
+/// runs a different number of times and bills different shapes. Neither is a
+/// special case of the other, so neither owns the other -- they own this.
+pub(crate) struct Glm52TargetForward {
+    name: String,
+    pub(crate) ep_size: u16,
+    embedding: Op<ElementwiseKernel>,
+    embedding_allreduce_fallback: Op<AllReduceKernel>,
+    embedding_allreduce_fusion: Op<AllReduceFusionKernel>,
+    embedding_allreduce_max_fused_tokens: u32,
+    dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet,
+    dense_ffn: Glm52DenseFfnLocalWorklet,
+    dense_attention_allreduce: Op<AllReduceKernel>,
+    dense_attention_allreduce_fused: Op<AllReduceResidualRmsNormKernel>,
+    dense_attention_allreduce_max_fused_tokens: u32,
+    dense_ffn_allreduce_fallback: Op<AllReduceKernel>,
+    dense_ffn_allreduce_fusion: Op<AllReduceFusionKernel>,
+    dense_ffn_allreduce_max_fused_tokens: u32,
+    initial_shared_sparse: Glm52SparseBody,
+    cycle_full_sparse: Glm52SparseBody,
+    cycle_shared_sparse: Glm52SparseBody,
+    final_norm: Op<ResidualRmsNormKernel>,
+    lm_head: Op<SingleGemmKernel>,
+}
+
+/// The MTP proposer: one pass over the target's whole scheduled batch, then one
+/// pass per further drafted position over the request endpoints alone.
+///
+/// The depth is fixed when the stage is built, because it also fixes the width
+/// the target verifies at and therefore which measured sparse-MLA identities
+/// the whole model compiles against. It is not something an iteration chooses.
+struct Glm52MtpDraftStage {
+    first_pass: Glm52MtpPass,
+    /// The pass every drafted position after the first runs. Compiled once and
+    /// folded `recurrent_count` times: the calls are the same launch graph at
+    /// the same shape, differing only in how far each request's context has
+    /// advanced, which is at most `draft_tokens - 1` tokens.
+    recurrent: Option<Glm52MtpPass>,
+    recurrent_count: u32,
+}
+
+impl Glm52MtpDraftStage {
+    fn compile(&self, builder: &mut CostTreeBuilder, ep_size: u16, name: &str) -> CostNode {
+        let mut passes = vec![CostNode::Labeled {
+            label: format!("{name}.mtp.step_0 [whole-batch pass; builds the index state]"),
+            child: Box::new(self.first_pass.compile(
+                builder,
+                ep_size,
+                &format!("{name}.mtp.step_0"),
+            )),
+        }];
+        if let Some(recurrent) = &self.recurrent {
+            passes.push(CostNode::Labeled {
+                label: format!(
+                    "{name}.mtp.recurrent [request-endpoint pass; {} steps]",
+                    self.recurrent_count
+                ),
+                child: Box::new(CostNode::Scale {
+                    n: self.recurrent_count,
+                    child: Box::new(recurrent.compile(
+                        builder,
+                        ep_size,
+                        &format!("{name}.mtp.recurrent"),
+                    )),
+                }),
+            });
+        }
+        CostNode::Sum(passes)
+    }
+
+    fn eval(&self, batch: &NormalizedBatch, ep_size: u16, max_model_len: u32, ev: &mut Evaluator) {
+        // Step 0 receives every scheduled target row so the MTP layer can fill
+        // its own attention state, but only the request endpoints reach the
+        // sampling head -- a request proposes one token, not one per row it
+        // contributed.
+        self.first_pass
+            .eval(batch, ep_size, batch.groups[0].request_count, ev);
+        if let Some(recurrent) = &self.recurrent {
+            // The folded node bills this one evaluation `recurrent_count`
+            // times, so it has to be evaluated at the context the fold
+            // represents. Step i runs after i positions were appended, so the
+            // advances are 1..=recurrent_count and their mean is what preserves
+            // the KV the stage reads -- the same collapse the indexer makes
+            // over a mixed decode batch.
+            let mean_advance = (self.recurrent_count + 1).div_ceil(2);
+            let endpoints = batch.request_endpoints(mean_advance, max_model_len);
+            let rows = endpoints.groups[0].request_count;
+            recurrent.eval(&endpoints, ep_size, rows, ev);
+        }
+    }
+}
+
+/// The architecture as an ordinary deployment runs it: layers 0..77 and the
+/// output head, once per iteration.
+///
+/// There is no MTP layer here. The checkpoint has one, but a deployment that
+/// does not speculate never runs it and never allocates its KV --
+/// [`Glm52VllmNvfp4DsaMoeSpeculativeModel`] is the model that does.
+pub struct Glm52VllmNvfp4DsaMoeModel {
+    target: Glm52TargetForward,
+    pub nvl_num_gpu: u16,
+    pub max_model_len: u32,
+    pub num_attn_dp_groups: u16,
+    pub num_attn_shards: u16,
+    pub kv_cache_layout: KvCacheLayout,
+    cost_flat: Vec<FlatCostNode>,
+    n_slots: usize,
+}
+
+/// The same architecture deployed with an MTP proposer in front of it.
+///
+/// This is a sibling of [`Glm52VllmNvfp4DsaMoeModel`], not a wrapper around it.
+/// The two share the target forward by composition and nothing else: they
+/// compile separate trees, so a speculative iteration's cost log carries the
+/// draft passes as real slots and cannot be mistaken for an ordinary one, and
+/// they implement different traits, so a deployment cannot bind one where it
+/// meant the other.
+pub struct Glm52VllmNvfp4DsaMoeSpeculativeModel {
+    target: Glm52TargetForward,
+    draft: Glm52MtpDraftStage,
+    /// Candidate positions drafted per request per iteration. Not an `Option`:
+    /// this model always speculates, which is the point of it being its own
+    /// type. The compiled tree already assumes this depth.
+    draft_tokens: u32,
+    mtp_mode: Glm52MtpMode,
+    max_model_len: u32,
+    num_attn_dp_groups: u16,
+    num_attn_shards: u16,
+    kv_cache_layout: KvCacheLayout,
+    cost_flat: Vec<FlatCostNode>,
+    n_slots: usize,
+}
+
+impl Glm52TargetForward {
+    pub(crate) fn build(
+        name: String,
+        resolved: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        refuse_unfused_all_reduce(&resolved.raw_cfg.parallel)?;
+        let ep_size = resolved.raw_cfg.parallel.ep_size;
+        let embedding = build_atomic(
+            format!("{name}.main.embedding"),
+            resolved.embedding.clone(),
+            ElementwiseKernel::build,
+            bridge,
+        )?;
+        let embedding_allreduce_fallback = build_atomic(
+            format!("{name}.main.embedding.tp_allreduce_fallback"),
+            resolved.tp_allreduce.clone(),
+            AllReduceKernel::build,
+            bridge,
+        )?;
+        let embedding_allreduce_fusion = build_atomic(
+            format!("{name}.main.embedding.tp_allreduce"),
+            resolved.tp_allreduce_fusion.clone(),
+            AllReduceFusionKernel::build,
+            bridge,
+        )?;
+        let embedding_allreduce_max_fused_tokens =
+            AllReduceFusionSpec::max_fused_tokens(&resolved.tp_allreduce_fusion);
+        let dense_full_index_attention = VllmGlm52DsaAttnLocalWorklet::build(
+            format!("{name}.body.dense_full_index.attention"),
+            resolved.dense_full_index_attention.clone(),
+            bridge,
+        )?;
+        let dense_ffn = Glm52DenseFfnLocalWorklet::build(
+            format!("{name}.body.dense_full_index.ffn"),
+            resolved.dense_ffn.clone(),
+            bridge,
+        )?;
+        let dense_attention_allreduce = build_atomic(
+            format!("{name}.body.dense_full_index.attention.tp_allreduce"),
+            resolved.tp_allreduce.clone(),
+            AllReduceKernel::build,
+            bridge,
+        )?;
+        let dense_attention_allreduce_fused = build_atomic(
+            format!("{name}.body.dense_full_index.attention.tp_allreduce_residual_norm"),
+            resolved.tp_allreduce_fused.clone(),
+            AllReduceResidualRmsNormKernel::build,
+            bridge,
+        )?;
+        let dense_attention_allreduce_max_fused_tokens =
+            AllReduceResidualRmsNormSpec::max_fused_tokens(&resolved.tp_allreduce_fused);
+        let dense_ffn_allreduce_fallback = build_atomic(
+            format!("{name}.body.dense_full_index.ffn.tp_allreduce_fallback"),
+            resolved.tp_allreduce.clone(),
+            AllReduceKernel::build,
+            bridge,
+        )?;
+        let dense_ffn_allreduce_fusion = build_atomic(
+            format!("{name}.body.dense_full_index.ffn.tp_allreduce"),
+            resolved.tp_allreduce_fusion.clone(),
+            AllReduceFusionKernel::build,
+            bridge,
+        )?;
+        let dense_ffn_allreduce_max_fused_tokens =
+            AllReduceFusionSpec::max_fused_tokens(&resolved.tp_allreduce_fusion);
+        let initial_shared_sparse = Glm52SparseBody::build(
+            format!("{name}.body.sparse_initial_index_share"),
+            resolved.initial_shared_attention.clone(),
+            resolved,
+            bridge,
+        )?;
+        let cycle_full_sparse = Glm52SparseBody::build(
+            format!("{name}.body.sparse_cycle_full_index"),
+            resolved.cycle_full_attention.clone(),
+            resolved,
+            bridge,
+        )?;
+        let cycle_shared_sparse = Glm52SparseBody::build(
+            format!("{name}.body.sparse_cycle_index_share"),
+            resolved.cycle_shared_attention.clone(),
+            resolved,
+            bridge,
+        )?;
+        let final_norm = build_atomic(
+            format!("{name}.main.final_residual_rms_norm"),
+            resolved.final_norm.clone(),
+            ResidualRmsNormKernel::build,
+            bridge,
+        )?;
+        let lm_head = build_atomic(
+            format!("{name}.main.lm_head"),
+            resolved.lm_head.clone(),
+            SingleGemmKernel::build,
+            bridge,
+        )?;
+        Ok(Self {
+            name,
+            ep_size,
+            embedding,
+            embedding_allreduce_fallback,
+            embedding_allreduce_fusion,
+            embedding_allreduce_max_fused_tokens,
+            dense_full_index_attention,
+            dense_ffn,
+            dense_attention_allreduce,
+            dense_attention_allreduce_fused,
+            dense_attention_allreduce_max_fused_tokens,
+            dense_ffn_allreduce_fallback,
+            dense_ffn_allreduce_fusion,
+            dense_ffn_allreduce_max_fused_tokens,
+            initial_shared_sparse,
+            cycle_full_sparse,
+            cycle_shared_sparse,
+            final_norm,
+            lm_head,
+        })
+    }
+}
+
+pub fn build(
+    name: String,
+    resolved: Glm52VllmNvfp4DsaMoeResolved,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4DsaMoeModel, BuildError> {
+    if resolved.raw_cfg.speculative_draft_tokens.is_some() {
+        return Err(fit_failed(
+            "a speculative recipe must build through build_speculative",
+        ));
+    }
+    if resolved.raw_cfg.mtp_mode != Glm52MtpMode::Off {
+        return Err(fit_failed(
+            "an ordinary GLM-5.2 NVFP4 deployment does not run the MTP layer; \
+             use build_speculative to run it as a proposer",
+        ));
+    }
+    let ep_size = resolved.raw_cfg.parallel.ep_size;
+    let nvl_num_gpu = resolved.raw_cfg.parallel.nvl_num_gpu;
+    let max_model_len = resolved.raw_cfg.parallel.max_model_len;
+    let target = Glm52TargetForward::build(name.clone(), &resolved, bridge)?;
+    let mut model = Glm52VllmNvfp4DsaMoeModel {
+        target,
+        nvl_num_gpu,
+        max_model_len,
+        num_attn_dp_groups: 1,
+        num_attn_shards: ep_size,
+        kv_cache_layout: kv_cache_layout(ep_size, Glm52MtpMode::Off),
+        cost_flat: Vec::new(),
+        n_slots: 0,
+    };
+    let tree = model.cost_tree();
+    model.cost_flat = tree.flatten();
+    model.n_slots = tree.n_slots();
+    Ok(model)
+}
+
+pub fn build_speculative(
+    name: String,
+    resolved: Glm52VllmNvfp4DsaMoeResolved,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4DsaMoeSpeculativeModel, BuildError> {
+    let draft_tokens = resolved
+        .raw_cfg
+        .speculative_draft_tokens
+        .ok_or_else(|| fit_failed("build_speculative requires a speculative recipe"))?;
+    let ep_size = resolved.raw_cfg.parallel.ep_size;
+    let max_model_len = resolved.raw_cfg.parallel.max_model_len;
+    let mtp_mode = resolved.raw_cfg.mtp_mode;
+    let target = Glm52TargetForward::build(name.clone(), &resolved, bridge)?;
+
+    let (prelude, first_attention, head) = match (
+        resolved.mtp_prelude.clone(),
+        resolved.mtp_attention.clone(),
+        resolved.mtp_head.clone(),
+    ) {
+        (Some(prelude), Some(attention), Some(head)) => (prelude, attention, head),
+        _ => return Err(fit_failed("a speculative recipe requires an MTP proposer")),
+    };
+    let first_pass = Glm52MtpPass::build(
+        &format!("{name}.mtp.step_0"),
+        prelude.clone(),
+        first_attention,
+        resolved.mtp_bf16_moe.as_deref(),
+        head.clone(),
+        &resolved,
+        bridge,
+    )?;
+    // A `draft_tokens`-deep proposer runs one whole-batch pass and
+    // `draft_tokens - 1` endpoint passes after it. Those are one launch graph
+    // run repeatedly, so they are built once and folded.
+    let recurrent_count = draft_tokens.saturating_sub(1);
+    let recurrent = if recurrent_count == 0 {
+        None
+    } else {
+        let recurrent_attention = resolved
+            .mtp_recurrent_attention
+            .clone()
+            .ok_or_else(|| fit_failed("a multi-step draft requires a recurrent MTP config"))?;
+        Some(Glm52MtpPass::build(
+            &format!("{name}.mtp.recurrent"),
+            prelude,
+            recurrent_attention,
+            resolved.mtp_recurrent_bf16_moe.as_deref(),
+            head,
+            &resolved,
+            bridge,
+        )?)
+    };
+
+    let mut model = Glm52VllmNvfp4DsaMoeSpeculativeModel {
+        target,
+        draft: Glm52MtpDraftStage {
+            first_pass,
+            recurrent,
+            recurrent_count,
+        },
+        draft_tokens,
+        mtp_mode,
+        max_model_len,
+        num_attn_dp_groups: 1,
+        num_attn_shards: ep_size,
+        kv_cache_layout: kv_cache_layout(ep_size, mtp_mode),
+        cost_flat: Vec::new(),
+        n_slots: 0,
+    };
+    let tree = model.cost_tree();
+    model.cost_flat = tree.flatten();
+    model.n_slots = tree.n_slots();
+    Ok(model)
+}
+
+impl Glm52TargetForward {
+    /// The target forward's cost-tree children, in evaluation order.
+    ///
+    /// Returned rather than wrapped in a root so that each model can append its
+    /// own tail -- the MTP pass or the draft stage -- into the same builder and
+    /// label the root for itself. The slot order is the order of this vector,
+    /// so it is also the shared prefix of both models' cost logs.
+    pub(crate) fn compile_children(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
+        let embedding = labeled_max(
+            format!("{}.main.embedding [Max over TP ranks]", self.name),
+            (0..self.ep_size)
+                .map(|_| self.embedding.compile(builder))
+                .collect(),
+        );
+        let embedding_allreduce_fallback = self.embedding_allreduce_fallback.compile(builder);
+        let embedding_allreduce_fusion = self.embedding_allreduce_fusion.compile(builder);
+        let dense_attention = labeled_max(
+            format!(
+                "{}.body.dense_full_index.attention [Max over TP ranks]",
+                self.name
+            ),
+            (0..self.ep_size)
+                .map(|_| self.dense_full_index_attention.compile(builder))
+                .collect(),
+        );
+        let dense_attention_allreduce = self.dense_attention_allreduce.compile(builder);
+        let dense_attention_allreduce_fused = self.dense_attention_allreduce_fused.compile(builder);
+        let dense_ffn = labeled_max(
+            format!(
+                "{}.body.dense_full_index.ffn [Max over TP ranks]",
+                self.name
+            ),
+            (0..self.ep_size)
+                .map(|_| self.dense_ffn.compile(builder))
+                .collect(),
+        );
+        let dense_ffn_allreduce_fallback = self.dense_ffn_allreduce_fallback.compile(builder);
+        let dense_ffn_allreduce_fusion = self.dense_ffn_allreduce_fusion.compile(builder);
+        let dense = CostNode::Labeled {
+            label: "layers 0..2: dense + full index (3 layers)".to_string(),
+            child: Box::new(CostNode::Scale {
+                n: NUM_DENSE_LAYERS,
+                child: Box::new(CostNode::Sum(vec![
+                    dense_attention,
+                    dense_attention_allreduce,
+                    dense_attention_allreduce_fused,
+                    dense_ffn,
+                    dense_ffn_allreduce_fallback,
+                    dense_ffn_allreduce_fusion,
+                ])),
+            }),
+        };
+        let initial_shared = CostNode::Labeled {
+            label: "layers 3..5: sparse + IndexShare (3 layers)".to_string(),
+            child: Box::new(CostNode::Scale {
+                n: NUM_INITIAL_SHARED_LAYERS,
+                child: Box::new(self.initial_shared_sparse.compile(builder)),
+            }),
+        };
+        let cycle = CostNode::Labeled {
+            label: "layers 6..77: 18 cycles of full-index + 3 IndexShare".to_string(),
+            child: Box::new(CostNode::Scale {
+                n: NUM_SPARSE_CYCLES,
+                child: Box::new(CostNode::Sum(vec![
+                    self.cycle_full_sparse.compile(builder),
+                    CostNode::Scale {
+                        n: NUM_SHARED_PER_CYCLE,
+                        child: Box::new(self.cycle_shared_sparse.compile(builder)),
+                    },
+                ])),
+            }),
+        };
+        let final_norm = labeled_max(
+            format!(
+                "{}.main.final_residual_rms_norm [Max over TP ranks]",
+                self.name
+            ),
+            (0..self.ep_size)
+                .map(|_| self.final_norm.compile(builder))
+                .collect(),
+        );
+        let lm_head = labeled_max(
+            format!("{}.main.lm_head [Max over TP ranks]", self.name),
+            (0..self.ep_size)
+                .map(|_| self.lm_head.compile(builder))
+                .collect(),
+        );
+        vec![
+            embedding,
+            embedding_allreduce_fallback,
+            embedding_allreduce_fusion,
+            dense,
+            initial_shared,
+            cycle,
+            final_norm,
+            lm_head,
+        ]
+    }
+
+    /// Evaluates layers 0..77 and the output head into the shared slot prefix.
+    ///
+    /// The slot order matches `compile_children`, so a model that appends its
+    /// own tail after calling this fills the same prefix either way.
+    pub(crate) fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
+        let group = &batch.groups[0];
+        for _ in 0..self.ep_size {
+            eval_atomic_or_zero(
+                &self.embedding,
+                ElementwiseKernelInput {
+                    num_tokens: group.batch_tokens,
+                },
+                group.batch_tokens == 0,
+                ev,
+            );
+        }
+        let use_embedding_fusion = batch.total_tokens > 0
+            && batch.total_tokens <= self.embedding_allreduce_max_fused_tokens;
+        eval_atomic_or_zero(
+            &self.embedding_allreduce_fallback,
+            AllReduceKernelInput {
+                message_size_bytes: u64::from(batch.total_tokens) * u64::from(HIDDEN_DIM) * 2,
+            },
+            batch.total_tokens == 0 || use_embedding_fusion,
+            ev,
+        );
+        eval_atomic_or_zero(
+            &self.embedding_allreduce_fusion,
+            AllReduceFusionKernelInput {
+                num_tokens: batch.total_tokens,
+            },
+            !use_embedding_fusion,
+            ev,
+        );
+        let group = &batch.groups[0];
+        for _ in 0..self.ep_size {
+            self.dense_full_index_attention
+                .eval(&group.attention_input, ev);
+        }
+        let use_dense_fused = batch.total_tokens > 0
+            && batch.total_tokens <= self.dense_attention_allreduce_max_fused_tokens;
+        eval_atomic_or_zero(
+            &self.dense_attention_allreduce,
+            AllReduceKernelInput {
+                message_size_bytes: u64::from(batch.total_tokens) * u64::from(HIDDEN_DIM) * 2,
+            },
+            batch.total_tokens == 0 || use_dense_fused,
+            ev,
+        );
+        eval_atomic_or_zero(
+            &self.dense_attention_allreduce_fused,
+            AllReduceResidualRmsNormKernelInput {
+                num_tokens: batch.total_tokens,
+            },
+            !use_dense_fused,
+            ev,
+        );
+        for _ in 0..self.ep_size {
+            self.dense_ffn.eval_with_post_attn_norm(
+                &Glm52DenseFfnLocalWorkletInput {
+                    batch_tokens: group.batch_tokens,
+                },
+                !use_dense_fused,
+                ev,
+            );
+        }
+        let use_dense_ffn_fusion = batch.total_tokens > 0
+            && batch.total_tokens <= self.dense_ffn_allreduce_max_fused_tokens;
+        eval_atomic_or_zero(
+            &self.dense_ffn_allreduce_fallback,
+            AllReduceKernelInput {
+                message_size_bytes: u64::from(batch.total_tokens) * u64::from(HIDDEN_DIM) * 2,
+            },
+            batch.total_tokens == 0 || use_dense_ffn_fusion,
+            ev,
+        );
+        eval_atomic_or_zero(
+            &self.dense_ffn_allreduce_fusion,
+            AllReduceFusionKernelInput {
+                num_tokens: batch.total_tokens,
+            },
+            !use_dense_ffn_fusion,
+            ev,
+        );
+        self.initial_shared_sparse.eval(batch, ev);
+        self.cycle_full_sparse.eval(batch, ev);
+        self.cycle_shared_sparse.eval(batch, ev);
+        for _ in 0..self.ep_size {
+            eval_atomic_or_zero(
+                &self.final_norm,
+                ResidualRmsNormKernelInput {
+                    m: group.batch_tokens,
+                },
+                group.batch_tokens == 0,
+                ev,
+            );
+        }
+        for _ in 0..self.ep_size {
+            eval_atomic_or_zero(
+                &self.lm_head,
+                SingleGemmKernelInput {
+                    m: group.logits_rows,
+                },
+                group.logits_rows == 0,
+                ev,
+            );
+        }
+    }
+}
+
+impl Glm52VllmNvfp4DsaMoeModel {
+    pub fn cost_tree(&self) -> CostTree {
+        let mut builder = CostTreeBuilder::new();
+        let children = self.target.compile_children(&mut builder);
+        let root = CostNode::Labeled {
+            label: format!(
+                "{} (Glm52VllmNvfp4DsaMoeModel) [TP=EP{}; attention DP groups={}; \
+                 timing_context<={}]",
+                self.target.name, self.target.ep_size, self.num_attn_dp_groups, self.max_model_len
+            ),
+            child: Box::new(CostNode::Sum(children)),
+        };
+        builder.finish(root)
+    }
+
+    fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
+        let batch = normalize_input(input, self.target.ep_size, self.max_model_len)
+            .unwrap_or_else(|reason| panic!("invalid Glm52VllmNvfp4DsaMoeModel input: {reason}"));
+        self.target.eval(&batch, ev);
+    }
+}
+
+impl IterwiseUnifiedModel for Glm52VllmNvfp4DsaMoeModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch, self.target.ep_size, self.max_model_len).map(|_| ())
+    }
+
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
+    }
+
+    fn gpus_per_replica(&self) -> u16 {
+        self.target.ep_size
+    }
+
+    fn num_attn_dp_groups(&self) -> u16 {
+        self.num_attn_dp_groups
+    }
+
+    fn num_attn_shards(&self) -> u16 {
+        self.num_attn_shards
+    }
+
+    fn cost_log_manifest(&self) -> CostManifest {
+        self.cost_tree().manifest()
+    }
+
+    fn eval_iter(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
+        slots.clear();
+        slots.resize(self.n_slots, LeafMetrics::ZERO);
+        let mut evaluator = Evaluator::new(slots);
+        self.eval_into(batch, &mut evaluator);
+        assert_eq!(
+            evaluator.filled(),
+            self.n_slots,
+            "eval must fill every compiled slot"
+        );
+        CostTree::aggregate(&self.cost_flat, slots, scratch)
+    }
+
+    fn eval_iter_with_inputs(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        slots.clear();
+        slots.resize(self.n_slots, LeafMetrics::ZERO);
+        let mut evaluator = Evaluator::with_inputs(slots, inputs);
+        self.eval_into(batch, &mut evaluator);
+        assert_eq!(
+            evaluator.filled(),
+            self.n_slots,
+            "eval must fill every compiled slot"
+        );
+        let total = CostTree::aggregate(&self.cost_flat, slots, scratch);
+        assert_eq!(
+            inputs.len(),
+            self.n_slots,
+            "slot inputs must align with compiled slots"
+        );
+        total
+    }
+}
+
+impl Glm52VllmNvfp4DsaMoeSpeculativeModel {
+    pub fn cost_tree(&self) -> CostTree {
+        let mut builder = CostTreeBuilder::new();
+        let mut children = self.target.compile_children(&mut builder);
+        children.push(CostNode::Labeled {
+            label: format!(
+                "MTP layer 78 [{:?}; {}-deep draft]",
+                self.mtp_mode, self.draft_tokens
+            ),
+            child: Box::new(self.draft.compile(
+                &mut builder,
+                self.target.ep_size,
+                &self.target.name,
+            )),
+        });
+        let root = CostNode::Labeled {
+            label: format!(
+                "{} (Glm52VllmNvfp4DsaMoeSpeculativeModel) [TP=EP{}; attention DP groups={}; \
+                 MTP={:?}; draft tokens={}; verify width={}; timing_context<={}]",
+                self.target.name,
+                self.target.ep_size,
+                self.num_attn_dp_groups,
+                self.mtp_mode,
+                self.draft_tokens,
+                self.draft_tokens.saturating_add(1),
+                self.max_model_len
+            ),
+            child: Box::new(CostNode::Sum(children)),
+        };
+        builder.finish(root)
+    }
+
+    fn eval_into(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
+        let batch = normalize_speculative_input(input, self.draft_tokens, self.max_model_len)
+            .unwrap_or_else(|reason| {
+                panic!("invalid Glm52VllmNvfp4DsaMoeSpeculativeModel input: {reason}")
+            });
+        self.target.eval(&batch, ev);
+        self.draft
+            .eval(&batch, self.target.ep_size, self.max_model_len, ev);
+    }
+}
+
+impl SpeculativeUnifiedModel for Glm52VllmNvfp4DsaMoeSpeculativeModel {
+    fn check_input(&self, batch: &SpeculativeArchInput) -> Result<(), String> {
+        normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
+    }
+
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
+    }
+
+    fn max_model_len(&self) -> u32 {
+        self.max_model_len
+    }
+
+    fn gpus_per_replica(&self) -> u16 {
+        self.target.ep_size
+    }
+
+    fn num_attn_dp_groups(&self) -> u16 {
+        self.num_attn_dp_groups
+    }
+
+    fn num_attn_shards(&self) -> u16 {
+        self.num_attn_shards
+    }
+
+    fn cost_log_manifest(&self) -> CostManifest {
+        self.cost_tree().manifest()
+    }
+
+    fn eval_speculative_iter(
+        &self,
+        batch: &SpeculativeArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
+        slots.clear();
+        slots.resize(self.n_slots, LeafMetrics::ZERO);
+        let mut evaluator = Evaluator::new(slots);
+        self.eval_into(batch, &mut evaluator);
+        assert_eq!(
+            evaluator.filled(),
+            self.n_slots,
+            "eval must fill every compiled slot"
+        );
+        CostTree::aggregate(&self.cost_flat, slots, scratch)
+    }
+
+    fn eval_speculative_iter_with_inputs(
+        &self,
+        batch: &SpeculativeArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        slots.clear();
+        slots.resize(self.n_slots, LeafMetrics::ZERO);
+        let mut evaluator = Evaluator::with_inputs(slots, inputs);
+        self.eval_into(batch, &mut evaluator);
+        assert_eq!(
+            evaluator.filled(),
+            self.n_slots,
+            "eval must fill every compiled slot"
+        );
+        let total = CostTree::aggregate(&self.cost_flat, slots, scratch);
+        assert_eq!(
+            inputs.len(),
+            self.n_slots,
+            "slot inputs must align with compiled slots"
+        );
+        total
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NormalizedGroup {
+    pub(crate) batch_tokens: u32,
+    /// Requests in this group, prefilling and decoding alike. An MTP draft pass
+    /// forwards exactly this many rows, one endpoint per request.
+    pub(crate) request_count: u32,
+    /// Rows the sampler needs logits for: one per prefill request, and every
+    /// decode query row, because a verify step scores all of them. This exceeds
+    /// `request_count` by the drafted positions.
+    pub(crate) logits_rows: u32,
+    /// One entry per request, at that request's own KV length.
+    pub(crate) endpoint_context_lens: Vec<u32>,
+    pub(crate) attention_input: VllmGlm52DsaAttnLocalWorkletInput,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NormalizedBatch {
+    pub(crate) groups: Vec<NormalizedGroup>,
+    pub(crate) total_tokens: u32,
+}
+
+impl NormalizedBatch {
+    /// One query row per request, at that request's KV length advanced by
+    /// `context_advance`.
+    ///
+    /// This is the shape a recurrent draft pass sees: it extends every
+    /// scheduled request by one position, whether that request was prefilling
+    /// or decoding, so a prefill request contributes one endpoint row here just
+    /// like a decode request does.
+    fn request_endpoints(&self, context_advance: u32, max_model_len: u32) -> Self {
+        let groups: Vec<NormalizedGroup> = self
+            .groups
+            .iter()
+            .map(|group| {
+                let context_lens: Vec<u32> = group
+                    .endpoint_context_lens
+                    .iter()
+                    .map(|&context| context.saturating_add(context_advance).min(max_model_len))
+                    .collect();
+                let decode_context = context_lens.iter().copied().max();
+                NormalizedGroup {
+                    batch_tokens: group.request_count,
+                    request_count: group.request_count,
+                    logits_rows: group.request_count,
+                    endpoint_context_lens: context_lens.clone(),
+                    attention_input: VllmGlm52DsaAttnLocalWorkletInput {
+                        num_new_tokens: group.request_count,
+                        prefill_query_cache_pairs: Vec::new(),
+                        decode: decode_context.map(|context_len| {
+                            VllmGlm52DsaAttnLocalDecodeInput {
+                                batch_size: group.request_count,
+                                context_len,
+                                context_lens: Some(context_lens),
+                                requires_padding: false,
+                            }
+                        }),
+                    },
+                }
+            })
+            .collect();
+        let total_tokens: u32 = groups.iter().map(|group| group.batch_tokens).sum();
+        Self {
+            groups,
+            total_tokens,
+        }
+    }
+}
+
+pub(crate) fn normalize_input(
+    input: &UnifiedArchInput,
+    _ep_size: u16,
+    max_model_len: u32,
+) -> std::result::Result<NormalizedBatch, String> {
+    if input.groups.len() != 1 {
+        return Err(format!(
+            "expected exactly one tensor-parallel attention group, got {}",
+            input.groups.len()
+        ));
+    }
+    let group = normalize_group(0, &input.groups[0], max_model_len)?;
+    let total_tokens = group.batch_tokens;
+    Ok(NormalizedBatch {
+        groups: vec![group],
+        total_tokens,
+    })
+}
+
+/// Validate one attention group and lower it to the worklet inputs.
+///
+/// `group_index` only labels errors. A data-parallel graph lowers each of its
+/// attention groups through this, so every group obeys the same rules as the
+/// single tensor-parallel group.
+pub(crate) fn normalize_group(
+    group_index: usize,
+    group: &ArchGroupInput,
+    max_model_len: u32,
+) -> std::result::Result<NormalizedGroup, String> {
+    let mut prefill_tokens = 0_u32;
+    let mut prefill_query_cache_pairs = Vec::with_capacity(group.prefill_chunk_pairs.len());
+    let mut endpoint_context_lens =
+        Vec::with_capacity(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len());
+    for (request_index, &(prefix, append)) in group.prefill_chunk_pairs.iter().enumerate() {
+        if append == 0 {
+            return Err(format!(
+                "group {group_index} prefill request {request_index} append must be nonzero"
+            ));
+        }
+        let cache_tokens = prefix.checked_add(append).ok_or_else(|| {
+            format!(
+                "group {group_index} prefill request {request_index} prefix+append overflows u32"
+            )
+        })?;
+        if cache_tokens > max_model_len {
+            return Err(format!(
+                "group {group_index} prefill request {request_index} context {cache_tokens} exceeds max_model_len {max_model_len}"
+            ));
+        }
+        prefill_tokens = prefill_tokens
+            .checked_add(append)
+            .ok_or_else(|| format!("group {group_index} prefill token sum overflows u32"))?;
+        prefill_query_cache_pairs.push((append, cache_tokens));
+        endpoint_context_lens.push(cache_tokens);
+    }
+    if group.prefill_tokens != prefill_tokens {
+        return Err(format!(
+            "group {group_index} prefill_tokens {} must equal append sum {prefill_tokens}",
+            group.prefill_tokens
+        ));
+    }
+    let decode_tokens = u32::try_from(group.decode_kv_lens.len())
+        .map_err(|_| format!("group {group_index} decode request count exceeds u32"))?;
+    if group.decode_tokens != decode_tokens {
+        return Err(format!(
+            "group {group_index} decode_tokens {} must equal decode_kv_lens length {decode_tokens}",
+            group.decode_tokens
+        ));
+    }
+    let mut decode_context = None;
+    for (request_index, &context) in group.decode_kv_lens.iter().enumerate() {
+        if !(1..=max_model_len).contains(&context) {
+            return Err(format!(
+                "group {group_index} decode request {request_index} context {context} must be in 1..={max_model_len}"
+            ));
+        }
+        decode_context = Some(decode_context.map_or(context, |current: u32| current.max(context)));
+        endpoint_context_lens.push(context);
+    }
+    let batch_tokens = prefill_tokens
+        .checked_add(decode_tokens)
+        .ok_or_else(|| format!("group {group_index} batch token sum overflows u32"))?;
+    if group.batch_tokens != batch_tokens {
+        return Err(format!(
+            "group {group_index} batch_tokens {} must equal prefill+decode {batch_tokens}",
+            group.batch_tokens
+        ));
+    }
+    check_sparse_attention_rows(group_index, batch_tokens)?;
+    let request_count = u32::try_from(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len())
+        .map_err(|_| format!("group {group_index} request count exceeds u32"))?;
+    Ok(NormalizedGroup {
+        batch_tokens,
+        request_count,
+        // Without speculation every decode request submits one query row,
+        // so the sampler scores exactly one row per request.
+        logits_rows: request_count,
+        endpoint_context_lens,
+        attention_input: VllmGlm52DsaAttnLocalWorkletInput {
+            num_new_tokens: batch_tokens,
+            prefill_query_cache_pairs,
+            decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
+                batch_size: decode_tokens,
+                context_len,
+                context_lens: Some(group.decode_kv_lens.clone()),
+                requires_padding: false,
+            }),
+        },
+    })
+}
+
+/// vLLM runs sparse attention as one FlashInfer launch over every token row of
+/// the batch, prefill and decode alike, so the batch fits that launch or the
+/// iteration fails.
+fn check_sparse_attention_rows(group_index: usize, rows: u32) -> std::result::Result<(), String> {
+    if rows > MAX_LAUNCH_QUERY_ROWS {
+        return Err(format!(
+            "group {group_index} has {rows} token rows; the sparse attention launch takes at most {MAX_LAUNCH_QUERY_ROWS}"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_speculative_input(
+    input: &SpeculativeArchInput,
+    draft_tokens: u32,
+    max_model_len: u32,
+) -> std::result::Result<NormalizedBatch, String> {
+    // The compiled tree already assumes a depth. An iteration that drafted a
+    // different one would be billed against the wrong measured identities, so
+    // the mismatch is an error rather than a reshape.
+    if input.draft_tokens != draft_tokens {
+        return Err(format!(
+            "input draft_tokens {} must match model draft_tokens {draft_tokens}",
+            input.draft_tokens
+        ));
+    }
+    if input.groups.len() != 1 {
+        return Err(format!(
+            "expected exactly one tensor-parallel attention group, got {}",
+            input.groups.len()
+        ));
+    }
+    let mut groups = Vec::with_capacity(input.groups.len());
+    let mut total_tokens = 0_u32;
+    for (group_index, group) in input.groups.iter().enumerate() {
+        let mut prefill_tokens = 0_u32;
+        let mut prefill_query_cache_pairs = Vec::with_capacity(group.prefill_chunk_pairs.len());
+        let mut endpoint_context_lens =
+            Vec::with_capacity(group.prefill_chunk_pairs.len() + group.decode_requests.len());
+        for (request_index, &(prefix, append)) in group.prefill_chunk_pairs.iter().enumerate() {
+            if append == 0 {
+                return Err(format!(
+                    "group {group_index} prefill request {request_index} append must be nonzero"
+                ));
+            }
+            let cache_tokens = prefix.checked_add(append).ok_or_else(|| {
+                format!("group {group_index} prefill request {request_index} prefix+append overflows u32")
+            })?;
+            if cache_tokens > max_model_len {
+                return Err(format!(
+                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds max_model_len {max_model_len}"
+                ));
+            }
+            prefill_tokens = prefill_tokens
+                .checked_add(append)
+                .ok_or_else(|| format!("group {group_index} prefill token sum overflows u32"))?;
+            prefill_query_cache_pairs.push((append, cache_tokens));
+            endpoint_context_lens.push(cache_tokens);
+        }
+        if group.prefill_tokens != prefill_tokens {
+            return Err(format!(
+                "group {group_index} prefill_tokens {} must equal append sum {prefill_tokens}",
+                group.prefill_tokens
+            ));
+        }
+
+        let decode_request_count = u32::try_from(group.decode_requests.len())
+            .map_err(|_| format!("group {group_index} decode request count exceeds u32"))?;
+        let mut decode_tokens = 0_u32;
+        let mut decode_context = None;
+        let mut decode_context_lens = Vec::with_capacity(group.decode_requests.len());
+        let mut uniform_decode_count = 0_u32;
+        for (request_index, decode) in group.decode_requests.iter().enumerate() {
+            // A full verify window runs the uniform `k + 1`-row decode kernels;
+            // acceptance truncates the output after this compute, not the
+            // compute. Only a request at max_model_len verifies fewer rows, and
+            // that ragged row cannot share the uniform launch: price it on the
+            // prefill-shaped `(query, cache)` path, a profiled shape. Such
+            // steps are rare (the last verifies of a request ending within
+            // `k` of the limit).
+            let clipped = decode
+                .check_verify_row(draft_tokens, max_model_len)
+                .map_err(|reason| {
+                    format!("group {group_index} decode request {request_index}: {reason}")
+                })?;
+            decode_tokens = decode_tokens
+                .checked_add(decode.query_len)
+                .ok_or_else(|| format!("group {group_index} decode token sum overflows u32"))?;
+            endpoint_context_lens.push(decode.kv_len);
+            if clipped {
+                prefill_query_cache_pairs.push((decode.query_len, decode.kv_len));
+                continue;
+            }
+            uniform_decode_count += 1;
+            decode_context = Some(
+                decode_context.map_or(decode.kv_len, |current: u32| current.max(decode.kv_len)),
+            );
+            decode_context_lens.push(decode.kv_len);
+        }
+        if group.decode_tokens != decode_tokens {
+            return Err(format!(
+                "group {group_index} decode_tokens {} must equal query_len sum {decode_tokens}",
+                group.decode_tokens
+            ));
+        }
+        let batch_tokens = prefill_tokens
+            .checked_add(decode_tokens)
+            .ok_or_else(|| format!("group {group_index} batch token sum overflows u32"))?;
+        if group.batch_tokens != batch_tokens {
+            return Err(format!(
+                "group {group_index} batch_tokens {} must equal prefill+decode {batch_tokens}",
+                group.batch_tokens
+            ));
+        }
+        check_sparse_attention_rows(group_index, batch_tokens)?;
+        let prefill_request_count = u32::try_from(group.prefill_chunk_pairs.len())
+            .map_err(|_| format!("group {group_index} prefill request count exceeds u32"))?;
+        let request_count = prefill_request_count
+            .checked_add(decode_request_count)
+            .ok_or_else(|| format!("group {group_index} request count overflows u32"))?;
+        // Every verified row is scored, so the head is wider than the request
+        // count by exactly the drafted positions.
+        let logits_rows = prefill_request_count
+            .checked_add(decode_tokens)
+            .ok_or_else(|| format!("group {group_index} logits row count overflows u32"))?;
+        total_tokens = total_tokens
+            .checked_add(batch_tokens)
+            .ok_or_else(|| "pooled token count overflows u32".to_string())?;
+        groups.push(NormalizedGroup {
+            batch_tokens,
+            request_count,
+            logits_rows,
+            endpoint_context_lens,
+            attention_input: VllmGlm52DsaAttnLocalWorkletInput {
+                num_new_tokens: batch_tokens,
+                prefill_query_cache_pairs,
+                decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
+                    batch_size: uniform_decode_count,
+                    context_len,
+                    context_lens: Some(decode_context_lens),
+                    requires_padding: false,
+                }),
+            },
+        });
+    }
+    Ok(NormalizedBatch {
+        groups,
+        total_tokens,
+    })
+}
+
+fn labeled_max(label: String, children: Vec<CostNode>) -> CostNode {
+    CostNode::Labeled {
+        label,
+        child: Box::new(CostNode::Max {
+            overlap: 1.0,
+            children,
+        }),
+    }
+}
+
+pub(crate) fn build_atomic<K, C, F>(
+    name: String,
+    config: C,
+    build_kernel: F,
+    bridge: &PerfApiBridge,
+) -> Result<Op<K>, BuildError>
+where
+    K: Probe,
+    F: FnOnce(String, C, &PerfApiBridge) -> std::result::Result<K, BuildError>,
+{
+    Ok(Op::new(
+        name.clone(),
+        Arc::new(build_kernel(name, config, bridge)?),
+    ))
+}
+
+pub(crate) fn eval_atomic_or_zero<K>(op: &Op<K>, input: K::Input, zero: bool, ev: &mut Evaluator)
+where
+    K: Probe,
+    K::Input: Clone + Into<SlotInput>,
+{
+    let metrics = if zero {
+        LeafMetrics::ZERO
+    } else {
+        op.kernel.eval(&input)
+    };
+    ev.push(metrics, || input.clone().into());
+}
+
+/// Layers 0..77 plus the output head -- the whole ordinary model, and the
+/// shared prefix of the speculative one.
+#[cfg(test)]
+fn expected_slot_count(ep_size: u16) -> usize {
+    let ep = usize::from(ep_size);
+    // Scale nodes do not mint additional slots. Each static section is built
+    // once, while rank-local work is represented by Max over TP/EP children.
+    let dense = ep * (ATTN_FULL_SLOTS + DENSE_FFN_SLOTS) + 4;
+    let sparse_shared =
+        ep * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + 2 * SHARED_EXPERT_SLOTS + NVFP4_EXPERT_SLOTS) + 4;
+    let sparse_full = sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS);
+    (ep + 2) + dense + sparse_shared + sparse_full + sparse_shared + ep + ep
+}
+
+/// One MTP pass. `shares_index` is what `IndexShare` buys: reusing a previous
+/// layer's top-k instead of computing the indexer.
+///
+/// The MTP layer's experts are BF16, which quantizes nothing, so it mints one
+/// expert leaf per rank where a body layer's NVFP4 experts mint two.
+#[cfg(test)]
+fn expected_mtp_pass_slots(ep_size: u16, shares_index: bool) -> usize {
+    let ep = usize::from(ep_size);
+    let sparse_shared =
+        ep * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + 2 * SHARED_EXPERT_SLOTS + BF16_EXPERT_SLOTS) + 4;
+    let decoder = if shares_index {
+        sparse_shared
+    } else {
+        sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS)
+    };
+    ep * MTP_PRELUDE_SLOTS + decoder + ep * MTP_HEAD_SLOTS
+}
+
+/// A draft stage compiles one whole-batch pass and, when the draft is deeper
+/// than one, one endpoint pass folded `draft_tokens - 1` times. Only the
+/// endpoint pass may share the index; the first is what builds it.
+#[cfg(test)]
+fn expected_speculative_slot_count(
+    ep_size: u16,
+    mtp_mode: Glm52MtpMode,
+    draft_tokens: u32,
+) -> usize {
+    let shares_index = mtp_mode == Glm52MtpMode::IndexShare;
+    let recurrent = if draft_tokens > 1 {
+        expected_mtp_pass_slots(ep_size, shares_index)
+    } else {
+        0
+    };
+    expected_slot_count(ep_size) + expected_mtp_pass_slots(ep_size, false) + recurrent
+}
+
+/// One decoder layer's MLA cache for one token on one rank: one FP8
+/// (kv_lora_rank + rope_dim) vector.
+pub(crate) fn mla_bytes_per_layer_token() -> u64 {
+    u64::from(KV_LORA_RANK + ROPE_DIM) * u64::from(DType::Fp8E4m3.size_bytes())
+}
+
+/// One indexer layer's DSA index cache for one token on one rank: the FP8
+/// index key plus one FP32 scale.
+pub(crate) fn indexer_bytes_per_layer_token() -> u64 {
+    u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes())
+}
+
+/// One rank's MLA latent and DSA index caches of `mla_layers` and
+/// `index_layers` layers. vLLM replicates both on every attention TP rank, so a
+/// TP group holds this layout on each rank.
+pub(crate) fn mla_dsa_kv_cache_layout(mla_layers: u32, index_layers: u32) -> KvCacheLayout {
+    KvCacheLayout::new()
+        .with_part(KvCachePart::per_token(
+            "mla",
+            u64::from(mla_layers) * mla_bytes_per_layer_token(),
+        ))
+        .with_part(KvCachePart::per_token(
+            "indexer",
+            u64::from(index_layers) * indexer_bytes_per_layer_token(),
+        ))
+}
+
+/// The whole model's cache: the latent of all 78 body layers and the index key
+/// of the 21 full-index layers, plus the MTP layer's latent and index key.
+///
+/// vLLM builds an indexer, and so an index cache, only on a layer that
+/// computes its own top-k; a shared layer reuses the previous result and has
+/// none. The MTP layer always builds one, whether or not its later draft steps
+/// share the index (fork `deepseek_v2.py`, `DeepseekV2MLAAttention`).
+pub(crate) fn kv_cache_layout(attn_tp: u16, mtp_mode: Glm52MtpMode) -> KvCacheLayout {
+    let mtp = match mtp_mode {
+        Glm52MtpMode::Off => 0,
+        Glm52MtpMode::FullIndex | Glm52MtpMode::IndexShare => NUM_MTP_LAYERS,
+    };
+    mla_dsa_kv_cache_layout(NUM_LAYERS + mtp, FULL_INDEX_LAYERS.len() as u32 + mtp)
+        .held_on_each_rank(u64::from(attn_tp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::contract::{
+        ArchGroupInput, SpeculativeArchGroupInput, SpeculativeDecodeInput,
+    };
+    use crate::timing::routing::RoutingDistribution;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    fn exact_json_value() -> serde_json::Value {
+        let full: Vec<&str> = (0..NUM_LAYERS)
+            .map(|layer| {
+                if FULL_INDEX_LAYERS.contains(&layer) {
+                    "full"
+                } else {
+                    "shared"
+                }
+            })
+            .collect();
+        let mlp: Vec<&str> = (0..NUM_LAYERS)
+            .map(|layer| if layer < 3 { "dense" } else { "sparse" })
+            .collect();
+        let mut value: serde_json::Value = serde_json::from_str(
+            r#"{
+                "architectures":["GlmMoeDsaForCausalLM"],
+                "model_type":"glm_moe_dsa","dtype":"bfloat16",
+                "hidden_size":6144,"intermediate_size":12288,
+                "num_hidden_layers":78,"first_k_dense_replace":3,
+                "num_attention_heads":64,"num_key_value_heads":64,"head_dim":192,
+                "q_lora_rank":2048,"kv_lora_rank":512,"qk_head_dim":256,
+                "qk_nope_head_dim":192,"qk_rope_head_dim":64,"v_head_dim":256,
+                "index_n_heads":32,"index_head_dim":128,"index_topk":2048,
+                "index_skip_topk_offset":3,"index_topk_freq":4,"index_topk_pattern":null,
+                "index_share_for_mtp_iteration":true,"indexer_rope_interleave":true,
+                "rope_interleave":true,"max_position_embeddings":1048576,
+                "n_routed_experts":256,"num_experts_per_tok":8,
+                "moe_intermediate_size":2048,"n_shared_experts":1,"moe_layer_freq":1,
+                "moe_router_dtype":"float32","scoring_func":"sigmoid",
+                "topk_method":"noaux_tc","n_group":1,"topk_group":1,
+                "norm_topk_prob":true,"routed_scaling_factor":2.5,
+                "vocab_size":154880,"num_nextn_predict_layers":1
+            }"#,
+        )
+        .unwrap();
+        value["mlp_layer_types"] = serde_json::to_value(mlp).unwrap();
+        value["indexer_types"] = serde_json::to_value(full).unwrap();
+        value
+    }
+
+    fn model() -> Glm52ModelCfg {
+        crate::arch::glm52_model_cfg::parse_model_json(&exact_json_value().to_string()).unwrap()
+    }
+
+    fn parallel(ep_size: u16) -> Glm52VllmNvfp4DsaMoeParallel {
+        Glm52VllmNvfp4DsaMoeParallel {
+            ep_size,
+            nvl_num_gpu: ep_size.min(8),
+            max_model_len: CHECKPOINT_MAX_CONTEXT,
+            gpu_name: "NVIDIA B200".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_configs_bakes_tp4_nvfp4_and_exact_varlen_without_a_bridge() {
+        let mut p = parallel(4);
+        p.max_model_len = 8_192;
+        let cfg = build_configs(
+            &model(),
+            &p,
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+
+        for attention in [
+            &cfg.dense_full_index_attention,
+            &cfg.initial_shared_attention,
+            &cfg.cycle_full_attention,
+            &cfg.cycle_shared_attention,
+        ] {
+            assert_eq!(attention.tp_size, 4);
+            assert_eq!(attention.gpu_name, "NVIDIA B200");
+            assert_eq!(
+                attention.sparse_attention_backends,
+                vec!["flashinfer_trtllm_fp8"]
+            );
+            assert_eq!(attention.sparse_attention_q_dtype, DType::Fp8E4m3);
+            assert_eq!(attention.sparse_attention_cache_dtype, DType::Fp8E4m3);
+            assert_eq!(attention.sparse_attention_output_dtype, DType::Bf16);
+            let exact = attention.sparse_exact_varlen.as_ref().unwrap();
+            assert_eq!(attention.sparse_index_remap_backends, vec!["vllm_triton"]);
+            assert_eq!(exact.prefill_backends, vec!["flashinfer_trtllm_fp8"]);
+            assert_eq!(exact.max_model_len, 8_192);
+            assert_eq!(
+                exact.page_table_mapping.as_deref(),
+                Some("request_contiguous")
+            );
+        }
+        assert!(cfg.dense_full_index_attention.include_indexer);
+        assert!(!cfg.initial_shared_attention.include_indexer);
+        assert_eq!(cfg.dense_ffn.tp_size, 4);
+        assert_eq!(cfg.shared_expert.tp_size, 4);
+        assert!(!cfg.sparse_router.include_router_input_cast);
+        assert!(!cfg.sparse_router.include_router_select);
+        assert_eq!(cfg.nvfp4_moe.len(), 4);
+        assert_eq!(
+            cfg.nvfp4_moe
+                .iter()
+                .map(|rank| rank.folded_rank_position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert!(cfg
+            .nvfp4_moe
+            .windows(2)
+            .all(|pair| pair[0].expert_demand == pair[1].expert_demand));
+        for rank in &cfg.nvfp4_moe {
+            assert_eq!(rank.quant_backends, vec!["vllm_cuda"]);
+            assert_eq!(rank.moe_backends, vec!["flashinfer_trtllm_sm100"]);
+            assert_eq!(rank.weight_format, DType::Nvfp4E2m1);
+            assert_eq!(rank.group_size, 16);
+            assert_eq!(rank.routing_method, "minimax2");
+        }
+        assert_eq!(cfg.tp_allreduce.num_gpus, 4);
+        assert_eq!(cfg.tp_allreduce_fusion.num_gpus, 4);
+        assert_eq!(cfg.tp_allreduce_fused.num_gpus, 4);
+    }
+
+    #[test]
+    fn resolve_configs_partitions_only_the_tp_owned_dimensions() {
+        let cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let resolved = resolve_configs(&cfg);
+
+        assert_eq!(resolved.dense_full_index_attention.main_rope.num_heads, 16);
+        assert_eq!(resolved.dense_full_index_attention.q_absorb.num_batches, 16);
+        let indexer = resolved
+            .dense_full_index_attention
+            .indexer
+            .as_ref()
+            .unwrap();
+        assert_eq!(indexer.q_lora_rank, 2_048);
+        assert_eq!(indexer.model_num_index_heads, 32);
+        assert_eq!(resolved.dense_ffn.gate_up_proj.n, 6_144);
+        assert_eq!(resolved.dense_ffn.gate_up_proj.k, 6_144);
+        assert_eq!(resolved.shared_expert.gate_up_proj.n, 1_024);
+        assert_eq!(resolved.shared_expert.gate_up_proj.k, 6_144);
+        assert_eq!(resolved.nvfp4_moe.len(), 4);
+        assert!(resolved
+            .nvfp4_moe
+            .iter()
+            .all(|rank| rank.experts_per_device == 64));
+        assert!(resolved.sparse_router.router_fp32_cast.is_none());
+        assert!(resolved.sparse_router.router_select.is_none());
+    }
+
+    #[test]
+    fn both_lm_heads_shard_the_vocabulary_by_the_same_degree() {
+        // This arch runs the EP group as its TP group, so both heads divide by
+        // `ep_size`. The MTP output head is the same `ParallelLMHead` as the
+        // main head, one layer later; billing one sharded and the other whole
+        // charges this rank for every other rank's logits.
+        let cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
+            false,
+            Glm52MtpMode::FullIndex,
+        )
+        .unwrap();
+        let resolved = resolve_configs(&cfg);
+        let mtp_head = resolved.mtp_head.as_ref().unwrap();
+
+        assert_eq!(resolved.lm_head.n, mtp_head.lm_head.n);
+        assert_eq!(mtp_head.lm_head.n, VOCAB_SIZE / 4);
+        assert_eq!(mtp_head.vocab_size_per_rank, VOCAB_SIZE / 4);
+        // Hidden is never sharded, on either head.
+        assert_eq!(resolved.lm_head.k, mtp_head.lm_head.k);
+    }
+
+    #[test]
+    fn parallel_model_and_checkpoint_contracts_fail_closed() {
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let m = model();
+
+        let mut invalid = parallel(4);
+        invalid.ep_size = 0;
+        assert!(build_configs(
+            &m,
+            &invalid,
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off
+        )
+        .is_err());
+
+        let mut invalid = parallel(4);
+        invalid.nvl_num_gpu = 3;
+        assert!(build_configs(
+            &m,
+            &invalid,
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off
+        )
+        .is_err());
+
+        let mut invalid = parallel(4);
+        invalid.max_model_len = 0;
+        assert!(build_configs(
+            &m,
+            &invalid,
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off
+        )
+        .is_err());
+
+        assert!(build_configs(
+            &m,
+            &parallel(4),
+            &routing,
+            Some(&routing),
+            true,
+            Glm52MtpMode::Off
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("fp8=false"));
+        assert!(build_configs(
+            &m,
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(128), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(128),
+                1
+            )),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_speculative_recipe_widens_the_target_and_keeps_the_proposer_narrow() {
+        let cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            false,
+            Glm52MtpMode::IndexShare,
+            5,
+        )
+        .unwrap();
+
+        // The target verifies the five drafted positions plus the token they
+        // extend, so every one of its attention sections sweeps width 6.
+        for attention in [
+            &cfg.dense_full_index_attention,
+            &cfg.initial_shared_attention,
+            &cfg.cycle_full_attention,
+            &cfg.cycle_shared_attention,
+        ] {
+            assert_eq!(attention.decode_next_n, 6);
+        }
+        assert_eq!(cfg.speculative_draft_tokens, Some(5));
+
+        // The proposer's first call forwards the target's whole batch, so it
+        // shares the target's width -- and it builds the index state the
+        // recurrent calls reuse, so it computes the indexer even under
+        // `IndexShare`.
+        let first = cfg.mtp_attention.as_ref().unwrap();
+        assert_eq!(first.decode_next_n, 6);
+        assert!(first.include_indexer);
+
+        // The recurrent calls are one row per request and may share the index.
+        let recurrent = cfg.mtp_recurrent_attention.as_ref().unwrap();
+        assert_eq!(recurrent.decode_next_n, 1);
+        assert!(!recurrent.include_indexer);
+    }
+
+    #[test]
+    fn a_verify_only_target_widens_the_decode_and_runs_no_mtp_layer() {
+        // A proposer from its own checkpoint (DFlash2) still makes the target
+        // verify `draft_tokens + 1` rows, but must not bill or allocate the MTP
+        // layer the GLM checkpoint happens to carry.
+        let cfg = build_verify_configs(
+            &model(),
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            false,
+            7,
+        )
+        .unwrap();
+        for attention in [
+            &cfg.dense_full_index_attention,
+            &cfg.initial_shared_attention,
+            &cfg.cycle_full_attention,
+            &cfg.cycle_shared_attention,
+        ] {
+            assert_eq!(attention.decode_next_n, 8);
+        }
+        assert_eq!(cfg.speculative_draft_tokens, Some(7));
+        assert_eq!(cfg.mtp_mode, Glm52MtpMode::Off);
+        assert!(cfg.mtp_attention.is_none());
+        assert!(cfg.mtp_recurrent_attention.is_none());
+        assert!(cfg.mtp_bf16_moe.is_none());
+        assert!(cfg.mtp_prelude.is_none() && cfg.mtp_head.is_none());
+
+        // The GLM-5.2 speculative model has no proposer to run from these.
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        assert!(build_speculative("unified".to_string(), resolve_configs(&cfg), &bridge).is_err());
+    }
+
+    #[test]
+    fn the_ep1_recipe_builds_but_its_all_reduce_graph_is_refused() {
+        // EP1 is the pipeline stage's and DP rank's recipe; the graph with TP
+        // boundaries must still refuse it cleanly instead of panicking on the
+        // missing fusion workspace.
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let cfg = build_configs(
+            &model(),
+            &parallel(1),
+            &demand,
+            None,
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let error = build("unified".to_string(), resolve_configs(&cfg), &bridge)
+            .err()
+            .expect("EP1 has no fused all-reduce");
+        assert!(error.to_string().contains("ep_size 1"), "{error}");
+    }
+
+    #[test]
+    fn a_one_deep_draft_has_no_recurrent_pass_to_configure() {
+        let cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            false,
+            Glm52MtpMode::IndexShare,
+            1,
+        )
+        .unwrap();
+        assert_eq!(cfg.dense_full_index_attention.decode_next_n, 2);
+        assert!(cfg.mtp_recurrent_attention.is_none());
+    }
+
+    #[test]
+    fn a_speculative_recipe_needs_a_proposer_and_a_positive_depth() {
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        assert!(build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::Off,
+            5,
+        )
+        .is_err());
+        assert!(build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::IndexShare,
+            0,
+        )
+        .is_err());
+
+        // An ordinary recipe is width 1 everywhere and records no depth.
+        let ordinary = build_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::IndexShare,
+        )
+        .unwrap();
+        assert_eq!(ordinary.dense_full_index_attention.decode_next_n, 1);
+        assert_eq!(ordinary.mtp_attention.as_ref().unwrap().decode_next_n, 1);
+        assert!(ordinary.mtp_recurrent_attention.is_none());
+        assert!(ordinary.speculative_draft_tokens.is_none());
+    }
+
+    /// The first draft call forwards the target's verify blocks, so a corpus
+    /// must sample its rows as blocks; the calls after it are one row per
+    /// request. Each pass has to price the demand its own batch presents.
+    #[test]
+    fn each_draft_pass_prices_the_mtp_experts_at_its_own_width() {
+        let first = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let mut recurrent_ppm = vec![0; NUM_EXPERTS as usize];
+        recurrent_ppm[0] = 1_000_000;
+        let recurrent = ExpertDemand::Popularity {
+            layerwise_global_ppm: vec![recurrent_ppm],
+        };
+        let cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &first,
+            &first,
+            &recurrent,
+            false,
+            Glm52MtpMode::IndexShare,
+            5,
+        )
+        .unwrap();
+        let demands = |configs: &Option<Vec<Bf16MoeLocalWorkletConfig>>| {
+            configs
+                .as_ref()
+                .expect("the pass has experts")
+                .iter()
+                .map(|rank| rank.expert_demand.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(demands(&cfg.mtp_bf16_moe).iter().all(|d| *d == first));
+        assert!(demands(&cfg.mtp_recurrent_bf16_moe)
+            .iter()
+            .all(|d| *d == recurrent));
+
+        // A one-deep draft has no later call to price.
+        let shallow = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &first,
+            &first,
+            &recurrent,
+            false,
+            Glm52MtpMode::IndexShare,
+            1,
+        )
+        .unwrap();
+        assert!(shallow.mtp_recurrent_bf16_moe.is_none());
+    }
+
+    #[test]
+    fn the_mtp_layer_bills_its_experts_through_the_bf16_fused_moe_leaf() {
+        // The checkpoint quantizes the 78 body layers' routed experts and
+        // leaves the MTP layer's in BF16. Billing that layer through the NVFP4
+        // path charges it an activation-quantization launch it never makes and
+        // a fused-MoE kernel it never calls -- a measured identity belonging to
+        // different weights.
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::FullIndex,
+            1,
+        )
+        .unwrap();
+        let mtp_experts = cfg.mtp_bf16_moe.as_ref().expect("MTP layer has experts");
+        assert_eq!(mtp_experts.len(), 4, "one ranked workload per EP rank");
+        assert!(mtp_experts.iter().all(|rank| rank.dtype == DType::Bf16));
+
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built =
+            build_speculative("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
+        let slots = built.cost_tree().slots;
+        let mtp_expert_slots = slots
+            .iter()
+            .filter(|slot| {
+                slot.name
+                    .starts_with("unified.mtp.step_0.decoder_sparse.moe.routed_experts")
+            })
+            .count();
+        assert_eq!(
+            mtp_expert_slots, 4,
+            "BF16 experts are one whole-callable leaf per rank, with no quantization leaf"
+        );
+
+        // The body layers next door are unaffected: they keep both leaves.
+        let body_expert_slots = slots
+            .iter()
+            .filter(|slot| {
+                slot.name
+                    .starts_with("unified.body.sparse_cycle_full_index.moe.routed_experts")
+            })
+            .count();
+        assert_eq!(body_expert_slots, 8, "NVFP4 experts quantize then fuse");
+
+        // An ordinary deployment never runs the layer, so it carries no config
+        // for its experts at all.
+        let ordinary = build_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        assert!(ordinary.mtp_bf16_moe.is_none());
+    }
+
+    #[test]
+    fn compiled_tree_matches_the_tp4_schedule_and_collective_boundaries() {
+        let cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = build("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
+        assert_eq!(built.n_slots, expected_slot_count(4));
+        assert_eq!(built.num_attn_dp_groups(), 1);
+        assert_eq!(built.num_attn_shards(), 4);
+        let description = built.cost_tree().describe();
+        assert!(description.contains("TP=EP4; attention DP groups=1"));
+        assert!(!description.contains("attention TP1"));
+        // An ordinary deployment never runs the MTP layer, so it has no slot
+        // for it -- and a recipe that asks for one does not build.
+        assert!(!description.contains("MTP layer 78"));
+        for mode in [Glm52MtpMode::FullIndex, Glm52MtpMode::IndexShare] {
+            let asked_for_mtp = build_configs(
+                &model(),
+                &parallel(4),
+                &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+                Some(&ExpertDemand::popularity(
+                    &RoutingDistribution::uniform(NUM_EXPERTS),
+                    1,
+                )),
+                false,
+                mode,
+            )
+            .unwrap();
+            assert!(build(
+                "unified".to_string(),
+                resolve_configs(&asked_for_mtp),
+                &bridge
+            )
+            .is_err());
+        }
+
+        let cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = build("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
+        let slots = built.cost_tree().slots;
+        for body in [
+            "unified.body.sparse_initial_index_share",
+            "unified.body.sparse_cycle_full_index",
+            "unified.body.sparse_cycle_index_share",
+        ] {
+            let fallback = slots
+                .iter()
+                .position(|slot| slot.name == format!("{body}.attention.tp_allreduce"))
+                .unwrap();
+            let fused = slots
+                .iter()
+                .position(|slot| {
+                    slot.name == format!("{body}.attention.tp_allreduce_residual_norm")
+                })
+                .unwrap();
+            let router = slots
+                .iter()
+                .position(|slot| slot.name.starts_with(&format!("{body}.moe.router.")))
+                .unwrap();
+            assert_eq!(fallback + 1, fused);
+            assert_eq!(fused + 1, router);
+
+            let ffn_fallback = slots
+                .iter()
+                .position(|slot| slot.name == format!("{body}.moe.tp_allreduce_fallback"))
+                .unwrap();
+            let ffn_fused = slots
+                .iter()
+                .position(|slot| slot.name == format!("{body}.moe.tp_allreduce"))
+                .unwrap();
+            assert_eq!(ffn_fallback + 1, ffn_fused);
+        }
+    }
+
+    #[test]
+    fn location_map_matches_every_unique_noncommunication_manifest_location() {
+        let cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = build("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
+        let is_communication = |kind: &str| {
+            matches!(
+                kind,
+                "all_reduce" | "all_reduce_fusion" | "all_reduce_residual_rms_norm"
+            )
+        };
+        let manifest_locations: BTreeSet<String> = built
+            .cost_log_manifest()
+            .slots
+            .into_iter()
+            .filter(|slot| !is_communication(&slot.kind))
+            .map(|slot| slot.name)
+            .collect();
+
+        let map_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("model/work/location_maps/glm52_vllm_nvfp4_dsa_moe_unified.json");
+        let map: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(map_path).unwrap()).unwrap();
+        let mapped_locations: BTreeSet<String> = map["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["location"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(manifest_locations.len(), 114);
+        assert_eq!(mapped_locations, manifest_locations);
+    }
+
+    #[test]
+    fn state_and_topology_contracts_are_exact() {
+        // 78 latents of 576 B and 21 index keys of 132 B per rank, plus one
+        // of each for the MTP layer in either MTP mode.
+        let bytes = |mode| kv_cache_layout(4, mode).per_token_bytes();
+        assert_eq!(bytes(Glm52MtpMode::Off), 4 * (78 * 576 + 21 * 132));
+        assert_eq!(bytes(Glm52MtpMode::FullIndex), 4 * (79 * 576 + 22 * 132));
+        assert_eq!(
+            bytes(Glm52MtpMode::IndexShare),
+            bytes(Glm52MtpMode::FullIndex)
+        );
+    }
+
+    /// The fork's (892da082) "GPU KV cache size" and "Maximum concurrency for
+    /// N tokens per request" at TP4, without and with five MTP drafts. An
+    /// older vLLM gave every layer an index key (55,224 B per rank and token);
+    /// this one gives it only to the layers that compute top-k.
+    #[test]
+    fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        for (gib_per_rank, max_model_len, mtp_mode, logged_tokens, logged) in [
+            (41.58, 131_072, Glm52MtpMode::Off, 935_872, 7.14),
+            (35.26, 131_072, Glm52MtpMode::Off, 793_600, 6.05),
+            (34.49, 131_072, Glm52MtpMode::FullIndex, 764_992, 5.84),
+            (11.89, 8192, Glm52MtpMode::FullIndex, 263_616, 32.18),
+        ] {
+            let layout = kv_cache_layout(4, mtp_mode);
+            let budget = (gib_per_rank * f64::from(1u32 << 30)) as u64 * 4;
+            let tokens = budget / layout.per_token_bytes();
+            assert!(
+                (tokens as f64 / f64::from(logged_tokens) - 1.0).abs() < 0.005,
+                "{gib_per_rank} GiB {mtp_mode:?}: {tokens} vs {logged_tokens} tokens"
+            );
+            let options = KvAccountingOptions {
+                prefix_caching: true,
+                ..Default::default()
+            };
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            let concurrency = accounting.concurrency_at(max_model_len);
+            assert!(
+                (concurrency / logged - 1.0).abs() < 0.005,
+                "{gib_per_rank} GiB {mtp_mode:?}: {concurrency} vs {logged}"
+            );
+            // `kv_cache.json` reports the same two numbers.
+            let report = accounting.report(Some(max_model_len as u32)).result;
+            assert_eq!(report.capacity_tokens, Some(tokens));
+            assert_eq!(report.max_concurrency_at_max_model_len, Some(concurrency));
+        }
+    }
+
+    fn group(prefill_tokens: u32, decode_lens: Vec<u32>, pairs: Vec<(u32, u32)>) -> ArchGroupInput {
+        let decode_tokens = decode_lens.len() as u32;
+        ArchGroupInput {
+            batch_tokens: prefill_tokens + decode_tokens,
+            prefill_tokens,
+            decode_tokens,
+            prefill_chunk_pairs: pairs,
+            decode_kv_lens: decode_lens,
+            total_kv_len: 0,
+        }
+    }
+
+    #[test]
+    fn input_lowering_preserves_each_prefill_request_boundary() {
+        let input = UnifiedArchInput {
+            groups: vec![group(5, vec![64, 91], vec![(3, 2), (0, 3)])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let normalized = normalize_input(&input, 4, 8_192).unwrap();
+        assert_eq!(normalized.total_tokens, 7);
+        assert_eq!(
+            normalized.groups[0]
+                .attention_input
+                .prefill_query_cache_pairs,
+            vec![(2, 5), (3, 3)]
+        );
+        let decode = normalized.groups[0]
+            .attention_input
+            .decode
+            .as_ref()
+            .unwrap();
+        assert_eq!(decode.batch_size, 2);
+        assert_eq!(decode.context_len, 91);
+        assert_eq!(decode.context_lens.as_deref(), Some(&[64, 91][..]));
+        assert!(!decode.requires_padding);
+        assert_eq!(normalized.groups[0].request_count, 4);
+        // Without speculation the sampler scores one row per request.
+        assert_eq!(normalized.groups[0].logits_rows, 4);
+        assert_eq!(
+            normalized.groups[0].endpoint_context_lens,
+            vec![5, 3, 64, 91]
+        );
+    }
+
+    fn speculative_input(
+        draft_tokens: u32,
+        prefill_chunk_pairs: Vec<(u32, u32)>,
+        decode_kv_lens: Vec<u32>,
+    ) -> SpeculativeArchInput {
+        let verify_width = draft_tokens + 1;
+        let prefill_tokens: u32 = prefill_chunk_pairs.iter().map(|&(_, append)| append).sum();
+        let decode_tokens = decode_kv_lens.len() as u32 * verify_width;
+        SpeculativeArchInput {
+            draft_tokens,
+            groups: vec![SpeculativeArchGroupInput {
+                batch_tokens: prefill_tokens + decode_tokens,
+                prefill_tokens,
+                decode_tokens,
+                prefill_chunk_pairs,
+                decode_requests: decode_kv_lens
+                    .iter()
+                    .map(|&kv_len| SpeculativeDecodeInput {
+                        kv_len,
+                        query_len: verify_width,
+                    })
+                    .collect(),
+                total_kv_len: decode_kv_lens
+                    .iter()
+                    .map(|length| length.saturating_sub(verify_width))
+                    .sum(),
+            }],
+            tokens_per_source_rank: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_verify_step_scores_every_drafted_row_not_one_row_per_request() {
+        // Two prefill requests and two decode requests, each verifying six
+        // rows. Billing the output head one row per request -- which is right
+        // when a decode step produces one token -- would undercount it by ten.
+        let input = speculative_input(5, vec![(3, 2), (0, 3)], vec![64, 91]);
+        let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
+        let group = &normalized.groups[0];
+
+        assert_eq!(group.batch_tokens, 5 + 12);
+        assert_eq!(group.request_count, 4);
+        assert_eq!(group.logits_rows, 2 + 12);
+
+        // The attention section still sees two decode requests, at their own
+        // KV lengths: the verify width multiplies query rows, not requests.
+        let decode = group.attention_input.decode.as_ref().unwrap();
+        assert_eq!(decode.batch_size, 2);
+        assert_eq!(decode.context_lens.as_deref(), Some(&[64, 91][..]));
+        assert_eq!(group.attention_input.num_new_tokens, 17);
+    }
+
+    #[test]
+    fn a_verify_clipped_at_the_model_limit_runs_its_rows_on_the_prefill_path() {
+        // vLLM clips a request at the context limit to the rows that leave its
+        // sampled position inside max_model_len. The ragged row bills exactly
+        // its queries and every one is scored, but it leaves the uniform
+        // decode launch to the full-width requests.
+        let mut input = speculative_input(5, vec![], vec![64, 91]);
+        let group = &mut input.groups[0];
+        group.decode_requests.push(SpeculativeDecodeInput {
+            kv_len: 8_191,
+            query_len: 2,
+        });
+        group.decode_tokens += 2;
+        group.batch_tokens += 2;
+        group.total_kv_len += 8_189;
+        let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
+        let group = &normalized.groups[0];
+
+        assert_eq!(group.batch_tokens, 14);
+        assert_eq!(group.request_count, 3);
+        assert_eq!(group.logits_rows, 14);
+        assert_eq!(group.endpoint_context_lens, vec![64, 91, 8_191]);
+        assert_eq!(
+            group.attention_input.prefill_query_cache_pairs,
+            vec![(2, 8_191)]
+        );
+        let decode = group.attention_input.decode.as_ref().unwrap();
+        assert_eq!(decode.batch_size, 2);
+        assert_eq!(decode.context_lens.as_deref(), Some(&[64, 91][..]));
+        assert_eq!(group.attention_input.num_new_tokens, 14);
+    }
+
+    #[test]
+    fn a_recurrent_draft_pass_forwards_one_row_per_request_at_an_advanced_context() {
+        let input = speculative_input(5, vec![(3, 2)], vec![64]);
+        let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
+        // Prefill request holds 5 tokens after its chunk, decode request 64.
+        assert_eq!(normalized.groups[0].endpoint_context_lens, vec![5, 64]);
+
+        // The second recurrent pass runs after two proposed positions have
+        // been appended, and forwards one row per scheduled request -- the
+        // prefilling one included, because it is being extended too.
+        let endpoints = normalized.request_endpoints(2, 8_192);
+        let group = &endpoints.groups[0];
+        assert_eq!(group.batch_tokens, 2);
+        assert_eq!(group.request_count, 2);
+        assert_eq!(group.endpoint_context_lens, vec![7, 66]);
+        assert!(group.attention_input.prefill_query_cache_pairs.is_empty());
+        let decode = group.attention_input.decode.as_ref().unwrap();
+        assert_eq!(decode.batch_size, 2);
+        assert_eq!(decode.context_len, 66);
+
+        // The context cap clamps rather than widening past a measured shape.
+        let clamped = normalized.request_endpoints(2, 65);
+        assert_eq!(clamped.groups[0].endpoint_context_lens, vec![7, 65]);
+    }
+
+    #[test]
+    fn speculative_input_must_match_the_depth_the_tree_was_compiled_for() {
+        let input = speculative_input(5, vec![], vec![64]);
+        assert!(normalize_speculative_input(&input, 3, 8_192).is_err());
+
+        // A ragged verify row away from max_model_len is not a shape the
+        // scheduler produces.
+        let mut ragged = speculative_input(5, vec![], vec![64, 91]);
+        ragged.groups[0].decode_requests[1].query_len = 4;
+        ragged.groups[0].decode_tokens = 10;
+        ragged.groups[0].batch_tokens = 10;
+        assert!(normalize_speculative_input(&ragged, 5, 8_192).is_err());
+
+        // A request cannot verify further back than it has KV for.
+        let mut short = speculative_input(5, vec![], vec![64]);
+        short.groups[0].decode_requests[0].kv_len = 5;
+        assert!(normalize_speculative_input(&short, 5, 8_192).is_err());
+    }
+
+    #[test]
+    fn a_speculative_iteration_compiles_its_own_tree_not_the_ordinary_one() {
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+
+        let spec_cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::IndexShare,
+            5,
+        )
+        .unwrap();
+        let speculative =
+            build_speculative("unified".to_string(), resolve_configs(&spec_cfg), &bridge).unwrap();
+        assert_eq!(
+            speculative.n_slots,
+            expected_speculative_slot_count(4, Glm52MtpMode::IndexShare, 5)
+        );
+
+        let ordinary_cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let ordinary = build(
+            "unified".to_string(),
+            resolve_configs(&ordinary_cfg),
+            &bridge,
+        )
+        .unwrap();
+
+        // The speculative tree is not the ordinary tree with rows appended: the
+        // target's own leaves are billed at a different verify width, and the
+        // five draft passes are slots of their own. A consumer reading a cost
+        // log therefore cannot mistake one iteration for the other.
+        assert_eq!(ordinary.n_slots, expected_slot_count(4));
+        assert!(speculative.n_slots > ordinary.n_slots);
+        let description = speculative.cost_tree().describe();
+        assert!(description.contains("Glm52VllmNvfp4DsaMoeSpeculativeModel"));
+        assert!(description.contains("draft tokens=5; verify width=6"));
+        assert!(description.contains("mtp.step_0 [whole-batch pass"));
+        // The four endpoint passes are one launch graph run four times, so they
+        // are one compiled subtree under a Scale{4} -- the same fold the 18
+        // sparse cycles use. The whole-batch pass is not part of it: it runs a
+        // different attention config over a different batch.
+        assert!(description.contains("mtp.recurrent [request-endpoint pass; 4 steps]"));
+        assert!(description.contains("Scale{n=4}"));
+        assert!(!description.contains("mtp.step_1"));
+
+        let slots = speculative.cost_tree().slots;
+        let slot_names: Vec<&str> = slots.iter().map(|slot| slot.name.as_str()).collect();
+        for prefix in ["unified.mtp.step_0.", "unified.mtp.recurrent."] {
+            assert!(
+                slot_names.iter().any(|name| name.starts_with(prefix)),
+                "{prefix} has slots of its own"
+            );
+        }
+        // Campaign rules must resolve against the compiled tree, including the
+        // shared recurrent subtree introduced by the clean implementation.
+        // The shared rule set also contains full-index-only draft indexer slots.
+        let full_index_cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::FullIndex,
+            5,
+        )
+        .unwrap();
+        let full_index =
+            build_speculative("unified".into(), resolve_configs(&full_index_cfg), &bridge).unwrap();
+        let full_index_slots = full_index.cost_tree().slots;
+        let mut slot_names = slot_names;
+        slot_names.extend(full_index_slots.iter().map(|slot| slot.name.as_str()));
+        let mut unresolved = std::collections::BTreeSet::new();
+        let rules_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("presets/alignment/glm52_nvfp4_b200_spec5/label_rules");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(rules_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        for file in manifest["rule_files"].as_array().unwrap() {
+            let path = rules_dir.join(file.as_str().unwrap());
+            let document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            for rule in document["rules"].as_array().unwrap() {
+                if rule["status"] == "unmapped" {
+                    assert!(rule.get("slot_suffixes").is_none());
+                    continue;
+                }
+                for suffix in rule["slot_suffixes"].as_array().unwrap() {
+                    let suffix = suffix.as_str().unwrap();
+                    if !slot_names.iter().any(|name| name.ends_with(suffix)) {
+                        unresolved.insert(suffix.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            unresolved.is_empty(),
+            "unresolved campaign slot suffixes: {unresolved:#?}"
+        );
+    }
+
+    #[test]
+    fn each_recipe_builds_only_its_own_model() {
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+
+        let spec_cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::IndexShare,
+            5,
+        )
+        .unwrap();
+        assert!(build("unified".to_string(), resolve_configs(&spec_cfg), &bridge).is_err());
+
+        let ordinary_cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        assert!(build_speculative(
+            "unified".to_string(),
+            resolve_configs(&ordinary_cfg),
+            &bridge
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn speculative_necessary_work_maps_cover_the_compiled_locations() {
+        use std::collections::BTreeSet;
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        for ep in [4, 8] {
+            for (mode, depth, encoded) in [
+                (
+                    Glm52MtpMode::IndexShare,
+                    5,
+                    include_str!(
+                        "../../../model/work/location_maps/glm52_speculative_index_share.json"
+                    ),
+                ),
+                (
+                    Glm52MtpMode::FullIndex,
+                    5,
+                    include_str!(
+                        "../../../model/work/location_maps/glm52_speculative_full_index.json"
+                    ),
+                ),
+                (
+                    Glm52MtpMode::IndexShare,
+                    1,
+                    include_str!(
+                        "../../../model/work/location_maps/glm52_speculative_single_draft.json"
+                    ),
+                ),
+            ] {
+                let cfg = build_speculative_configs(
+                    &model(),
+                    &parallel(ep),
+                    &routing,
+                    &routing,
+                    &routing,
+                    false,
+                    mode,
+                    depth,
+                )
+                .unwrap();
+                let built =
+                    build_speculative("unified".into(), resolve_configs(&cfg), &bridge).unwrap();
+                let manifest = built.cost_tree();
+                let actual: BTreeSet<_> = manifest
+                    .slots
+                    .iter()
+                    .filter(|slot| {
+                        !matches!(
+                            slot.kind.as_str(),
+                            "all_reduce" | "all_reduce_fusion" | "all_reduce_residual_rms_norm"
+                        )
+                    })
+                    .map(|slot| slot.name.as_str())
+                    .collect();
+                let map: serde_json::Value = serde_json::from_str(encoded).unwrap();
+                let mapped: BTreeSet<_> = map["locations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["location"].as_str().unwrap())
+                    .collect();
+                assert_eq!(actual, mapped, "EP={ep}, depth={depth}, mode={mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn input_validation_rejects_wrong_group_count_and_context() {
+        let too_many_groups = UnifiedArchInput {
+            groups: vec![ArchGroupInput::default(); 2],
+            tokens_per_source_rank: Vec::new(),
+        };
+        assert!(normalize_input(&too_many_groups, 4, 8_192).is_err());
+
+        let bad_prefill = UnifiedArchInput {
+            groups: vec![group(1, vec![], vec![(0, 2)])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        assert!(normalize_input(&bad_prefill, 4, 8_192).is_err());
+
+        let too_long = UnifiedArchInput {
+            groups: vec![group(0, vec![8_193], vec![])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        assert!(normalize_input(&too_long, 4, 8_192).is_err());
+    }
+
+    #[test]
+    fn a_batch_fits_one_sparse_attention_launch_or_is_rejected() {
+        // 65535 rows run: one prefill of 65000 plus 535 decodes.
+        let fits = UnifiedArchInput {
+            groups: vec![group(65_000, vec![100_000; 535], vec![(0, 65_000)])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        assert!(normalize_input(&fits, 4, 202_752).is_ok());
+
+        let over = UnifiedArchInput {
+            groups: vec![group(65_000, vec![100_000; 536], vec![(0, 65_000)])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let reason = normalize_input(&over, 4, 202_752).unwrap_err();
+        assert!(reason.contains("65536 token rows"), "{reason}");
+    }
+}

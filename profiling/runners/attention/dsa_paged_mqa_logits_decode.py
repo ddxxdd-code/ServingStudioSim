@@ -1,4 +1,4 @@
-"""Profilers for GLM-5.2's paged-decode DSA MQA logits.
+"""Profilers for paged-decode DSA MQA logits.
 
 The Torch backend times the complete semantic composite. The production-aligned
 backend times only DeepGEMM's fused main kernel; metadata construction and JIT
@@ -9,7 +9,7 @@ transactions or Torch intermediates.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from profiling.db.args import DType
@@ -18,10 +18,6 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_NEXT_N = 1
-_NUM_HEADS = 64
-_HEAD_DIM = 128
-_BLOCK_SIZE = 64
 _Q_DTYPE = DType.FP8_E4M3
 _CACHE_DTYPE = DType.FP8_E4M3
 _SCALE_DTYPE = DType.FP32
@@ -30,9 +26,36 @@ _OUTPUT_DTYPE = DType.FP32
 _CONTEXT_MODE = "uniform"
 _PAGE_MAPPING = "unique_scattered"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
-_REQUIRED_GPU = "NVIDIA H200"
-_REQUIRED_H200_SMS = 132
-_DEEPGEMM_KERNEL_NAME = "sm90_fp8_paged_mqa_logits"
+# Request-contiguous, 576-byte-aligned pages: see dsa_paged_mqa_logits_decode_contiguous.
+_CONTIGUOUS_CACHE_FORMAT = "fp8_e4m3_ue8m0"
+# DeepGEMM's FP8 paged MQA-logits launch bounds per arch major, from
+# csrc/apis/attention.hpp (q heads, block_kv) and csrc/jit_kernels/impls/
+# sm{90,100,120}_*mqa_logits.hpp (head_dim, next_n) at the vLLM-pinned 8b1392b.
+# Other arch majors have no kernel.
+_DEEPGEMM_ARCH_BOUNDS = {
+    9: {
+        "num_heads": frozenset({32, 64}),
+        "head_dim": frozenset({32, 64, 128}),
+        "block_size": frozenset({32, 64}),
+        "next_n": frozenset({1, 2, 4}),
+    },
+    10: {
+        "num_heads": frozenset({8, 16, 32, 64}),
+        "head_dim": frozenset({32, 64, 128}),
+        "block_size": frozenset({32, 64, 128}),
+        "next_n": None,
+    },
+    12: {
+        "num_heads": frozenset({16, 32, 64}),
+        "head_dim": frozenset({128}),
+        "block_size": frozenset({64}),
+        "next_n": None,
+    },
+}
+# DeepGEMM names the main kernel `sm90_fp8_paged_mqa_logits` on SM90 and
+# `sm100_paged_mqa_logits` on SM100.
+_DEEPGEMM_KERNEL_NAME = "paged_mqa_logits"
+_CHECK_TOLERANCE = 1e-3
 
 
 @dataclass(frozen=True)
@@ -108,12 +131,13 @@ def _validate_args(
         raise ValueError(
             f"context_len must be <= max_model_len, got {context_len} and {max_model_len}"
         )
-    if next_n != _NEXT_N:
-        raise ValueError(f"dsa_paged_mqa_logits_decode requires next_n=1, got {next_n}")
-    if (num_heads, head_dim, block_size) != (_NUM_HEADS, _HEAD_DIM, _BLOCK_SIZE):
+    if next_n <= 0:
+        raise ValueError(f"dsa_paged_mqa_logits_decode requires next_n > 0, got {next_n}")
+    # The operands, Torch composite and accounting are parametric in these;
+    # DeepGEMM's per-arch launch bounds are checked against the device.
+    if num_heads <= 0 or head_dim <= 0 or block_size <= 0:
         raise ValueError(
-            "dsa_paged_mqa_logits_decode requires "
-            "(num_heads, head_dim, block_size) == (64, 128, 64), "
+            "dsa_paged_mqa_logits_decode requires num_heads, head_dim, and block_size > 0, "
             f"got ({num_heads}, {head_dim}, {block_size})"
         )
     if q_dtype is not _Q_DTYPE or cache_dtype is not _CACHE_DTYPE:
@@ -172,49 +196,47 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the torch dsa_paged_mqa_logits_decode backend"
-        )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            f"torch dsa_paged_mqa_logits_decode is verified only on {_REQUIRED_GPU}, got {gpu_name}"
-        )
+def _check_deepgemm_launch_bounds(
+    torch: Any,
+    *,
+    num_heads: int,
+    head_dim: int,
+    block_size: int,
+    next_n: int,
+) -> int:
+    """Check DeepGEMM's per-arch launch bounds and return the device SM count.
 
-
-def _validate_deepgemm_cuda_device(torch: Any) -> int:
-    """Validate the exact H200 deployment identity and return its SM count."""
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 backend"
-        )
+    vLLM's indexer builds the schedule for the device's own SM count
+    (``num_compute_units``), so the runner passes the same value.
+    """
     device = torch.cuda.current_device()
-    gpu_name = str(torch.cuda.get_device_name(device))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            "dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
-        )
-    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
-    if num_sms != _REQUIRED_H200_SMS:
-        raise ProfilerNotImplemented(
-            "dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 requires the verified "
-            f"{_REQUIRED_H200_SMS}-SM H200 schedule, got {num_sms} SMs"
-        )
-    return num_sms
+    arch_major = int(torch.cuda.get_device_capability(device)[0])
+    # The worker has checked the backend's sm_targets, one per key here.
+    bounds = _DEEPGEMM_ARCH_BOUNDS[arch_major]
+    for name, value in (
+        ("num_heads", num_heads),
+        ("head_dim", head_dim),
+        ("block_size", block_size),
+        ("next_n", next_n),
+    ):
+        allowed = bounds[name]
+        if allowed is not None and value not in allowed:
+            raise ProfilerNotImplemented(
+                f"DeepGEMM paged MQA logits on SM{arch_major}x needs {name} in "
+                f"{sorted(allowed)}, got {value}"
+            )
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
 def _load_deepgemm_backend() -> tuple[Any, Any]:
-    """Load vLLM's serving wrapper only inside the selected worker process."""
+    """Load the pinned DeepGEMM measurement provider in the worker process."""
     try:
         import torch
         from vllm.utils import deep_gemm
     except (ImportError, OSError) as exc:
         raise ProfilerNotImplemented(
             "the instrumented vLLM/DeepGEMM environment is required for "
-            "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
+            "dsa_paged_mqa_logits_decode:deepgemm_fp8"
         ) from exc
 
     support_api = getattr(deep_gemm, "is_deep_gemm_supported", None)
@@ -224,13 +246,11 @@ def _load_deepgemm_backend() -> tuple[Any, Any]:
         supported = support_api()
     except (RuntimeError, OSError) as exc:
         raise ProfilerNotImplemented(
-            "DeepGEMM support could not be initialized for "
-            "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
+            "DeepGEMM support could not be initialized for dsa_paged_mqa_logits_decode:deepgemm_fp8"
         ) from exc
     if not supported:
         raise ProfilerNotImplemented(
-            "DeepGEMM is unavailable or unsupported for "
-            "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
+            "DeepGEMM is unavailable or unsupported for dsa_paged_mqa_logits_decode:deepgemm_fp8"
         )
     if not callable(getattr(deep_gemm, "get_paged_mqa_logits_metadata", None)):
         raise ProfilerNotImplemented(
@@ -238,8 +258,7 @@ def _load_deepgemm_backend() -> tuple[Any, Any]:
         )
     if _paged_mqa_logits_entry_point(deep_gemm) is None:
         raise ProfilerNotImplemented(
-            "vllm.utils.deep_gemm exposes neither fp8_paged_mqa_logits nor "
-            "fp8_fp4_paged_mqa_logits"
+            "vllm.utils.deep_gemm exposes neither fp8_paged_mqa_logits nor fp8_fp4_paged_mqa_logits"
         )
     return torch, deep_gemm
 
@@ -505,9 +524,7 @@ def _prepare_deepgemm_call(
     # calling both this and the metadata builder. The older entry point took the
     # flat (B,) view. Feed each the layout it was built for.
     runnable_context_lens = (
-        operands.context_lens.contiguous()
-        if unified
-        else operands.context_lens[:, 0].contiguous()
+        operands.context_lens.contiguous() if unified else operands.context_lens[:, 0].contiguous()
     )
     schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
         runnable_context_lens,
@@ -591,8 +608,6 @@ def profile_dsa_paged_mqa_logits_decode_torch(
             "torch is required for the torch dsa_paged_mqa_logits_decode backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -648,7 +663,36 @@ def profile_dsa_paged_mqa_logits_decode_torch(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
-def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
+def _check_first_request(
+    torch: Any,
+    operands: _DsaPagedMqaLogitsDecodeOperands,
+    output: Any,
+    *,
+    context_len: int,
+    max_model_len: int,
+) -> None:
+    """Compare request 0's logits rows with the Torch composite on the valid columns."""
+    next_n = operands.q.shape[1]
+    first = replace(
+        operands,
+        q=operands.q[:1],
+        weights=operands.weights[:next_n],
+        context_lens=operands.context_lens[:1],
+        block_table=operands.block_table[:1],
+    )
+    expected = _torch_composite(first, context_len=context_len, max_model_len=max_model_len)
+    expected = expected[:, :context_len]
+    actual = output[:next_n, :context_len].float()
+    if not torch.allclose(actual, expected, rtol=_CHECK_TOLERANCE, atol=_CHECK_TOLERANCE):
+        max_abs = float((actual - expected).abs().max())
+        raise KernelLaunchFailed(
+            "dsa_paged_mqa_logits_decode:deepgemm_fp8 disagrees with the Torch "
+            f"composite: max abs error {max_abs:.6f}"
+        )
+
+
+def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
+    load_backend: Any,
     batch_size: int,
     context_len: int,
     next_n: int,
@@ -666,7 +710,7 @@ def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
     cache_format: str,
     clean_logits: bool,
 ) -> ComputeMetrics:
-    """Profile vLLM's production-aligned fused DeepGEMM decode kernel."""
+    """Shared profiling implementation for the fused DeepGEMM decode callable."""
     (
         batch_size,
         context_len,
@@ -702,8 +746,10 @@ def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
         cache_format,
         clean_logits,
     )
-    torch, deep_gemm = _load_deepgemm_backend()
-    num_sms = _validate_deepgemm_cuda_device(torch)
+    torch, deep_gemm = load_backend()
+    num_sms = _check_deepgemm_launch_bounds(
+        torch, num_heads=num_heads, head_dim=head_dim, block_size=block_size, next_n=next_n
+    )
 
     try:
         operands = _build_operands(
@@ -725,8 +771,10 @@ def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
             max_model_len=max_model_len,
         )
 
-        # Compile and initialize the exact shape before formal CUPTI timing.
-        kernel()
+        # Compile, initialize, and check the exact shape before formal CUPTI timing.
+        _check_first_request(
+            torch, operands, kernel(), context_len=context_len, max_model_len=max_model_len
+        )
         torch.cuda.synchronize()
         time_ms = Timer.cupti(
             kernel,
@@ -766,3 +814,21 @@ def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
         )
     except (RuntimeError, OSError) as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**kwargs: Any) -> ComputeMetrics:
+    """Profile the fused DeepGEMM FP8 decode callable.
+
+    Both cache layouts reach the same DeepGEMM paged MQA-logits call; each keeps
+    the operand builder and timing boundary its rows were measured with.
+    """
+    if kwargs.get("cache_format") == _CONTIGUOUS_CACHE_FORMAT:
+        from profiling.runners.attention.dsa_paged_mqa_logits_decode_contiguous import (
+            profile_contiguous_deepgemm_fp8,
+        )
+
+        return profile_contiguous_deepgemm_fp8(**kwargs)
+    return _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
+        _load_deepgemm_backend,
+        **kwargs,
+    )

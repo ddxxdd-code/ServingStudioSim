@@ -18,7 +18,21 @@ pub(crate) fn build_kv_store_worker(
     let group = {
         let mut cluster = cluster.borrow_mut();
         let base = cluster.allocate_host(pool.0, id.0, "CPU DRAM");
-        cluster.register_kv_capacity("kv_store", pool.0, id.0, 0, capacity);
+        let accounting = crate::worker::kv::KvAccounting::resolve(
+            &crate::arch::kv_layout::KvCacheLayout::new().with_part(
+                crate::arch::kv_layout::KvCachePart::per_token("remote", bytes_per_token),
+            ),
+            crate::worker::kv::KvAccountingOptions::default(),
+            capacity_bytes,
+        )
+        .expect("linear remote storage accounting");
+        cluster.register_kv_pool(
+            "kv_store",
+            pool.0,
+            id.0,
+            0,
+            crate::worker::gpu_cluster::KvPoolFacts::of(&accounting, None),
+        );
         cluster.register_comm_group(base, 1, "kv_store", id.0)
     };
     KvStoreWorker::new(

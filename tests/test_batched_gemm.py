@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,10 +14,10 @@ from profiling.db.args import DType
 from profiling.db.batch import coerce_args
 from profiling.db.registry import MetricFamily, find_kernel_profiler_spec, known_backends
 from profiling.kernels.batched_gemm import KIND, BatchedGemmArgs
-from profiling.runners.exceptions import ProfilerNotImplemented
 
-_Q_BACKEND = "torch_mla_q_absorb_glm52"
-_V_UP_BACKEND = "torch_mla_v_up_glm52"
+_Q_BACKEND = "torch_mla_q_absorb"
+_V_UP_BACKEND = "torch_mla_v_up"
+_WO_A_BACKEND = "deepgemm_mxfp8_einsum_grouped_o_proj"
 
 
 def test_args_field_order_and_dtype_coercion():
@@ -54,7 +53,13 @@ def test_kind_table_backend_and_runner_ref_contract():
     spec = find_kernel_profiler_spec(KIND, _Q_BACKEND)
 
     assert KIND == "batched_gemm"
-    assert known_backends(KIND) == [_Q_BACKEND, _V_UP_BACKEND]
+    assert known_backends(KIND) == [
+        _Q_BACKEND,
+        _V_UP_BACKEND,
+        "torch_mla_q_absorb_no_rope",
+        "torch_mla_v_up_unpadded",
+        _WO_A_BACKEND,
+    ]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
     assert spec.backend == _Q_BACKEND
@@ -62,7 +67,7 @@ def test_kind_table_backend_and_runner_ref_contract():
     assert spec.metric_family is MetricFamily.COMPUTE
     assert spec.subprocess_env is None
     assert spec.runner_ref.module_name == "profiling.runners.gemm.batched_gemm"
-    assert spec.runner_ref.function_name == "profile_mla_q_absorb_glm52"
+    assert spec.runner_ref.function_name == "profile_mla_q_absorb"
 
 
 def test_v_up_registration_reuses_kind_table_args_and_facade():
@@ -75,18 +80,19 @@ def test_v_up_registration_reuses_kind_table_args_and_facade():
     assert v_spec.metric_family is q_spec.metric_family is MetricFamily.COMPUTE
     assert v_spec.subprocess_env is None
     assert v_spec.runner_ref.module_name == "profiling.runners.gemm.batched_gemm"
-    assert v_spec.runner_ref.function_name == "profile_mla_v_up_glm52"
+    assert v_spec.runner_ref.function_name == "profile_mla_v_up"
 
 
 @pytest.mark.parametrize("backend", [_Q_BACKEND, _V_UP_BACKEND])
-def test_backend_support_is_bf16_h200_only(backend):
+def test_backend_support_is_bf16_on_any_gpu(backend):
     support = find_kernel_profiler_spec(KIND, backend).supports
 
+    # A plain torch.bmm: bf16 only, and no GPU restriction.
     assert support.allows(DType.BF16, gpu="NVIDIA H200")
     assert not support.allows(DType.FP16, gpu="NVIDIA H200")
     assert not support.allows(DType.FP32, gpu="NVIDIA H200")
-    assert not support.allows(DType.BF16, gpu="NVIDIA H100")
-    assert not support.allows(DType.BF16, gpu="NVIDIA B200")
+    assert support.allows(DType.BF16, gpu="NVIDIA H100")
+    assert support.allows(DType.BF16, gpu="NVIDIA B200")
 
 
 def test_registry_barrel_import_is_lazy():
@@ -116,9 +122,9 @@ def test_runner_ref_resolves_without_importing_torch():
                 "import sys; "
                 "from profiling.db.registry import find_kernel_profiler_spec; "
                 "runner = find_kernel_profiler_spec("
-                "'batched_gemm', 'torch_mla_q_absorb_glm52').runner_ref.load(); "
+                "'batched_gemm', 'torch_mla_q_absorb').runner_ref.load(); "
                 "v_runner = find_kernel_profiler_spec("
-                "'batched_gemm', 'torch_mla_v_up_glm52').runner_ref.load(); "
+                "'batched_gemm', 'torch_mla_v_up').runner_ref.load(); "
                 "print(runner.__module__); "
                 "print(runner.__name__); "
                 "print(v_runner.__module__); "
@@ -132,9 +138,9 @@ def test_runner_ref_resolves_without_importing_torch():
     )
     assert completed.stdout.splitlines() == [
         "profiling.runners.gemm.batched_gemm",
-        "profile_mla_q_absorb_glm52",
+        "profile_mla_q_absorb",
         "profiling.runners.gemm.batched_gemm",
-        "profile_mla_v_up_glm52",
+        "profile_mla_v_up",
         "False",
     ]
 
@@ -160,12 +166,12 @@ def test_runner_rejects_nonpositive_dimensions_before_cuda(
         _validate_args(num_batches, m, n, k, DType.BF16)
 
 
-@pytest.mark.parametrize("num_batches", [1, 8, 63, 128])
-def test_runner_rejects_unsupported_head_counts(num_batches):
+@pytest.mark.parametrize("num_batches", [1, 4, 63, 128])
+def test_runner_accepts_any_positive_head_count(num_batches):
+    # torch.bmm runs over any head axis; an unmeasured TP degree is a data gap.
     from profiling.runners.gemm.batched_gemm import _validate_args
 
-    with pytest.raises(ValueError, match=r"num_batches in \{16, 32, 64\}"):
-        _validate_args(num_batches, 1, 512, 192, DType.BF16)
+    assert _validate_args(num_batches, 1, 512, 192, DType.BF16)[0] == num_batches
 
 
 @pytest.mark.parametrize(("n", "k"), [(256, 192), (512, 128), (513, 192)])
@@ -182,27 +188,6 @@ def test_runner_rejects_non_bf16_dtype(dtype):
 
     with pytest.raises(ValueError, match="supports only bf16"):
         _validate_args(64, 1, 512, 192, dtype)
-
-
-def test_runner_rejects_missing_cuda_and_unverified_gpu():
-    from profiling.runners.gemm.batched_gemm import _validate_cuda_device
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match="verified only on NVIDIA H200, got NVIDIA H100",
-    ):
-        _validate_cuda_device(h100)
 
 
 @pytest.mark.parametrize(
@@ -226,11 +211,19 @@ def test_v_up_rejects_nonpositive_dimensions_before_cuda(
         _validate_v_up_args(num_batches, m, n, k, DType.BF16)
 
 
-@pytest.mark.parametrize("num_batches", [1, 8, 63, 128])
-def test_v_up_rejects_unsupported_head_counts(num_batches):
+@pytest.mark.parametrize("num_batches", [1, 4, 63, 64])
+def test_v_up_accepts_head_counts_within_the_padded_layout(num_batches):
     from profiling.runners.gemm.batched_gemm import _validate_v_up_args
 
-    with pytest.raises(ValueError, match=r"num_batches in \{16, 32, 64\}"):
+    assert _validate_v_up_args(num_batches, 1, 256, 512, DType.BF16)[0] == num_batches
+
+
+@pytest.mark.parametrize("num_batches", [65, 128])
+def test_v_up_rejects_head_counts_beyond_the_padded_layout(num_batches):
+    # The attention output is allocated with a 64-head stride.
+    from profiling.runners.gemm.batched_gemm import _validate_v_up_args
+
+    with pytest.raises(ValueError, match=r"num_batches must be <= 64"):
         _validate_v_up_args(num_batches, 1, 256, 512, DType.BF16)
 
 
@@ -250,28 +243,7 @@ def test_v_up_rejects_non_bf16_dtype(dtype):
         _validate_v_up_args(64, 1, 256, 512, dtype)
 
 
-def test_v_up_rejects_missing_cuda_and_unverified_gpu():
-    from profiling.runners.gemm.batched_gemm import _validate_v_up_cuda_device
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_v_up_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match="verified only on NVIDIA H200, got NVIDIA H100",
-    ):
-        _validate_v_up_cuda_device(h100)
-
-
-@pytest.mark.parametrize("num_batches", [64, 32, 16])
+@pytest.mark.parametrize("num_batches", [64, 32, 16, 8])
 def test_q_absorb_operand_constructor_matches_vllm_layout(num_batches):
     from profiling.runners.gemm.batched_gemm import _build_q_absorb_operands
 
@@ -310,7 +282,7 @@ def test_q_absorb_operand_constructor_matches_vllm_layout(num_batches):
     assert operands.out.is_contiguous()
 
 
-@pytest.mark.parametrize("num_batches", [64, 32, 16])
+@pytest.mark.parametrize("num_batches", [64, 32, 16, 8])
 def test_v_up_operand_constructor_matches_vllm_layout(num_batches):
     from profiling.runners.gemm.batched_gemm import _build_v_up_operands
 
@@ -374,3 +346,23 @@ def test_logical_traffic_excludes_packed_gaps():
 def test_generated_facades_are_available():
     assert hasattr(perf_api, "get_batched_gemm_times")
     assert hasattr(perf_api, "count_missing_batched_gemm")
+
+
+def test_no_rope_unpadded_layout_has_no_rope_split_and_no_head_padding():
+    """The no-RoPE layout absorbs the full 256-wide q head and writes an unpadded V-up input."""
+    from profiling.runners.gemm import batched_gemm as runner
+
+    q = runner._build_layout_q_absorb_operands(
+        torch, runner._NO_ROPE_UNPADDED_LAYOUT, num_batches=16, m=3, torch_dtype=torch.float32, device="cpu"
+    )
+    assert tuple(q.lhs.shape) == (16, 3, 256)
+    assert q.lhs.stride() == (256, 16 * 256, 1)
+    assert tuple(q.rhs.shape) == (16, 256, 512)
+    v = runner._build_layout_v_up_operands(
+        torch, runner._NO_ROPE_UNPADDED_LAYOUT, num_batches=16, m=3, torch_dtype=torch.float32, device="cpu"
+    )
+    assert tuple(v.attention_base.shape) == (3, 16, 512)
+    assert tuple(v.rhs.shape) == (16, 512, 256)
+    assert tuple(v.out.shape) == (16, 3, 256)
+    with pytest.raises(ValueError, match=r"\(256, 512\)"):
+        runner._validate_layout_args("torch_mla_q_absorb_no_rope", (256, 512), 16, 3, 512, 192, "bf16")

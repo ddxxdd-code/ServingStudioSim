@@ -1,4 +1,4 @@
-//! GLM-5.2 DSA prefill top-k kernel.
+//! DSA prefill top-k kernel.
 //!
 //! The cache stays on physical `(num_queries, num_keys)` coordinates and
 //! brackets the observed row-wave, work-tile, and semantic top-k boundaries.
@@ -31,6 +31,13 @@ pub struct DsaTopkPrefillKernelConfig {
 pub struct DsaTopkPrefillKernelInput {
     pub num_queries: u32,
     pub num_keys: u32,
+}
+
+/// Whether `backend` takes per-row key starts, which a launch packing several
+/// requests needs. DeepSelect's `begin` is unsupported, so it runs only
+/// launches whose every row starts at key 0.
+pub fn takes_row_starts(backend: &str) -> bool {
+    backend != "deep_select"
 }
 
 pub struct DsaTopkPrefillSpec;

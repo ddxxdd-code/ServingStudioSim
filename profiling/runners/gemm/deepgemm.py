@@ -4,13 +4,13 @@
 L1a-only: allocate tensors, time one kernel, return metrics. Both mirror
 ref/profile/gemm/grouped_gemm_deepgemm.py: `profile_single_gemm` ports the ref's
 dense `fp8_gemm_nt`; `profile_grouped_gemm` ports the m-grouped contiguous kernel
-but generalizes the ref's uniform `batch_size`-per-expert to VibeSim's variable
+but generalizes the ref's uniform `batch_size`-per-expert to ServingStudioSim's variable
 `per_group_batches` vector — the distribution-sensitive cost driver (§2.8).
 
 DeepGEMM grouped needs each expert's rows aligned to the contiguous-layout
 alignment; real rows carry the expert id in `m_indices`, padding rows carry -1
 and the kernel skips them. FP8: A is per-token cast, each weight is per-block
-cast. Both runners require a Hopper GPU + the pinned `deep_gemm` wheel (see
+cast. Both runners require a Hopper or Blackwell GPU + the pinned `deep_gemm` wheel (see
 CLAUDE.md / `just sync`); absent it, they raise ProfilerNotImplemented.
 """
 
@@ -71,8 +71,6 @@ def profile_grouped_gemm(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch required for the deepgemm grouped-GEMM runner") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA required for the deepgemm grouped-GEMM runner")
     try:
         import deep_gemm
         from deep_gemm.utils import (
@@ -167,8 +165,6 @@ def profile_single_gemm(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch required for the deepgemm single-GEMM runner") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA required for the deepgemm single-GEMM runner")
     try:
         import deep_gemm
         from deep_gemm.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
@@ -180,13 +176,19 @@ def profile_single_gemm(
     try:
         # NT layout: A is (M, K) row-major, B is (N, K) row-major (i.e. stored
         # transposed), out is (M, N) bf16. A: per-token FP8, B: per-block FP8
-        # (use_ue8m0=False for SM90/Hopper).
+        # (use_ue8m0=False for SM90/Hopper). Blackwell takes UE8M0 scales; like
+        # vLLM, they are packed into the kernel's layout before timing.
         a_bf16 = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b_bf16 = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
         out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
 
-        a_fp8 = per_token_cast_to_fp8(a_bf16, use_ue8m0=False)
-        b_fp8 = per_block_cast_to_fp8(b_bf16, use_ue8m0=False)
+        use_ue8m0 = torch.cuda.get_device_capability()[0] >= 10
+        a_fp8 = per_token_cast_to_fp8(a_bf16, use_ue8m0=use_ue8m0)
+        b_fp8 = per_block_cast_to_fp8(b_bf16, use_ue8m0=use_ue8m0)
+        if use_ue8m0:
+            layout = deep_gemm.transform_sf_into_required_layout
+            a_fp8 = (a_fp8[0], layout(a_fp8[1], m, k, (1, 128, 128), is_sfa=True))
+            b_fp8 = (b_fp8[0], layout(b_fp8[1], n, k, (1, 128, 128), is_sfa=False))
 
         def kernel():
             deep_gemm.fp8_gemm_nt(a_fp8, b_fp8, out)

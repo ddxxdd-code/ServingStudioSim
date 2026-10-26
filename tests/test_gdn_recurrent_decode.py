@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +18,6 @@ from profiling.kernels.gdn_recurrent_decode import (
     KIND,
     GdnRecurrentDecodeArgs,
 )
-from profiling.runners.exceptions import ProfilerNotImplemented
 
 _SPEC = {
     "batch_size": 1,
@@ -41,6 +39,7 @@ def test_args_field_order_and_coercion() -> None:
         "value_head_dim",
         "dtype",
         "state_dtype",
+        "num_tokens",
     ]
     args = coerce_args(
         GdnRecurrentDecodeArgs,
@@ -69,7 +68,7 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
     spec = find_kernel_profiler_spec(KIND, "torch")
 
     assert KIND == "gdn_recurrent_decode"
-    assert known_backends(KIND) == ["torch", "vllm_triton"]
+    assert known_backends(KIND) == ["torch", "vllm_triton", "vllm_triton_sigmoid_gating"]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.backend == "torch"
     assert spec.args_schema is GdnRecurrentDecodeArgs
@@ -81,14 +80,13 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
 
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.supports.kv is None
-    assert spec.supports.gpus is None
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
 
 
-def test_vllm_triton_registration_reuses_schema_table_and_is_h200_only() -> None:
+def test_vllm_triton_registration_reuses_schema_table_and_runs_on_any_gpu() -> None:
     spec = find_kernel_profiler_spec(KIND, "vllm_triton")
 
     assert spec.kernel_kind == spec.table_name == KIND
@@ -104,10 +102,9 @@ def test_vllm_triton_registration_reuses_schema_table_and_is_h200_only() -> None
 
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.supports.kv is None
-    assert spec.supports.gpus == frozenset({"NVIDIA H200"})
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
-    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
 
@@ -359,16 +356,6 @@ def test_vllm_correctness_guard_matches_reference_and_restores_cpu_state() -> No
     assert torch.count_nonzero(operands.out) == 0
 
 
-def test_runner_reports_missing_cuda_as_typed_unsupported() -> None:
-    from profiling.runners.attention.gdn_recurrent_decode_torch import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-
 def test_semantic_metrics_are_explicit_logical_counts() -> None:
     from profiling.runners.attention.gdn_recurrent_decode_torch import (
         _logical_bytes,
@@ -439,4 +426,52 @@ def test_generated_facades_and_read_only_missing_query(tmp_path, monkeypatch) ->
         "value_head_dim",
         "dtype",
         "state_dtype",
+        "num_tokens",
     ]
+
+
+def test_sigmoid_gating_runner_forwards_vllm_mixed_step_call(monkeypatch) -> None:
+    """The mixed-step decode call: one-token varlen batch, separate Q/K/V,
+    in-place indexed state, in-kernel L2 norm, and only its kernel timed.
+    Catches a runner that times the packed decode layout instead."""
+    import torch
+
+    import profiling.runners.attention.gdn_recurrent_decode_vllm_triton_sigmoid_gating as runner
+
+    spec = _SPEC | {
+        "batch_size": 3,
+        "num_qk_heads": 2,
+        "num_value_heads": 4,
+        "key_head_dim": 8,
+        "value_head_dim": 8,
+    }
+    args = runner._validate_args(**spec)
+    operands = runner._build_varlen_operands(torch, args, device=torch.device("cpu"))
+    seen: dict[str, object] = {}
+
+    def fake_fused(**keyword):
+        seen.update(keyword)
+        return keyword["q"].new_zeros(1, 3, 4, 8), keyword["initial_state"]
+
+    def fake_timer(fn, *, kernel_name):
+        fn()
+        seen["kernel_name"] = kernel_name
+        return 0.5
+
+    monkeypatch.setattr(runner, "_load_callable", lambda: fake_fused)
+    monkeypatch.setattr(runner, "_build_varlen_operands", lambda *_a, **_k: operands)
+    monkeypatch.setattr(runner, "_check_correctness", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner.Timer, "cupti", staticmethod(fake_timer))
+    monkeypatch.setattr(runner.Energy, "perf", staticmethod(lambda fn, **_k: 0.25))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    metrics = runner.profile_gdn_recurrent_decode_vllm_triton_sigmoid_gating(**spec)
+    assert metrics.time_ms == 0.5
+    assert seen["kernel_name"] == "fused_sigmoid_gating_delta_rule_update_kernel"
+    assert tuple(seen["q"].shape) == (1, 3, 2, 8)
+    assert tuple(seen["v"].shape) == (1, 3, 4, 8)
+    assert seen["cu_seqlens"].tolist() == [0, 1, 2, 3]
+    assert seen["ssm_state_indices"].tolist() == [1, 2, 3]
+    assert seen["initial_state"] is operands.base.initial_state
+    assert seen["inplace_final_state"] is True
+    assert seen["use_qk_l2norm_in_kernel"] is True

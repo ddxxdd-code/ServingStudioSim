@@ -6,15 +6,15 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::worker::admission::LoadBalance;
+use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::FullAttnKv;
+use crate::worker::kv::KvCacheStore;
 use crate::worker::types::WorkerConfig;
-use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prepare_unified_iter_build_essentials,
+use crate::worker::workers::iter_build_essentials::{
+    prepare_iter_build_essentials, resolve_kv_accounting,
 };
 
 use super::RemotePullDecodeWorker;
-use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::workers::pd_decode::decode_core::{DecodeCore, PULL_BUDGET_FRACTION};
 
 #[allow(clippy::too_many_arguments)]
@@ -28,27 +28,32 @@ pub(crate) fn build_remote_cache_pd_decode_worker<M: IterwiseUnifiedModel>(
     pool: PoolId,
     gpu_name: &str,
     cluster: SharedGpuCluster,
-) -> RemotePullDecodeWorker<FullAttnKv, UnifiedIterExecution<M>> {
+) -> RemotePullDecodeWorker<KvCacheStore, UnifiedIterExecution<M>> {
     let num_partitions = model.num_attn_dp_groups().max(1) as usize;
     let num_attn_shards = model.num_attn_shards().max(1);
-    let kv_bytes_per_token = model.total_kv_bytes_per_token();
-    let total_partition_tokens = full_attention_token_capacity(model.as_ref(), &config);
-    let pull_budget_tokens = ((total_partition_tokens as f64 * PULL_BUDGET_FRACTION) as u64).max(1);
-    let active_kv_capacity = total_partition_tokens
-        .saturating_sub(pull_budget_tokens)
+    let partition_accounting =
+        resolve_kv_accounting(&model.kv_cache_layout(), model.num_attn_shards(), &config);
+    // A slice of the partition holds pulled KV until it enters a decode
+    // partition; the rest is the decode store's.
+    let pull_budget_units =
+        ((partition_accounting.capacity_units() as f64 * PULL_BUDGET_FRACTION) as u64).max(1);
+    let pull_budget_tokens = partition_accounting
+        .tokens_fitting(pull_budget_units)
         .max(1);
+    let kv_accounting = Arc::new(partition_accounting.reserving(pull_budget_units));
 
-    let essentials = prepare_unified_iter_build_essentials(
+    let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
-        model,
         requests,
         &config,
         cost_log_dir,
         pool,
         gpu_name,
         &cluster,
-        active_kv_capacity,
+        model.gpus_per_replica(),
+        model.cost_log_manifest(),
+        &kv_accounting,
         num_partitions,
     );
     let receive_group_id = cluster.borrow_mut().register_comm_group(
@@ -61,21 +66,21 @@ pub(crate) fn build_remote_cache_pd_decode_worker<M: IterwiseUnifiedModel>(
         LoadBalance::Single if num_partitions > 1 => LoadBalance::RoundRobin { next: 0 },
         configured => configured,
     };
-    let kv_store = FullAttnKv::without_prefix_cache(
+    let kv_store = KvCacheStore::without_prefix_cache(
         num_partitions,
-        essentials.kv_capacity,
+        Arc::clone(&kv_accounting),
         essentials.sampler,
     );
 
     let core = DecodeCore::from_components(
         essentials.context,
         kv_store,
-        essentials.execution,
+        UnifiedIterExecution::new(model, essentials.cost),
         balance,
         cluster,
         receive_group_id,
         pull_budget_tokens,
-        kv_bytes_per_token,
+        kv_accounting,
     );
     RemotePullDecodeWorker::new(core, receive_group_id)
 }

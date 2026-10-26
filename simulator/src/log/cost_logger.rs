@@ -7,22 +7,51 @@
 //! is available, writes its matching `cost_manifest/worker_<pool>_<id>.json`
 //! sidecar once (slots + aggregation structure, for reproducing the total), then
 //! pushes a `CostLogEntry` per iteration.
+//!
+//! The sim never stops for a logging failure, but the run must not pass with a
+//! wrong `cost_log` either: a failed writer deletes its partial parquet and leaves
+//! `cost_log/worker_<pool>_<id>.error`, which the run driver turns into a failed
+//! run once the workers are dropped ([`cost_log_failures`]).
 
-use std::path::Path;
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Result};
 
+use arrow_array::RecordBatch;
+
 use crate::common::WorkerId;
-use crate::log::parquet_writer::StreamingParquetWriter;
-use crate::log::rows::{cost_to_record_batch, CostLogChunk, CostLogEntry, GroupInputLog};
+use crate::log::parquet_writer::{EncodeThreads, StreamingParquetWriter};
+use crate::log::rows::{cost_to_record_batches, CostLogChunk, CostLogEntry, GroupInputLog};
 use crate::log::schemas::cost_log_schema;
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
 use parquet::schema::types::ColumnPath;
 
+/// Most rows in one chunk handed to the writer thread.
 const STREAM_FLUSH_ROWS: usize = 8_192;
-const CHANNEL_CAP: usize = 64;
+/// Buffered bytes that close a chunk early. A row's size scales with the
+/// deployment's slot count (1,271 slots on GLM-5.2 EP8, 8,649 on GLM-5.3 EP64),
+/// so a row-count cap alone let one chunk reach ~5 GB.
+const CHUNK_BYTE_BUDGET: usize = 64 << 20;
+/// Chunks queued for the writer before the sim thread blocks. With
+/// [`CHUNK_BYTE_BUDGET`] this bounds a stream's in-flight rows to about 1 GB.
+const CHANNEL_CAP: usize = 16;
+/// Most threads that encode one stream's columns. The six `slot_*` list
+/// columns are ~99% of the encode time and `slot_input` alone ~30%, so past
+/// three or four threads the `slot_input` thread alone sets the pace.
+const MAX_ENCODE_THREADS: usize = 4;
+
+/// Rows per chunk for a row of these sizes: [`CHUNK_BYTE_BUDGET`] worth, at
+/// least one and at most [`STREAM_FLUSH_ROWS`].
+fn rows_per_chunk(groups: usize, slots: usize, slot_inputs: usize) -> usize {
+    let slot_bytes = 3 * std::mem::size_of::<f32>() + 2 * std::mem::size_of::<u8>();
+    let row_bytes = std::mem::size_of::<CostLogEntry>()
+        + groups * std::mem::size_of::<GroupInputLog>()
+        + slots * slot_bytes
+        + slot_inputs * std::mem::size_of::<SlotInput>();
+    (CHUNK_BYTE_BUDGET / row_bytes.max(1)).clamp(1, STREAM_FLUSH_ROWS)
+}
 
 /// Parquet *leaf* path of one per-slot list column.
 fn slot_list_column(column: &str) -> ColumnPath {
@@ -63,12 +92,84 @@ fn high_cardinality_slot_columns() -> Vec<ColumnPath> {
         .collect()
 }
 
+/// Arrow-converted chunks waiting for the encoder: enough to keep it busy
+/// while the next chunk converts, few enough to stay a small fraction of the
+/// queued rows.
+const BATCH_CHANNEL_CAP: usize = 2;
+
+/// The writer thread: convert `rx`'s chunks to Arrow on a second thread and
+/// encode them here, so the two stages overlap. Conversion is about a third of
+/// the writer's work (mostly serializing each `SlotInput`) and was serial with
+/// the encode. A failed encode drops the batch channel, which stops the
+/// converter at its next send; a failed conversion closes it, ending the
+/// encode loop. Either error is returned, the encoder's first.
+fn write_stream(rx: Receiver<CostLogChunk>, mut writer: StreamingParquetWriter) -> Result<()> {
+    std::thread::scope(|scope| {
+        let (batch_tx, batch_rx) = sync_channel::<Vec<RecordBatch>>(BATCH_CHANNEL_CAP);
+        let converter = std::thread::Builder::new()
+            .name("vibesim-cost-convert".to_string())
+            .spawn_scoped(scope, move || -> Result<()> {
+                for chunk in rx {
+                    let batches = cost_to_record_batches(&chunk)?;
+                    drop(chunk);
+                    if batch_tx.send(batches).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            })?;
+        let encoded = (|| -> Result<()> {
+            for batches in batch_rx {
+                for batch in &batches {
+                    writer.write(batch)?;
+                }
+            }
+            Ok(())
+        })();
+        let converted = converter
+            .join()
+            .map_err(|_| anyhow!("cost-log converter thread panicked"))?;
+        encoded?;
+        converted?;
+        writer.close()?;
+        Ok(())
+    })
+}
+
 pub(crate) fn cost_artifact_stem(pool_tag: &str, worker_id: WorkerId) -> String {
     assert!(
         !pool_tag.contains('/') && !pool_tag.contains('\\'),
         "pool_tag must be path-segment safe"
     );
     format!("worker_{}_{}", pool_tag, worker_id.0)
+}
+
+/// Extension of the marker a failed writer leaves beside where its parquet was.
+const FAILURE_MARKER_EXTENSION: &str = "error";
+
+/// The `cost_log` streams of the run in `log_dir` whose writer failed, as
+/// `"<stem>: <error>"`. Read after every worker has been dropped (which flushes
+/// and joins its writer); a non-empty list means the run's `cost_log` is
+/// incomplete and the run has failed.
+pub fn cost_log_failures(log_dir: &Path) -> Result<Vec<String>> {
+    let cost_dir = log_dir.join("raw").join("cost_log");
+    if !cost_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut failures = Vec::new();
+    for entry in std::fs::read_dir(&cost_dir)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext == FAILURE_MARKER_EXTENSION)
+        {
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let error = std::fs::read_to_string(&path)?;
+            failures.push(format!("{stem}: {}", error.trim()));
+        }
+    }
+    failures.sort();
+    Ok(failures)
 }
 
 /// Sim-thread handle: buffers `CostLogEntry` rows and offloads encode/write to a
@@ -78,13 +179,26 @@ pub struct CostLogger {
     handle: Option<JoinHandle<Result<()>>>,
     buf: CostLogChunk,
     pool_tag: &'static str,
+    /// This stream's parquet and the marker written in its place if the writer fails.
+    parquet_path: PathBuf,
+    failure_marker_path: PathBuf,
     /// Per-row flat-buffer sizes, learned from the first recorded row (all rows
     /// of one worker share the same compiled CostTree, so these are constant).
     /// Used to size a freshly-rotated chunk's buffers in [`Self::send`].
     groups_per_row: usize,
     slots_per_row: usize,
     slot_inputs_per_row: usize,
+    /// Rows that close a chunk ([`rows_per_chunk`] of the per-row sizes).
+    chunk_rows: usize,
+    /// Set after the first backpressure warning, so a writer-bound run logs it once.
+    backpressure_warned: bool,
+    /// The writer's column-encode threads, raised one at a time while the
+    /// channel is full.
+    encode_threads: EncodeThreads,
     closed: bool,
+    /// Set once the writer has failed: later rows are dropped, since the stream's
+    /// file is already gone and the failure is on record.
+    failed: bool,
 }
 
 impl CostLogger {
@@ -120,30 +234,42 @@ impl CostLogger {
             serde_json::to_vec_pretty(manifest)?,
         )?;
 
-        let path = cost_dir.join(format!("{stem}.parquet"));
-        let mut writer = StreamingParquetWriter::new(path, cost_log_schema())
+        let parquet_path = cost_dir.join(format!("{stem}.parquet"));
+        let failure_marker_path = cost_dir.join(format!("{stem}.{FAILURE_MARKER_EXTENSION}"));
+        // The parquet is created on the first write, so a file left by an earlier
+        // run in this log_dir would otherwise survive a run that fails before it.
+        for stale in [&parquet_path, &failure_marker_path] {
+            match std::fs::remove_file(stale) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let encode_threads = EncodeThreads::new(MAX_ENCODE_THREADS);
+        let writer = StreamingParquetWriter::new(parquet_path.clone(), cost_log_schema())
             .with_column_dictionary_disabled(high_cardinality_slot_columns())
-            .with_column_statistics_disabled(slot_list_columns());
+            .with_column_statistics_disabled(slot_list_columns())
+            .with_encode_threads(encode_threads.handle());
         let (tx, rx) = sync_channel::<CostLogChunk>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
             .name("vibesim-cost-logger".to_string())
-            .spawn(move || -> Result<()> {
-                for chunk in rx {
-                    writer.write(&cost_to_record_batch(&chunk)?)?;
-                }
-                writer.close()?;
-                Ok(())
-            })?;
+            .spawn(move || write_stream(rx, writer))?;
 
         Ok(Self {
             tx: Some(tx),
             handle: Some(handle),
             buf: CostLogChunk::with_capacity(pool_tag, STREAM_FLUSH_ROWS, 0, 0, 0),
             pool_tag,
+            parquet_path,
+            failure_marker_path,
             groups_per_row: 0,
             slots_per_row: 0,
             slot_inputs_per_row: 0,
+            chunk_rows: STREAM_FLUSH_ROWS,
+            backpressure_warned: false,
+            encode_threads,
             closed: false,
+            failed: false,
         })
     }
 
@@ -161,22 +287,24 @@ impl CostLogger {
         groups: &mut Vec<GroupInputLog>,
         slot_inputs: &[SlotInput],
     ) -> Result<()> {
+        if self.failed {
+            groups.clear();
+            return Ok(());
+        }
         let (group_len, slot_len, slot_input_len) = (groups.len(), slots.len(), slot_inputs.len());
         if self.slots_per_row == 0 && slot_len > 0 {
             self.groups_per_row = group_len;
             self.slots_per_row = slot_len;
             self.slot_inputs_per_row = slot_input_len;
-            self.buf
-                .group_logs
-                .reserve(STREAM_FLUSH_ROWS * group_len.max(1));
-            self.buf.slot_times.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf.slot_covs.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf.slot_flops.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf.slot_bytes.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf.slot_backends.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf
-                .slot_inputs
-                .reserve(STREAM_FLUSH_ROWS * slot_input_len);
+            self.chunk_rows = rows_per_chunk(group_len, slot_len, slot_input_len);
+            let rows = self.chunk_rows;
+            self.buf.group_logs.reserve(rows * group_len.max(1));
+            self.buf.slot_times.reserve(rows * slot_len);
+            self.buf.slot_covs.reserve(rows * slot_len);
+            self.buf.slot_flops.reserve(rows * slot_len);
+            self.buf.slot_bytes.reserve(rows * slot_len);
+            self.buf.slot_backends.reserve(rows * slot_len);
+            self.buf.slot_inputs.reserve(rows * slot_input_len);
         }
         entry.group_len = group_len;
         entry.slot_len = slot_len;
@@ -195,8 +323,10 @@ impl CostLogger {
         self.buf.group_logs.append(groups);
         self.buf.slot_inputs.extend_from_slice(slot_inputs);
         self.buf.entries.push(entry);
-        if self.buf.len() >= STREAM_FLUSH_ROWS {
-            self.send()?;
+        if self.buf.len() >= self.chunk_rows {
+            if let Err(e) = self.send() {
+                return Err(self.fail(e));
+            }
         }
         Ok(())
     }
@@ -209,10 +339,10 @@ impl CostLogger {
             &mut self.buf,
             CostLogChunk::with_capacity(
                 self.pool_tag,
-                STREAM_FLUSH_ROWS,
-                STREAM_FLUSH_ROWS * self.groups_per_row.max(1),
-                STREAM_FLUSH_ROWS * self.slots_per_row,
-                STREAM_FLUSH_ROWS * self.slot_inputs_per_row,
+                self.chunk_rows,
+                self.chunk_rows * self.groups_per_row.max(1),
+                self.chunk_rows * self.slots_per_row,
+                self.chunk_rows * self.slot_inputs_per_row,
             ),
         );
         let tx = self.tx.as_ref().expect("tx present until flush");
@@ -222,10 +352,18 @@ impl CostLogger {
         let chunk = match tx.try_send(chunk) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Full(chunk)) => {
-                tracing::warn!(
-                    "cost-log channel full ({CHANNEL_CAP} chunks in flight): sim thread \
-                     blocking on cost-logger backpressure"
-                );
+                // A full channel means the writer is behind: give it another
+                // column-encode thread before blocking the sim thread.
+                if let Some(threads) = self.encode_threads.grow() {
+                    tracing::debug!("cost-log writer behind: encoding on {threads} threads");
+                }
+                if !self.backpressure_warned {
+                    self.backpressure_warned = true;
+                    tracing::warn!(
+                        "cost-log channel full ({CHANNEL_CAP} chunks in flight): sim thread \
+                         blocking on cost-logger backpressure (warned once per stream)"
+                    );
+                }
                 chunk
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -247,11 +385,37 @@ impl CostLogger {
     fn join_writer(&mut self) -> Result<()> {
         drop(self.tx.take());
         match self.handle.take() {
-            Some(h) => h
-                .join()
-                .map_err(|_| anyhow!("cost-logger writer thread panicked"))?,
+            Some(h) => h.join().map_err(|payload| {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                anyhow!("cost-logger writer thread panicked: {message}")
+            })?,
             None => Ok(()),
         }
+    }
+
+    /// Record a writer failure: stop the writer, delete the partial parquet (it
+    /// has no footer, or holds only a prefix of the rows), and leave the marker
+    /// [`cost_log_failures`] reports. Returns `error` for the caller to propagate.
+    fn fail(&mut self, error: anyhow::Error) -> anyhow::Error {
+        self.failed = true;
+        // Already joined when the error came from the writer itself.
+        let _ = self.join_writer();
+        self.buf = CostLogChunk::with_capacity(self.pool_tag, 0, 0, 0, 0);
+        let _ = std::fs::remove_file(&self.parquet_path);
+        if let Err(e) = std::fs::write(&self.failure_marker_path, format!("{error:#}\n")) {
+            tracing::error!(
+                "cost_log writer failed ({error:#}) and its marker could not be written: {e}"
+            );
+        }
+        tracing::error!(
+            "cost_log {} failed, file removed: {error:#}",
+            self.parquet_path.display()
+        );
+        error
     }
 
     /// Flush the buffer tail, close the channel, and join the writer. Idempotent.
@@ -260,8 +424,13 @@ impl CostLogger {
             return Ok(());
         }
         self.closed = true;
-        self.send()?;
-        self.join_writer()
+        if self.failed {
+            return Ok(());
+        }
+        match self.send().and_then(|()| self.join_writer()) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.fail(e)),
+        }
     }
 }
 
@@ -381,11 +550,11 @@ mod tests {
             }
             Err(_) => {
                 let chunk = bench_chunk(rows);
-                let mut batch = cost_to_record_batch(&chunk).unwrap();
+                let mut batch = cost_to_record_batches(&chunk).unwrap().remove(0);
                 convert_s = f64::INFINITY;
                 for _ in 0..5 {
                     let start = std::time::Instant::now();
-                    batch = cost_to_record_batch(&chunk).unwrap();
+                    batch = cost_to_record_batches(&chunk).unwrap().remove(0);
                     convert_s = convert_s.min(start.elapsed().as_secs_f64());
                 }
                 // Same chunk with the slot_input column emptied: the difference is
@@ -398,7 +567,7 @@ mod tests {
                 let mut no_input_s = f64::INFINITY;
                 for _ in 0..5 {
                     let start = std::time::Instant::now();
-                    let _ = cost_to_record_batch(&no_input).unwrap();
+                    let _ = cost_to_record_batches(&no_input).unwrap();
                     no_input_s = no_input_s.min(start.elapsed().as_secs_f64());
                 }
                 println!(
@@ -438,7 +607,7 @@ mod tests {
             .as_deref()
             .map_or_else(|| dir.path().to_path_buf(), std::path::PathBuf::from);
         std::fs::create_dir_all(&out_dir).unwrap();
-        let mut report = vec![("cost_to_record_batch".to_owned(), convert_s, 0u64)];
+        let mut report = vec![("cost_to_record_batches".to_owned(), convert_s, 0u64)];
         let all_slot_columns = |input: bool| -> Vec<ColumnPath> {
             let mut columns = numeric_slot_columns.clone();
             if input {
@@ -755,5 +924,105 @@ mod tests {
             .clone();
         assert_eq!(backend_slots.len(), 1);
         assert_eq!(backend_slots.value(0), 0);
+    }
+
+    fn one_slot_doc() -> CostManifestDoc {
+        CostManifestDoc::single(
+            "iter",
+            CostManifest {
+                slots: vec![LeafDesc {
+                    name: "m.test".to_owned(),
+                    kind: "unit".to_owned(),
+                    kernel_config: serde_json::json!({"shape": 1, "backends": ["torch"]}),
+                }],
+                nodes: vec![FlatCostNode::Leaf(0)],
+                node_labels: vec![None],
+            },
+        )
+    }
+
+    fn record_rows(logger: &mut CostLogger, rows: u64) -> Result<()> {
+        let slots = vec![LeafMetrics {
+            m: Metrics4 {
+                time_ms: 1.0,
+                flops: 0.0,
+                bytes: 0.0,
+                energy_j: 0.0,
+            },
+            coverage: CoverageFlags::EMPTY,
+            backend_index: 0,
+        }];
+        for iter_id in 0..rows {
+            let entry = CostLogEntry {
+                worker_id: 0,
+                iter_id,
+                batch_id: 0,
+                wall_start_ms: iter_id as f64,
+                total_time_ms: 1.0,
+                energy_j: 0.0,
+                section: "iter",
+                layer: -1,
+                group_len: 0,
+                slot_len: 0,
+                slot_input_len: 0,
+            };
+            logger.record(entry, &slots, &mut Vec::new(), &[])?;
+        }
+        Ok(())
+    }
+
+    /// Catches a chunk sized by row count alone: a wide row (GLM-5.3 EP64,
+    /// 8,649 slots) must close its chunk long before 8,192 rows, so the queued
+    /// chunks stay near `CHANNEL_CAP x CHUNK_BYTE_BUDGET`.
+    #[test]
+    fn a_chunk_holds_a_byte_budget_of_rows() {
+        assert_eq!(rows_per_chunk(0, 1, 0), STREAM_FLUSH_ROWS);
+        let wide = rows_per_chunk(64, 8_649, 8_649);
+        assert!(wide < STREAM_FLUSH_ROWS / 4, "{wide}");
+        let slot_bytes = 14 + std::mem::size_of::<SlotInput>();
+        assert!(wide * 8_649 * slot_bytes <= CHUNK_BYTE_BUDGET, "{wide}");
+        assert_eq!(rows_per_chunk(0, usize::MAX / 64, 0), 1);
+    }
+
+    #[test]
+    fn a_failed_writer_leaves_a_marker_and_no_parquet() {
+        let dir = tempdir().unwrap();
+        let mut logger =
+            CostLogger::open(dir.path(), "main", WorkerId(0), &one_slot_doc()).unwrap();
+        // A directory where the parquet goes: the writer's first `File::create` fails.
+        let parquet_path = dir.path().join("raw/cost_log/worker_main_0.parquet");
+        std::fs::create_dir(&parquet_path).unwrap();
+        record_rows(&mut logger, 3).unwrap();
+
+        let error = logger.flush_all().unwrap_err();
+        // Later rows and flushes are no-ops: the failure is already on record.
+        record_rows(&mut logger, STREAM_FLUSH_ROWS as u64 + 1).unwrap();
+        logger.flush_all().unwrap();
+        drop(logger);
+
+        let failures = cost_log_failures(dir.path()).unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].starts_with("worker_main_0: "), "{failures:?}");
+        assert!(
+            failures[0].contains(&format!("{error:#}")),
+            "{failures:?} vs {error:#}"
+        );
+    }
+
+    #[test]
+    fn opening_a_stream_removes_the_previous_runs_files() {
+        let dir = tempdir().unwrap();
+        let cost_dir = dir.path().join("raw/cost_log");
+        std::fs::create_dir_all(&cost_dir).unwrap();
+        std::fs::write(cost_dir.join("worker_main_0.parquet"), b"stale").unwrap();
+        std::fs::write(cost_dir.join("worker_main_0.error"), b"stale").unwrap();
+
+        // A run whose worker never records a row writes no parquet at all.
+        let mut logger =
+            CostLogger::open(dir.path(), "main", WorkerId(0), &one_slot_doc()).unwrap();
+        logger.flush_all().unwrap();
+
+        assert!(!cost_dir.join("worker_main_0.parquet").exists());
+        assert!(cost_log_failures(dir.path()).unwrap().is_empty());
     }
 }

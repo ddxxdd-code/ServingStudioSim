@@ -19,12 +19,10 @@ encoding (``kv_len = prefix_len + append_len`` >= ``q_len``) cannot. The runner
 ``profiling.runners.attention.flashinfer_attn_prefill_and_rect``) passes these
 straight to the ragged wrapper.
 
-Backends ``{fa2, fa3, trt, cudnn}`` are VibeSim backend strings, not kinds: each
+Backends ``{fa2, fa3, cudnn}`` are ServingStudioSim backend strings, not kinds: each
 registers its own spec -> the same ``args_schema`` and table, routing to its own
 ``profile_flashinfer_attn_rect_<backend>`` entry. Unsupported combos raise
-``ProfilerNotImplemented`` at profile time: ``cudnn+fp8``, and ``trt`` entirely
-(trtllm-gen has no ragged kernel and is B200-only — kept registered for a future
-paged/B200 path).
+``ProfilerNotImplemented`` at profile time: ``cudnn+fp8``.
 
 Shape split: static Config = ``(num_qo_heads, num_kv_heads, head_dim, q_dtype,
 kv_dtype, o_dtype)``; runtime 2D sweep Input = ``(q_len, kv_len)``.
@@ -40,6 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -52,7 +51,7 @@ from profiling.db.registry import (
 KIND: str = "flashinfer_attn_rect"
 
 _RUNNER_MODULE = "profiling.runners.attention.flashinfer_attn_prefill_and_rect"
-_BACKENDS = ("fa2", "fa3", "trt", "cudnn")
+_BACKENDS = ("fa2", "fa3", "cudnn")
 
 # Per-backend capability on compute (q_dtype) and kv-cache (kv_dtype) axes; fa2
 # runs bf16-q / fp8-kv. See flashinfer_attn_prefill for the rationale.
@@ -67,26 +66,68 @@ _SUPPORTS = {
     "cudnn": BackendSupport(
         compute=frozenset({DType.BF16}), kv=frozenset({DType.BF16})
     ),
-    "trt": BackendSupport(
-        compute=frozenset({DType.FP8_E4M3}),
-        kv=frozenset({DType.FP8_E4M3}),
-        gpus=frozenset({"NVIDIA B200"}),  # trtllm-gen kernels are Blackwell-only
-    ),
 }
 
 
 @dataclass(frozen=True)
 class FlashinferAttnRectArgs(KernelArgs):
     # Static attention dims (Rust <Name>KernelConfig, minus `backends`).
-    num_qo_heads: int
-    num_kv_heads: int
-    head_dim: int
-    q_dtype: DType
-    kv_dtype: DType
-    o_dtype: DType
+    num_qo_heads: int = arg(unit="heads", doc="Query and output heads on this GPU.")
+    num_kv_heads: int = arg(unit="heads", doc="KV heads on this GPU.")
+    head_dim: int = arg(unit="elements", doc="Dimension of each query, key and value head.")
+    q_dtype: DType = arg(doc="Query element type.")
+    kv_dtype: DType = arg(doc="Key and value element type.")
+    o_dtype: DType = arg(doc="Output element type.")
     # Runtime 2D sweep coords (Rust <Name>KernelInput). Direct, not prefix/append.
-    q_len: int
-    kv_len: int
+    q_len: int = arg(unit="tokens", doc="Query tokens in the measured request.")
+    kv_len: int = arg(unit="tokens", doc="Key and value tokens in the measured request.")
+
+
+DOC = KernelDoc(
+    title="Non-causal rectangular attention",
+    summary="Attend every query token over every key and value token in one request.",
+    description=(
+        "Attention without a causal mask: every query token sees every key and "
+        "value token of its request. The DFlash2 draft layer uses it so each "
+        "drafted position sees the whole context. The measurement is one "
+        "request with q_len queries and kv_len contiguous keys and values; the "
+        "two lengths are independent."
+    ),
+    category="Attention",
+    subcategory="MHA / GQA",
+    formula=(
+        "O = softmax(Q · Kᵀ / √head_dim) · V, per query head",
+        "TFLOPS = 4 · q_len · kv_len · num_qo_heads · head_dim / time",
+        "GB/s = bytes of Q, K, V and O / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=(
+        f"{CUPTI_METHOD} "
+        "Planning and input construction are not timed; every launch of the "
+        "attention call is counted. fa2 first times the default plan and fixed "
+        "KV split sizes of 1,024 to 16,384 tokens below kv_len, then measures "
+        "the fastest."
+    ),
+    caveats=(
+        "One request with contiguous K and V is measured, not a batch of "
+        "requests of different lengths.",
+        "The fp8 path needs fp8 queries and KV with a non-fp8 output, so bf16 "
+        "queries over fp8 KV are not measured.",
+        "cudnn measures no fp8.",
+    ),
+    # No separate PyTorch reference implementation exists for this attention kind.
+    reference=None,
+)
+
+_BACKEND_DOCS = {
+    "fa2": BackendDoc(
+        summary="FlashInfer FA2 non-causal ragged attention with a measured KV split search."
+    ),
+    "fa3": BackendDoc(summary="FlashInfer's non-causal ragged wrapper with FA3 kernels."),
+    "cudnn": BackendDoc(
+        summary="PyTorch scaled_dot_product_attention pinned to cuDNN for non-causal attention."
+    ),
+}
 
 
 for _backend in _BACKENDS:
@@ -104,5 +145,6 @@ for _backend in _BACKENDS:
             metric_family=MetricFamily.COMPUTE,
             batch_outlier_policy=BatchOutlierPolicy(),
             subprocess_env="flashinfer_pip_env",
+            doc=_BACKEND_DOCS[_backend],
         )
     )

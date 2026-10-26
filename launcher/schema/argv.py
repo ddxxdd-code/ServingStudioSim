@@ -1,4 +1,4 @@
-"""Concrete config tree → Rust binary argv (new-interface-design §13.1).
+"""Concrete config tree → Rust binary argv (L7 design).
 
 Each run-like subcommand (`run` / `build-cache-only` / `dry-run`) takes a path
 to ONE structured config file. This module strips the launcher-internal keys,
@@ -34,11 +34,17 @@ def write_config(config: dict, config_path: str | Path) -> Path:
 
 
 def build_cli_command(
-    config: dict, binary: str | Path, config_path: str | Path, subcommand: str = "run"
+    config: dict,
+    binary: str | Path,
+    config_path: str | Path,
+    subcommand: str = "run",
+    *,
+    error_json: Path | None = None,
 ) -> list[str]:
     """Write `config` to `config_path` (block-style YAML) and emit `[binary,
     subcommand, path]`. `subcommand` is `run` (sim), `build-cache-only` (cache
     prebuild), or `dry-run` (coverage probe) — all take the same one-config-file
-    surface."""
+    surface. With `error_json`, a failure also writes its error there."""
     path = write_config(config, config_path)
-    return [str(binary), subcommand, str(path)]
+    error = ["--error-json", str(error_json)] if error_json is not None else []
+    return [str(binary), subcommand, str(path), *error]

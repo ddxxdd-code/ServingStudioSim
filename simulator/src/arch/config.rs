@@ -1,5 +1,5 @@
 //! Arch (L4) config surface — the model-arch *selectors*, co-located with the L4
-//! implementations they pick (new-interface-design §2 / §4).
+//! implementations they pick (L4 design).
 //!
 //! Each selector is a serde tagged enum (`#[serde(tag = "type")]`): choosing the
 //! tag is the only way that variant's params appear — no global union,
@@ -30,7 +30,8 @@ use serde::Deserialize;
 
 use schema_derive::{ParamStruct, ProviderSchema};
 
-use super::glm52_dsa_moe::Glm52MtpMode;
+use super::glm52_model_cfg::Glm52MtpMode;
+use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -53,15 +54,19 @@ pub struct ModelSpec {
     pub fp8: bool,
 }
 
+impl ModelSpec {
+    /// The checkpoint's `max_position_embeddings`, the longest request an arch
+    /// without its own `max_model_len` serves (see
+    /// [`model_cfg::max_position_embeddings`](super::model_cfg::max_position_embeddings)).
+    pub fn max_position_embeddings(&self) -> anyhow::Result<u32> {
+        super::model_cfg::max_position_embeddings(std::path::Path::new(&self.model_config))
+    }
+}
+
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
-/// MoE expert routing distribution kind (the `routing` selector on
-/// [`IterArchSel::Qwen3MoeDpAttnEpFfn`]). v1 exposes `uniform` and a seeded
-/// `random`; the model layer also carries `power_law` / explicit `from_profile`
-/// (see `timing::routing::RoutingDistribution`), while a measured profile is
-/// supplied separately through `expert_popularity_file`. Kept a small closed
-/// set so the launcher validates it as a `string` param with `choices`
-/// (mirrored by [`ROUTING_KINDS`]).
+/// Where a MoE arch's expert demand comes from: synthetic uniform/random
+/// demand, or a measured distribution loaded from `expert_popularity_file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingKind {
@@ -70,10 +75,23 @@ pub enum RoutingKind {
     Uniform,
     /// Deterministic pseudo-random skew seeded by `routing_seed`.
     Random,
+    /// Measured per-expert marginal; requires `expert_popularity_file`.
+    Popularity,
+    /// Recorded per-token expert routes; requires `token_corpus_file`. Unlike a
+    /// marginal it keeps whole tokens, so a batch's verify blocks can be
+    /// sampled as the contiguous runs they are.
+    Corpus,
 }
 
 /// The `routing` choices the launcher schema advertises (mirror of [`RoutingKind`]).
-const ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
+const ROUTING_KINDS: [&str; 4] = ["uniform", "random", "popularity", "corpus"];
+
+// Only the GLM-5.2 NVFP4 and DeepSeek-V4.1 archs read a token corpus so far;
+// the rest advertise the marginal-backed kinds.
+const MARGINAL_ROUTING_KINDS: [&str; 3] = ["uniform", "random", "popularity"];
+
+// AFD FFN selectors do not yet accept popularity files.
+const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
 
 /// GLM-5.2 proposer modes exposed by the iter selector. This mirrors
 /// [`Glm52MtpMode`]'s serde representation.
@@ -81,6 +99,81 @@ const GLM52_MTP_MODES: [&str; 3] = ["off", "full_index", "index_share"];
 
 const fn default_glm52_parallel_size() -> u16 {
     8
+}
+
+const fn default_glm52_nvfp4_parallel_size() -> u16 {
+    4
+}
+
+const fn default_glm52_nvfp4_max_model_len() -> u32 {
+    1_048_576
+}
+
+/// The captured GLM-5.3-Flash deployment's `--max-model-len`.
+const fn default_glm53_flash_max_model_len() -> u32 {
+    8192
+}
+
+/// The MiMo-V2.6-Flash capture's `--max-model-len` (its attention rows'
+/// FA4 split count).
+const fn default_mimo_v2_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-27B capture's `--max-model-len`.
+const fn default_qwen35_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-Flash-Next capture's `--max-model-len`.
+const fn default_qwen4_exp_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-Flash-Next capture's MTP `num_speculative_tokens`.
+const fn default_qwen4_exp_draft_tokens() -> u32 {
+    3
+}
+
+/// [`Qwen4ExpCacheDtype`]'s serde representation.
+const QWEN4_EXP_CACHE_DTYPES: [&str; 2] = Qwen4ExpCacheDtype::CHOICES;
+/// [`PleTableResidency`]'s serde representation.
+const PLE_TABLE_RESIDENCIES: [&str; 2] = PleTableResidency::CHOICES;
+
+/// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
+const fn default_glm53_flash_enable_expert_parallel() -> bool {
+    true
+}
+
+const fn default_glm53_flash_mla_layout_copies() -> bool {
+    true
+}
+
+/// vLLM's default `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` (`vllm/envs.py`).
+const fn default_glm53_flash_indexer_max_logits_mb() -> u32 {
+    512
+}
+
+/// A speculative GLM must actually run its MTP layer, so unlike the ordinary
+/// selector it cannot default to `off`.
+const fn default_glm52_speculative_mtp_mode() -> Glm52MtpMode {
+    Glm52MtpMode::IndexShare
+}
+
+/// Default to the measured Spec5 workload; depth remains an execution choice.
+const fn default_glm52_draft_tokens() -> u32 {
+    5
+}
+
+/// The DFlash2 checkpoint's own block size is 8: one bonus token plus seven
+/// drafted positions.
+const fn default_dflash2_draft_tokens() -> u32 {
+    7
+}
+
+/// `sliding_window` in the DFlash2 draft checkpoint.
+const fn default_dflash2_sliding_window() -> u32 {
+    2048
 }
 
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
@@ -100,9 +193,10 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
@@ -112,6 +206,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
     },
+    /// Megatron TP over dense Llama 3. `tp_size` must divide the KV heads (8).
     Llama3DenseTp {
         #[serde(flatten)]
         model: ModelSpec,
@@ -151,15 +246,17 @@ pub enum IterArchSel {
         nvl_num_gpu: u16,
         /// Expert routing distribution: `uniform` (default) spreads load evenly;
         /// `random` draws a deterministic pseudo-random skew seeded by
-        /// `routing_seed`. Drives the L2 MoE dispatch/combine `BottleneckCurve`
+        /// `routing_seed`; `popularity` loads `expert_popularity_file`.
+        /// Drives the L2 MoE dispatch/combine `BottleneckCurve`
         /// and the L3 grouped-GEMM `local_ppm` shards. Omitted → `uniform`.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, cache_key)]
         routing: RoutingKind,
         /// Seed for `routing = random` (ignored for `uniform`). Fixed so a run is
         /// reproducible (the throughput golden is bit-identical); vary it to
         /// sample a different random skew.
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         /// Optional measured expert-popularity JSON. Its all-layer expert
         /// totals replace the synthetic routing distribution and are split
@@ -170,7 +267,7 @@ pub enum IterArchSel {
         expert_popularity_file: Option<String>,
     },
     /// Native FP8 Qwen recipe: per-token/group quantized dense projections,
-    /// DeepGEMM expert kernels, and VibeSim's P2P EP dispatch/combine graph.
+    /// DeepGEMM expert kernels, and ServingStudioSim's P2P EP dispatch/combine graph.
     Qwen3MoeFp8DpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -183,9 +280,10 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
@@ -194,7 +292,7 @@ pub enum IterArchSel {
     /// Alignment-only Qwen recipe matching the target vLLM execution path:
     /// FlashInfer/TensorRT-LLM block-scale expert GEMMs plus local finalize and
     /// an EP all-reduce. The generic Qwen tag above intentionally retains
-    /// VibeSim's original DeepGEMM + P2P communication recipe.
+    /// ServingStudioSim's original DeepGEMM + P2P communication recipe.
     Qwen3VllmMoeDpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -207,18 +305,117 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
-    /// The same GLM-5.2 schedule as `glm52_dsa_moe`, expressed in vLLM's kernel
-    /// granularity for framework alignment. Same parameters, same topology; the
-    /// graphs differ only in how leaves are cut. See
-    /// `arch/glm52_vllm_dsa_moe.rs` for the itemised divergences.
+    /// DeepSeek-V4-Flash-0731 at vLLM's physical kernel boundaries. EP4 and
+    /// local attention DP4 are checkpoint/deployment invariants.
+    DeepseekV4Vllm {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+    },
+    /// The same physical DeepSeek kernels with each source-level parallel
+    /// region serialized. This is an explicit alignment counterfactual, not a
+    /// hidden runtime knob on the production selector.
+    DeepseekV4VllmSerialStreams {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+    },
+    /// DeepSeek-V4.1-Flash at vLLM's physical kernel boundaries on B200: TP4
+    /// attention and EP4 experts over the same four ranks (deployment
+    /// invariants). Routed demand normally comes from the capture's token
+    /// corpus (`routing = corpus`), the demand its MoE rows were profiled on.
+    DeepseekV41Vllm {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. All 40 routed layers
+        /// share one binding over the corpus's layer axis.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`: the longest request, and the extent the
+        /// FlashMLA prefill planner sizes its compressed-KV workspace for.
+        /// Omitted, the checkpoint's `max_position_embeddings` (1048576), as
+        /// vLLM defaults it; anything larger is refused.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
+        /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
+        /// source run only each prefill chunk's last `sliding_window` extend
+        /// tokens. A counterfactual with no capture behind it; default off.
+        #[serde(default)]
+        decoder_swa_bounded_replay: bool,
+    },
+    /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
+    /// input projections, the compressor aux stream, the shared expert)
+    /// serialized; the Engram lookups keep racing the main path. An explicit
+    /// alignment counterfactual, not a runtime knob on the production selector.
+    DeepseekV41VllmSerialStreams {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`: the longest request, and the extent the
+        /// FlashMLA prefill planner sizes its compressed-KV workspace for.
+        /// Omitted, the checkpoint's `max_position_embeddings` (1048576), as
+        /// vLLM defaults it; anything larger is refused.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
+        /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
+        /// source run only each prefill chunk's last `sliding_window` extend
+        /// tokens. A counterfactual with no capture behind it; default off.
+        #[serde(default)]
+        decoder_swa_bounded_replay: bool,
+    },
+    /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
+    /// expert parallelism across the replica.
     Glm52VllmDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -232,10 +429,11 @@ pub enum IterArchSel {
         nvl_num_gpu: u16,
         /// Expert routing distribution used by dispatch/combine.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, cache_key)]
         routing: RoutingKind,
         /// Seed for `routing = random`; ignored for uniform routing.
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         /// Optional MTP proposer work: off, full-index step 0, or a later
         /// IndexShare step.
@@ -243,42 +441,752 @@ pub enum IterArchSel {
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
         mtp_mode: Glm52MtpMode,
         /// Measured per-expert popularity from a profile pass. Requires
-        /// `routing = uniform`; the profile replaces the synthetic distribution.
+        /// `routing = popularity`; uniform/random routing cannot carry a profile.
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
-    /// GLM-5.2's exact heterogeneous 78-layer DSA/MoE schedule. Attention is
-    /// local (TP1) on every EP rank and pairs with `hp_unified`, whose KV/input
-    /// partitions correspond one-for-one with the EP ranks.
-    Glm52DsaMoe {
+    /// B200 execution graph for NVIDIA's GLM-5.2 NVFP4 checkpoint. Tensor and
+    /// expert parallelism share one rank group, as observed in vLLM.
+    Glm52VllmNvfp4DsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
-        /// Expert-parallel ranks and independent local-attention DP groups.
-        #[serde(default = "default_glm52_parallel_size")]
-        #[param(default = 8, cache_key)]
+        /// Shared tensor/expert-parallel rank count.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
         ep_size: u16,
-        /// NVLink-domain size for the MoE dispatch/combine split.
-        #[serde(default = "default_glm52_parallel_size")]
-        #[param(default = 8, cache_key)]
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
         nvl_num_gpu: u16,
-        /// Expert routing distribution used by dispatch/combine.
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
         routing: RoutingKind,
-        /// Seed for `routing = random`; ignored for uniform routing.
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
-        /// Optional MTP proposer work: off, full-index step 0, or a later
-        /// IndexShare step.
         #[serde(default)]
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
         mtp_mode: Glm52MtpMode,
-        /// Measured per-expert popularity from a profile pass. Requires
-        /// `routing = uniform`; the profile replaces the synthetic distribution.
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as
+        /// a manifest path. Requires `routing = corpus`. One artifact covers
+        /// every routed layer, so the body MoE and the MTP MoE read slices
+        /// of it rather than separate files.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+    },
+    /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under data-parallel attention
+    /// and expert-parallel MoE (vLLM `--data-parallel-size ep_size
+    /// --enable-expert-parallel`, TP1). Every GPU is its own engine with its
+    /// own batch and KV; attention, dense FFN, shared expert and lm_head run
+    /// whole on each GPU's tokens, and only the routed experts are sharded,
+    /// behind an NVFP4 all-gather and a bf16 reduce-scatter. MTP is not run.
+    /// GLM-5.3 NVFP4 is the same graph.
+    Glm52VllmNvfp4DpAttnDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Data-parallel attention ranks, which are also the expert-parallel
+        /// group: one GPU each.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        nvl_num_gpu: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same
+        /// `expert_parallel_size`. Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Only the body slice is
+        /// read: no MTP layer runs.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM's CUDA-graph capture sizes. When the busiest DP rank's tokens
+        /// fit a captured size, every rank pads to that graph and every
+        /// kernel outside the attention graph break runs on the padded rows.
+        /// Empty: every step runs eager, unpadded.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under pure pipeline
+    /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
+    /// layer range (vLLM's `get_pp_indices`) at EP1: every head and expert is
+    /// local, so a stage has no collective. MTP is not run. GLM-5.3 NVFP4 is
+    /// the same graph. Runs only under deployment `pp`.
+    Glm52VllmNvfp4PpDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at EP1 (one rank owns all
+        /// 256 experts). Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Only the body slice is
+        /// read: a stage runs no MTP layer.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+    },
+    /// [`Self::Glm52VllmNvfp4DsaMoe`] driving its MTP layer as a real drafter:
+    /// one target verify pass over `draft_tokens + 1` rows per decode request,
+    /// then `draft_tokens` draft passes.
+    ///
+    /// A separate selector because it builds a different model type, not the
+    /// same one with speculation switched on — the two compile different cost
+    /// trees, so nothing can read one's cost log as the other's. It pairs only
+    /// with the `speculative` worker.
+    Glm52VllmNvfp4DsaMoeSpeculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Shared tensor/expert-parallel rank count.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        nvl_num_gpu: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// The draft layer's own execution mode. `off` is rejected here: a
+        /// speculative arch with no MTP layer has nothing to draft with.
+        #[serde(default = "default_glm52_speculative_mtp_mode")]
+        #[param(string, default = "index_share", choices = GLM52_MTP_MODES, cache_key)]
+        mtp_mode: Glm52MtpMode,
+        /// Candidate positions drafted per request per iteration. Fixes the
+        /// verify width at `draft_tokens + 1`, which selects a profiled kernel
+        /// shape and so cannot vary per iteration.
+        #[serde(default = "default_glm52_draft_tokens")]
+        #[param(default = 5, cache_key)]
+        draft_tokens: u32,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as
+        /// a manifest path. Requires `routing = corpus`. One artifact covers
+        /// every routed layer, so the body MoE and the MTP MoE read slices
+        /// of it rather than separate files.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+    },
+    /// The same GLM target graph driven by a **DFlash2** proposer instead of the
+    /// MTP layer.
+    ///
+    /// The distinction that matters here is not the checkpoint but the drafting
+    /// shape: DFlash2 proposes a whole block in one forward pass, so there is no
+    /// recurrence to fold and the draft forwards `draft_tokens + 1` rows per
+    /// request rather than one. It also carries its own dense checkpoint, so it
+    /// routes nothing and has no `mtp_mode`.
+    Glm53VllmNvfp4DsaMoeDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Shared tensor/expert-parallel rank count.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        nvl_num_gpu: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Candidate positions drafted per request per iteration. Fixes the
+        /// verify width at `draft_tokens + 1`, which selects a profiled kernel
+        /// shape and so cannot vary per iteration.
+        #[serde(default = "default_dflash2_draft_tokens")]
+        #[param(default = 7, cache_key)]
+        draft_tokens: u32,
+        /// The draft's own attention window. It caps the context each draft
+        /// query attends to, not the draft's KV: vLLM allocates those layers as
+        /// full attention, so their cache still grows with every token.
+        #[serde(default = "default_dflash2_sliding_window")]
+        #[param(default = 2048, cache_key)]
+        draft_sliding_window: u32,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token target expert routes from a `token_corpus` pass,
+        /// as a manifest path. Requires `routing = corpus`. Only the body
+        /// slice is read: this target runs no MTP layer.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+    },
+    /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
+    /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
+    /// tensor-parallel rank group whose routed experts are either expert- or
+    /// tensor-parallel; MTP is not run.
+    Glm53FlashVllmFp8KdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count: attention heads, the dense FFN and the
+        /// shared expert are split over it, and so are the routed experts.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced to `moe_intermediate_size / tp_size` on
+        /// the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. The engine pads an iteration's
+        /// token count up to the next captured size, and every kernel outside
+        /// the attention graph break runs on the padded rows. Empty: no
+        /// padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
+        /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
+        /// fits this many MiB, and runs logits and top-k once per piece.
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+    },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under pure pipeline
+    /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
+    /// layer range (vLLM's `get_pp_indices`) at TP1 / EP1: every head and
+    /// expert is local, so a stage has no collective. Each stage caches only
+    /// its own KDA (per request) and DSA (per token) layers; from PP12 a stage
+    /// has KDA layers but no DSA layer, which vLLM's hybrid cache rejects. MTP
+    /// is not run. Runs only under deployment `pp`.
+    Glm53FlashVllmFp8PpKdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at EP1 (one rank owns all
+        /// 288 experts). Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Routes are per token, so
+        /// a corpus captured at any EP size folds to EP1.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the TP = EP graph. Empty:
+        /// no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, `pp_size` counts
+        /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
+        #[serde(default)]
+        layer_partition: Vec<u32>,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
+        /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
+        /// fits this many MiB, and runs logits and top-k once per piece.
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+    },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under data-parallel
+    /// attention and expert-parallel MoE (vLLM `--data-parallel-size ep_size
+    /// --enable-expert-parallel`, TP1). Every GPU is its own engine with its
+    /// own batch, KV and KDA state; attention, dense FFN, shared expert and
+    /// lm_head run whole on each GPU's tokens, and only the routed experts are
+    /// sharded, behind an FP8 all-gather and a bf16 reduce-scatter.
+    Glm53FlashVllmFp8DpAttnEpMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Data-parallel attention ranks, which are also the expert-parallel
+        /// group: one GPU each.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same
+        /// `expert_parallel_size`. Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. When every rank's batch fits a
+        /// captured size, all ranks pad to the busiest rank's graph; otherwise
+        /// they run eager on their own rows. Empty: always eager.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
+        /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
+        /// fits this many MiB, and runs logits and top-k once per piece.
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+    },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s graph for NVIDIA's ModelOpt NVFP4
+    /// checkpoint (`nvidia/GLM-5.3-Flash-NVFP4`): NVFP4 routed experts and
+    /// dense FFN, BF16 shared expert; attention and the router as in FP8.
+    Glm53FlashVllmNvfp4KdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count: attention heads, the dense FFN and the
+        /// shared expert are split over it, and so are the routed experts.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced to `moe_intermediate_size / tp_size` on
+        /// the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. The engine pads an iteration's
+        /// token count up to the next captured size, and every kernel outside
+        /// the attention graph break runs on the padded rows. Empty: no
+        /// padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
+        /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
+        /// fits this many MiB, and runs logits and top-k once per piece.
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+    },
+    /// [`Self::Glm53FlashVllmFp8PpKdaDsaMoe`] for the NVFP4 checkpoint (see
+    /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]). Runs only under deployment `pp`.
+    Glm53FlashVllmNvfp4PpKdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at EP1 (one rank owns all
+        /// 288 experts). Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Routes are per token, so
+        /// a corpus captured at any EP size folds to EP1.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the TP = EP graph. Empty:
+        /// no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, `pp_size` counts
+        /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
+        #[serde(default)]
+        layer_partition: Vec<u32>,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
+        /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
+        /// fits this many MiB, and runs logits and top-k once per piece.
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+    },
+    /// [`Self::Glm53FlashVllmFp8DpAttnEpMoe`] for the NVFP4 checkpoint (see
+    /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]): the routed experts sit behind
+    /// an NVFP4 all-gather and a bf16 reduce-scatter.
+    Glm53FlashVllmNvfp4DpAttnEpMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Data-parallel attention ranks, which are also the expert-parallel
+        /// group: one GPU each.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same
+        /// `expert_parallel_size`. Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. When every rank's batch fits a
+        /// captured size, all ranks pad to the busiest rank's graph; otherwise
+        /// they run eager on their own rows. Empty: always eager.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
+        /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
+        /// fits this many MiB, and runs logits and top-k once per piece.
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+    },
+    /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
+    /// rank owns all experts (EP1) and shards the routed intermediate axis by
+    /// TP, so there is no expert-parallel or NVLink-domain selector.
+    Glm52SglangNvfp4TpDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[param(cache_key)]
+        tp_size: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[param(cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
+        mtp_mode: Glm52MtpMode,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as
+        /// a manifest path. Requires `routing = corpus`. One artifact covers
+        /// every routed layer, so the body MoE and the MTP MoE read slices
+        /// of it rather than separate files.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+    },
+    /// Inkling's ModelOpt NVFP4 checkpoints (`thinkingmachines/Inkling-NVFP4`,
+    /// `Inkling-Small-NVFP4`) under the vLLM fork's TP group: TP attention,
+    /// dense FFN and sink experts, replicated router, routed experts EP = TP
+    /// or MoE TP, and every sublayer closed by the Lamport RS + sconv + AG +
+    /// norm call.
+    InklingVllmNvfp4RelAttnMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count (at least 2: the Lamport boundary).
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced on the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
+        /// Configured context cap: the global layers' FA4 split count. It is
+        /// also part of every attention layer's kernel config, local layers
+        /// included (their context axis stops at it), and each request's
+        /// context is validated against it.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// MoE layers; the BF16-expert layers and the NVFP4 ones each fold
+        /// their own slice.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. Every kernel but attention runs
+        /// on the token count padded up to the next captured size; attention
+        /// on a uniform-decode step runs at the padded request count. The
+        /// sizes also decide whether the sink experts overlap the routed call
+        /// (FULL-graph decode or eager steps only). Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// MiMo-V2's FP8 checkpoints (`XiaomiMiMo/MiMo-V2.6-Flash-RL`) under
+    /// vLLM's TP group: TP attention over global and sliding-window layers
+    /// (FA4 DiffKV), replicated router, routed MXFP4 experts EP = TP with BF16
+    /// activations, and every TP all-reduce fused with the residual add and
+    /// RMSNorm (FlashInfer MNNVL).
+    MimoV2VllmFp8SwaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count; the routed experts are expert-parallel
+        /// over the same ranks (`--enable-expert-parallel`).
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// Configured context cap: FA4's split count on a FULL-graph decode
+        /// and the context axis top of every attention layer's config. Each
+        /// request's context is validated against it.
+        #[serde(default = "default_mimo_v2_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// MoE layers (layer 0's dense MLP has none).
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). Every kernel
+        /// but attention runs on the token count padded up to the next
+        /// captured size; attention on a uniform-decode step runs at the
+        /// padded request count from a FULL graph. Empty: no padding, no graphs
+        /// (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// Qwen3.5-family hybrid decoders (`Qwen3_5ForConditionalGeneration`,
+    /// text only) with ModelOpt mixed-precision weights (FP8 per-tensor
+    /// attention projections, NVFP4 MLP and lm_head) on one GPU under vLLM:
+    /// Gated DeltaNet and gated-GQA layers (FlashInfer trtllm-gen, FP8 KV),
+    /// each with a dense SwiGLU MLP. Precisions come from the checkpoint's
+    /// `quantization_config`; `fp8` is not read.
+    Qwen35VllmNvfp4GdnDense {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Configured context cap; each request's context is validated
+        /// against it.
+        #[serde(default = "default_qwen35_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). The compiled
+        /// pieces run on the token count padded up to the next captured size;
+        /// a uniform decode replays a FULL graph, so the GDN core and decode
+        /// attention run padded too. Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// Qwen4Exp hybrid decoders (`Qwen4ExpForConditionalGeneration`, text
+    /// only; Qwen3.8-Flash-Next) with ModelOpt mixed-precision weights on one
+    /// GPU under the vLLM fork, drafting with the checkpoint's MTP layer:
+    /// Gated DeltaNet and QSA (sparse GQA with a compressed indexer) layers
+    /// joined by hyper-connections, PLE n-gram blocks, NVFP4 routed experts
+    /// with a BF16 shared expert, and an FP8-block MTP layer. Precisions come
+    /// from the checkpoint's `quantization_config`; `fp8` is not read.
+    Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Configured context cap; each request's context is validated
+        /// against it, and it sizes the QSA top-k and block-table rows.
+        #[serde(default = "default_qwen4_exp_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        /// MTP `num_speculative_tokens`: fixes the verify width at
+        /// `draft_tokens + 1`, a profiled kernel shape.
+        #[serde(default = "default_qwen4_exp_draft_tokens")]
+        #[param(default = 3, cache_key)]
+        draft_tokens: u32,
+        /// vLLM `--kv-cache-dtype` of the QSA KV.
+        #[serde(default)]
+        #[param(string, default = "fp8", choices = QWEN4_EXP_CACHE_DTYPES, cache_key)]
+        kv_cache_dtype: Qwen4ExpCacheDtype,
+        /// The QSA indexer's key-cache dtype.
+        #[serde(default)]
+        #[param(string, default = "fp8", choices = QWEN4_EXP_CACHE_DTYPES, cache_key)]
+        indexer_kv_dtype: Qwen4ExpCacheDtype,
+        /// Where the PLE n-gram table lives: pinned host memory over UVA
+        /// (the fork's CPU offload) or HBM.
+        #[serde(default)]
+        #[param(string, default = "host_uva", choices = PLE_TABLE_RESIDENCIES, cache_key)]
+        ple_table_residency: PleTableResidency,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// body's MoE layers, then the MTP layer.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). The graph
+        /// pieces run on the token count padded up to the next captured size;
+        /// a uniform verify step replays a FULL graph, so its eager breaks run
+        /// padded too. Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
     },
 }
 
@@ -293,8 +1201,77 @@ impl IterArchSel {
             | Self::Qwen3MoeDpAttnEpFfn { model, .. }
             | Self::Qwen3MoeFp8DpAttnEpFfn { model, .. }
             | Self::Qwen3VllmMoeDpAttnEpFfn { model, .. }
-            | Self::Glm52DsaMoe { model, .. }
-            | Self::Glm52VllmDsaMoe { model, .. } => model,
+            | Self::DeepseekV4Vllm { model, .. }
+            | Self::DeepseekV4VllmSerialStreams { model, .. }
+            | Self::DeepseekV41Vllm { model, .. }
+            | Self::DeepseekV41VllmSerialStreams { model, .. }
+            | Self::Glm52VllmDsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4DsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4DpAttnDsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
+            | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmFp8PpKdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmFp8DpAttnEpMoe { model, .. }
+            | Self::Glm53FlashVllmNvfp4KdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
+            | Self::Glm52SglangNvfp4TpDsaMoe { model, .. }
+            | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
+            | Self::MimoV2VllmFp8SwaMoe { model, .. }
+            | Self::Qwen35VllmNvfp4GdnDense { model, .. }
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. } => model,
+        }
+    }
+
+    /// The longest request this arch serves, in tokens of context (prompt,
+    /// output and any tokens a verify reads ahead): its `max_model_len` where
+    /// the arch takes one, else the checkpoint's `max_position_embeddings`, as
+    /// vLLM defaults it. Every variant is listed so a new one decides which.
+    pub fn max_model_len(&self) -> anyhow::Result<u32> {
+        match self {
+            Self::Glm52VllmNvfp4DsaMoe { max_model_len, .. }
+            | Self::Glm52VllmNvfp4PpDsaMoe { max_model_len, .. }
+            | Self::Glm52VllmNvfp4DpAttnDsaMoe { max_model_len, .. }
+            | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
+            | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8PpKdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8DpAttnEpMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmNvfp4KdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
+            | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
+            | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
+            | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }
+            | Self::Qwen35VllmNvfp4GdnDense { max_model_len, .. }
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. } => {
+                Ok(*max_model_len)
+            }
+            Self::DeepseekV41Vllm {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41VllmSerialStreams {
+                model,
+                max_model_len,
+                ..
+            } => super::deepseek_v41_vllm::resolve_max_model_len(
+                *max_model_len,
+                model.max_position_embeddings()?,
+            ),
+            Self::Qwen36Local { model, .. }
+            | Self::Llama3Dense { model }
+            | Self::Llama3DenseTp { model, .. }
+            | Self::Llama3DpAttnTpFfn { model, .. }
+            | Self::Qwen3MoeDpAttnEpFfn { model, .. }
+            | Self::Qwen3MoeFp8DpAttnEpFfn { model, .. }
+            | Self::Qwen3VllmMoeDpAttnEpFfn { model, .. }
+            | Self::DeepseekV4Vllm { model, .. }
+            | Self::DeepseekV4VllmSerialStreams { model, .. }
+            | Self::Glm52VllmDsaMoe { model, .. } => model.max_position_embeddings(),
         }
     }
 }
@@ -345,7 +1322,10 @@ mod iter_tests {
             .iter()
             .map(|param| param["name"].as_str().unwrap())
             .collect();
-        assert_eq!(published, ["routing", "routing_seed", "expert_popularity_file"]);
+        assert_eq!(
+            published,
+            ["routing", "routing_seed", "expert_popularity_file"]
+        );
         let popularity = serde_json::to_value(params).unwrap();
         let popularity = popularity
             .as_array()
@@ -386,16 +1366,16 @@ mod iter_tests {
         ))
     }
 
-    fn parse(extra: &str) -> Result<IterArchSel, serde_json::Error> {
+    fn parse_glm52(extra: &str) -> Result<IterArchSel, serde_json::Error> {
         serde_json::from_str(&format!(
-            r#"{{"type":"glm52_dsa_moe","model_config":"model/config/glm52.json","fp8":false{extra}}}"#
+            r#"{{"type":"glm52_vllm_dsa_moe","model_config":"model/config/glm52.json","fp8":false{extra}}}"#
         ))
     }
 
     #[test]
     fn qwen_selector_parses_profile_path_and_marks_it_cache_relevant() {
         let parsed = parse_qwen(
-            r#","attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"expert_popularity_file":"profile_expert_popularity/expert_popularity.json""#,
+            r#","attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"popularity","expert_popularity_file":"profile_expert_popularity/expert_popularity.json""#,
         )
         .expect("qwen selector with popularity profile parses");
         let IterArchSel::Qwen3MoeDpAttnEpFfn {
@@ -436,7 +1416,7 @@ mod iter_tests {
             IterArchSel::Qwen3MoeFp8DpAttnEpFfn { .. }
         ));
         let parsed = parse_vllm_qwen(
-            r#", "attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"expert_popularity_file":"expert_popularity.json""#,
+            r#", "attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"popularity","expert_popularity_file":"expert_popularity.json""#,
         )
         .expect("vLLM-alignment Qwen selector parses");
         assert!(matches!(
@@ -499,41 +1479,112 @@ mod iter_tests {
     }
 
     #[test]
-    fn glm52_selector_accepts_a_measured_expert_popularity_profile() {
-        // The GLM graphs previously had no way to consume a measured expert
-        // distribution, so a DP+EP alignment run could only assume uniform
-        // routing -- a silent confound on exactly the grouped-GEMM operations
-        // that deviate most. Same field and same semantics as the Qwen
-        // variants: the profile replaces the synthetic distribution and is
-        // rejected outright if a non-uniform `routing` is also requested.
-        for tag in ["glm52_dsa_moe", "glm52_vllm_dsa_moe"] {
-            let parsed: IterArchSel = serde_json::from_str(&format!(
-                r#"{{"type":"{tag}","model_config":"model/config/glm52_fp8.json","fp8":true,
-                     "expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}}"#
-            ))
-            .expect("GLM selector accepts an expert-popularity profile");
-            let file = match &parsed {
-                IterArchSel::Glm52DsaMoe {
-                    expert_popularity_file,
-                    ..
-                }
-                | IterArchSel::Glm52VllmDsaMoe {
-                    expert_popularity_file,
-                    ..
-                } => expert_popularity_file.clone(),
-                _ => panic!("expected a GLM arch"),
-            };
-            assert_eq!(
-                file.as_deref(),
-                Some("profile_expert_popularity/expert_popularity.json")
-            );
+    fn glm52_nvfp4_selector_defaults_to_tp4_ep4() {
+        let parsed: IterArchSel = serde_json::from_str(
+            r#"{"type":"glm52_vllm_nvfp4_dsa_moe","model_config":"model/config/glm52_nvfp4.json","fp8":false}"#,
+        )
+        .expect("B200 NVFP4 GLM selector parses");
+        let IterArchSel::Glm52VllmNvfp4DsaMoe {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            max_model_len,
+            routing,
+            routing_seed,
+            mtp_mode,
+            expert_popularity_file,
+            token_corpus_file,
+        } = &parsed
+        else {
+            panic!("expected glm52_vllm_nvfp4_dsa_moe")
+        };
+        assert_eq!(model.model_config, "model/config/glm52_nvfp4.json");
+        assert!(!model.fp8);
+        assert_eq!((*ep_size, *nvl_num_gpu), (4, 4));
+        assert_eq!(*max_model_len, 1_048_576);
+        assert_eq!(*routing, RoutingKind::Uniform);
+        assert_eq!(*routing_seed, None);
+        assert_eq!(*mtp_mode, Glm52MtpMode::Off);
+        assert_eq!(*expert_popularity_file, None);
+        assert_eq!(*token_corpus_file, None);
+        assert!(std::ptr::eq(parsed.model(), model));
+        assert!(IterArchSel::SCHEMA
+            .iter()
+            .any(|(tag, _)| *tag == "glm52_vllm_nvfp4_dsa_moe"));
+    }
+
+    #[test]
+    fn glm52_sglang_nvfp4_selector_requires_explicit_tp_and_context_without_ep_knobs() {
+        let parsed: IterArchSel = serde_json::from_str(
+            r#"{"type":"glm52_sglang_nvfp4_tp_dsa_moe","model_config":"model/config/glm52_nvfp4.json","fp8":false,"tp_size":4,"max_model_len":8192}"#,
+        )
+        .expect("SGLang NVFP4 pure-TP selector parses");
+        let IterArchSel::Glm52SglangNvfp4TpDsaMoe {
+            model,
+            tp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            mtp_mode,
+            expert_popularity_file,
+            token_corpus_file,
+        } = &parsed
+        else {
+            panic!("expected glm52_sglang_nvfp4_tp_dsa_moe")
+        };
+        assert_eq!(model.model_config, "model/config/glm52_nvfp4.json");
+        assert!(!model.fp8);
+        assert_eq!(*tp_size, 4);
+        assert_eq!(*max_model_len, 8_192);
+        assert_eq!(*routing, RoutingKind::Uniform);
+        assert_eq!(*routing_seed, None);
+        assert_eq!(*mtp_mode, Glm52MtpMode::Off);
+        assert_eq!(*expert_popularity_file, None);
+        assert_eq!(*token_corpus_file, None);
+        assert!(std::ptr::eq(parsed.model(), model));
+
+        let params = IterArchSel::SCHEMA
+            .iter()
+            .find(|(tag, _)| *tag == "glm52_sglang_nvfp4_tp_dsa_moe")
+            .expect("SGLang pure-TP tag is published")
+            .1;
+        let names = params.iter().map(|param| param.name).collect::<Vec<_>>();
+        assert!(names.contains(&"tp_size"));
+        assert!(!names.contains(&"ep_size"));
+        assert!(!names.contains(&"nvl_num_gpu"));
+
+        for incomplete in [
+            r#"{"type":"glm52_sglang_nvfp4_tp_dsa_moe","model_config":"model/config/glm52_nvfp4.json","fp8":false,"max_model_len":8192}"#,
+            r#"{"type":"glm52_sglang_nvfp4_tp_dsa_moe","model_config":"model/config/glm52_nvfp4.json","fp8":false,"tp_size":4}"#,
+        ] {
+            assert!(serde_json::from_str::<IterArchSel>(incomplete).is_err());
         }
     }
 
     #[test]
+    fn glm52_selector_accepts_a_measured_expert_popularity_profile() {
+        let parsed: IterArchSel = serde_json::from_str(
+            r#"{"type":"glm52_vllm_dsa_moe","model_config":"model/config/glm52_fp8.json","fp8":true,
+                 "routing":"popularity","expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}"#,
+        )
+        .expect("GLM selector accepts an expert-popularity profile");
+        let IterArchSel::Glm52VllmDsaMoe {
+            expert_popularity_file,
+            ..
+        } = parsed
+        else {
+            panic!("expected glm52_vllm_dsa_moe")
+        };
+        assert_eq!(
+            expert_popularity_file.as_deref(),
+            Some("profile_expert_popularity/expert_popularity.json")
+        );
+    }
+
+    #[test]
     fn glm52_selector_defaults_and_model_are_exact() {
-        let parsed = parse("").expect("default GLM selector parses");
-        let IterArchSel::Glm52DsaMoe {
+        let parsed = parse_glm52("").expect("default GLM selector parses");
+        let IterArchSel::Glm52VllmDsaMoe {
             model,
             ep_size,
             nvl_num_gpu,
@@ -543,7 +1594,7 @@ mod iter_tests {
             expert_popularity_file,
         } = &parsed
         else {
-            panic!("expected glm52_dsa_moe")
+            panic!("expected glm52_vllm_dsa_moe")
         };
         assert_eq!(model.model_config, "model/config/glm52.json");
         assert!(!model.fp8);
@@ -563,13 +1614,13 @@ mod iter_tests {
             ("full_index", Glm52MtpMode::FullIndex),
             ("index_share", Glm52MtpMode::IndexShare),
         ] {
-            let parsed = parse(&format!(
+            let parsed = parse_glm52(&format!(
                 r#","ep_size":16,"nvl_num_gpu":8,"routing":"random","routing_seed":73,"mtp_mode":"{wire}""#
             ))
             .unwrap();
             assert!(matches!(
                 parsed,
-                IterArchSel::Glm52DsaMoe {
+                IterArchSel::Glm52VllmDsaMoe {
                     ep_size: 16,
                     nvl_num_gpu: 8,
                     routing: RoutingKind::Random,
@@ -583,7 +1634,7 @@ mod iter_tests {
 
     #[test]
     fn glm52_selector_rejects_malformed_mtp_mode() {
-        let error = parse(r#","mtp_mode":"shared""#).unwrap_err();
+        let error = parse_glm52(r#","mtp_mode":"shared""#).unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
     }
 
@@ -591,7 +1642,7 @@ mod iter_tests {
     fn glm52_schema_exposes_exact_defaults_choices_and_cache_keys() {
         let (_, params) = IterArchSel::SCHEMA
             .iter()
-            .find(|(tag, _)| *tag == "glm52_dsa_moe")
+            .find(|(tag, _)| *tag == "glm52_vllm_dsa_moe")
             .expect("glm52 selector schema row");
         let params = serde_json::to_value(params).unwrap();
         let get = |name: &str| {
@@ -609,7 +1660,10 @@ mod iter_tests {
         }
         let routing = get("routing");
         assert_eq!(routing["default"], "uniform");
-        assert_eq!(routing["choices"], serde_json::json!(["uniform", "random"]));
+        assert_eq!(
+            routing["choices"],
+            serde_json::json!(["uniform", "random", "popularity"])
+        );
         let mtp = get("mtp_mode");
         assert_eq!(mtp["default"], "off");
         assert_eq!(
@@ -618,22 +1672,114 @@ mod iter_tests {
         );
         assert_eq!(mtp["affects_cache"], true);
     }
+
+    #[test]
+    fn retired_glm52_selector_is_not_published_or_accepted() {
+        assert!(!IterArchSel::SCHEMA
+            .iter()
+            .any(|(tag, _)| *tag == "glm52_dsa_moe"));
+        let raw =
+            r#"{"type":"glm52_dsa_moe","model_config":"model/config/glm52.json","fp8":false}"#;
+        assert!(serde_json::from_str::<IterArchSel>(raw).is_err());
+    }
+
+    fn checked_in(config: &str) -> String {
+        format!("{}/model/config/{config}.json", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// An arch's own `max_model_len` wins; without one, the checkpoint's
+    /// `max_position_embeddings`, read from `text_config` for Qwen3.6.
+    #[test]
+    fn max_model_len_is_the_arch_param_else_the_checkpoints_positions() {
+        let limit = |arch: &str, config: &str, extra: &str| {
+            let raw = format!(
+                r#"{{"type":"{arch}","model_config":"{}","fp8":false{extra}}}"#,
+                checked_in(config)
+            );
+            serde_json::from_str::<IterArchSel>(&raw)
+                .unwrap()
+                .max_model_len()
+                .unwrap()
+        };
+        assert_eq!(
+            limit("llama3_dense_tp", "llama3_8b", r#","tp_size":2"#),
+            131_072
+        );
+        assert_eq!(limit("qwen36_local", "qwen3_6_35b_a3b_fp8", ""), 262_144);
+        assert_eq!(
+            limit("glm52_vllm_nvfp4_dsa_moe", "glm52_nvfp4", ""),
+            1_048_576
+        );
+        assert_eq!(
+            limit(
+                "glm52_vllm_nvfp4_dsa_moe",
+                "glm52_nvfp4",
+                r#","max_model_len":8192"#
+            ),
+            8192
+        );
+        assert_eq!(
+            limit("glm53_flash_vllm_fp8_kda_dsa_moe", "glm53_flash", ""),
+            8192
+        );
+        // DeepSeek-V4.1 defaults to the checkpoint's 1M positions; the
+        // capture presets pin their 131072.
+        for arch in ["deepseek_v41_vllm", "deepseek_v41_vllm_serial_streams"] {
+            assert_eq!(limit(arch, "deepseek_v41_flash", ""), 1_048_576);
+            assert_eq!(
+                limit(arch, "deepseek_v41_flash", r#","max_model_len":131072"#),
+                131_072
+            );
+        }
+
+        let attn = format!(
+            r#"{{"type":"qwen3_attn_tp","model_config":"{}","fp8":false,"attn_tp_size":4}}"#,
+            checked_in("qwen3_235b")
+        );
+        let attn: AttnArchSel = serde_json::from_str(&attn).unwrap();
+        assert_eq!(attn.max_model_len().unwrap(), 40_960);
+    }
+
+    /// DeepSeek-V4.1 takes no `max_model_len` past the trained positions.
+    #[test]
+    fn deepseek_v41_refuses_a_max_model_len_past_its_positions() {
+        let raw = format!(
+            r#"{{"type":"deepseek_v41_vllm","model_config":"{}","fp8":true,"max_model_len":1048577}}"#,
+            checked_in("deepseek_v41_flash")
+        );
+        let error = serde_json::from_str::<IterArchSel>(&raw)
+            .unwrap()
+            .max_model_len()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("max_model_len must be 1..=1048576"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_without_positions_needs_an_explicit_max_model_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"hidden_size": 8}"#).unwrap();
+        let raw = format!(
+            r#"{{"type":"llama3_dense","model_config":"{}","fp8":false}}"#,
+            path.display()
+        );
+        let error = serde_json::from_str::<IterArchSel>(&raw)
+            .unwrap()
+            .max_model_len()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no max_position_embeddings"), "{error}");
+    }
 }
 // ── layer-wise attn / ffn contract (AFD) ────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AttnArchSel {
-    Llama3AttnTp {
-        #[serde(flatten)]
-        model: ModelSpec,
-        /// Tensor parallelism size.
-        #[param(default = 2, cache_key)]
-        tp_size: u16,
-        /// Attention head parallelism.
-        #[param(default = 1, cache_key)]
-        head_parallel: u16,
-    },
     /// Qwen3-MoE attention side (layer-wise AFD attn pool). **One worker = one DP
     /// shard**: attention sharded over `attn_tp_size` head-parallel ranks, with its
     /// own KV cache and request stream. Data parallelism is the attn pool's
@@ -652,7 +1798,15 @@ impl AttnArchSel {
     /// The model identity/dims this arch operates on (every variant carries it).
     pub fn model(&self) -> &ModelSpec {
         match self {
-            Self::Llama3AttnTp { model, .. } | Self::Qwen3AttnTp { model, .. } => model,
+            Self::Qwen3AttnTp { model, .. } => model,
+        }
+    }
+
+    /// The longest request this attention side serves; see
+    /// [`IterArchSel::max_model_len`]. The FFN side holds no context.
+    pub fn max_model_len(&self) -> anyhow::Result<u32> {
+        match self {
+            Self::Qwen3AttnTp { model, .. } => model.max_position_embeddings(),
         }
     }
 }
@@ -660,16 +1814,6 @@ impl AttnArchSel {
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FfnArchSel {
-    DeepseekFfnMoe {
-        #[serde(flatten)]
-        model: ModelSpec,
-        /// Tensor parallelism size.
-        #[param(default = 2, cache_key)]
-        tp_size: u16,
-        /// Expert parallelism size.
-        #[param(default = 8, cache_key)]
-        ep_size: u16,
-    },
     /// BF16/native Qwen3-MoE FFN side (layer-wise AFD ffn pool): qkv / o_proj (on the attn-TP
     /// layout) + post_norm + router + EP MoE, plus the iteration embed / final_norm
     /// / lm_head. Mirrors the FFN-side cost of the unified `qwen3_moe_dp_attn_ep_ffn`;
@@ -694,10 +1838,11 @@ pub enum FfnArchSel {
         /// Expert routing distribution: `uniform` (default) or `random` (seeded by
         /// `routing_seed`). Drives the L2 MoE dispatch/combine simulation.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS, cache_key)]
         routing: RoutingKind,
         /// Seed for `routing = random` (ignored for `uniform`).
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
     },
     /// Native FP8 Qwen3-MoE FFN side. This is a separate provider because its
@@ -713,9 +1858,10 @@ pub enum FfnArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
     },
 }
@@ -724,9 +1870,27 @@ impl FfnArchSel {
     /// The model identity/dims this arch operates on (every variant carries it).
     pub fn model(&self) -> &ModelSpec {
         match self {
-            Self::DeepseekFfnMoe { model, .. }
-            | Self::Qwen3FfnMoe { model, .. }
-            | Self::Qwen3Fp8FfnMoe { model, .. } => model,
+            Self::Qwen3FfnMoe { model, .. } | Self::Qwen3Fp8FfnMoe { model, .. } => model,
         }
+    }
+}
+
+#[cfg(test)]
+mod layerwise_tests {
+    use super::*;
+
+    #[test]
+    fn unimplemented_layerwise_placeholders_are_not_published_or_accepted() {
+        assert!(!AttnArchSel::SCHEMA
+            .iter()
+            .any(|(tag, _)| *tag == "llama3_attn_tp"));
+        assert!(!FfnArchSel::SCHEMA
+            .iter()
+            .any(|(tag, _)| *tag == "deepseek_ffn_moe"));
+
+        let llama = r#"{"type":"llama3_attn_tp","model_config":"m.json","fp8":false,"tp_size":2,"head_parallel":1}"#;
+        let deepseek = r#"{"type":"deepseek_ffn_moe","model_config":"m.json","fp8":false,"tp_size":2,"ep_size":8}"#;
+        assert!(serde_json::from_str::<AttnArchSel>(llama).is_err());
+        assert!(serde_json::from_str::<FfnArchSel>(deepseek).is_err());
     }
 }

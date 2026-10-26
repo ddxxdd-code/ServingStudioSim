@@ -16,7 +16,6 @@ workload:
     - trace/smoke.csv
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
   run_to_end: true
 
 io:
@@ -31,6 +30,7 @@ pools:
         arch:
           type: qwen36_local
           model_config: model/config/qwen3_6_35b_a3b_fp8.json
+          fp8: true
         worker:
           type: barebone
           attn_gpu_memory_gb: 40.0

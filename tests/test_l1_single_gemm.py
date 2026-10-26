@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import profiling.exec.env as exec_env
+import profiling.exec.local as local_exec
 from profiling import perf_api
 from profiling.db import (
     SCHEMA_HASH,
@@ -129,8 +131,47 @@ def test_deepgemm_backend_registered_sharing_table_and_args():
     assert spec.runner_ref.function_name == "profile_single_gemm"
 
 
-def test_single_gemm_known_backends_include_both_torch_layouts_and_deepgemm():
-    assert set(known_backends("single_gemm")) == {"torch", "torch_linear", "deepgemm"}
+def test_single_gemm_known_backends_include_framework_dispatches():
+    assert set(known_backends("single_gemm")) == {
+        "torch",
+        "torch_linear",
+        "torch_linear_vllm",
+        "sglang_bf16_auto",
+        "sglang_fused_a_auto",
+        "deepgemm",
+        "flashinfer_fp8_tensor",
+        "flashinfer_cutedsl",
+        "flashinfer_mxfp8",
+    }
+
+
+def test_flashinfer_cutedsl_backend_is_nvfp4_sm10x_in_vllm_env():
+    # Guards the device/dtype contract the worker enforces before loading the
+    # runner: a bf16 config or a Hopper card must never route to the FP4 GEMM.
+    spec = find_kernel_profiler_spec("single_gemm", "flashinfer_cutedsl")
+    assert spec.table_name == "single_gemm"
+    assert spec.args_schema is SingleGemmArgs
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.supports.compute == frozenset({DType.NVFP4_E2M1})
+    assert spec.supports.sm_targets == frozenset({"sm_100f"})
+    assert spec.runner_ref.module_name == "profiling.runners.gemm.flashinfer_fp4"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"m": 8, "n": 64, "k": 64, "dtype": "bf16"}, "NVFP4-only"),
+        ({"m": 8, "n": 64, "k": 40, "dtype": "nvfp4_e2m1"}, "divisible by 16"),
+        ({"m": 0, "n": 64, "k": 64, "dtype": "nvfp4_e2m1"}, "positive"),
+    ],
+)
+def test_flashinfer_cutedsl_runner_rejects_specs_vllm_cannot_quantize(kwargs, message):
+    # Rejected before any torch/vLLM import, so a bad spec fails loudly instead
+    # of being timed as some other GEMM.
+    from profiling.runners.gemm.flashinfer_fp4 import profile_single_gemm
+
+    with pytest.raises(ValueError, match=message):
+        profile_single_gemm(**kwargs)
 
 
 def test_torch_linear_backend_registered_sharing_table_and_args():
@@ -140,6 +181,17 @@ def test_torch_linear_backend_registered_sharing_table_and_args():
     assert spec.metric_family is MetricFamily.COMPUTE
     assert spec.runner_ref.module_name == "profiling.runners.gemm.torch"
     assert spec.runner_ref.function_name == "profile_single_gemm_linear"
+
+
+def test_vllm_torch_linear_backend_registered_sharing_table_and_args():
+    spec = find_kernel_profiler_spec("single_gemm", "torch_linear_vllm")
+    assert spec.table_name == "single_gemm"
+    assert spec.args_schema is SingleGemmArgs
+    assert spec.metric_family is MetricFamily.COMPUTE
+    assert spec.runner_ref.module_name == "profiling.runners.gemm.torch"
+    assert spec.runner_ref.function_name == "profile_single_gemm_linear"
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.supports.compute == frozenset({DType.BF16})
 
 
 def test_dtype_from_value_accepts_runner_aliases():
@@ -217,6 +269,8 @@ def test_energy_perf_uses_total_energy_counter(monkeypatch: pytest.MonkeyPatch):
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
 
     class FakeCuda:
@@ -287,6 +341,8 @@ def test_energy_perf_resolves_remapped_cuda_device_by_uuid(
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
 
@@ -367,6 +423,8 @@ def test_energy_perf_does_not_guess_nvml_index_when_uuid_is_unavailable(
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
 
@@ -406,6 +464,8 @@ def test_energy_perf_uses_passed_timing_for_iteration_count(
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
 
     class FakeCuda:
@@ -485,6 +545,8 @@ def test_energy_window_restarts_cleanly_when_planned_iters_are_short(
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
 
     perf_counter_values = iter([0.0, 0.4, 10.0, 11.1])
@@ -566,6 +628,8 @@ def test_energy_perf_falls_back_to_power_polling(monkeypatch: pytest.MonkeyPatch
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
 
     class FakeCuda:
@@ -745,10 +809,17 @@ def test_torch_linear_single_gemm_uses_model_weight_layout(
     monkeypatch.setitem(sys.modules, "torch", torch_module)
     monkeypatch.setitem(sys.modules, "torch.nn", nn_module)
     monkeypatch.setitem(sys.modules, "torch.nn.functional", functional)
+    captured_timer_kwargs = {}
     monkeypatch.setattr(
         torch_gemm_runner.Timer,
         "cupti",
-        staticmethod(lambda fn, **kwargs: (fn(), 2.0)[1]),
+        staticmethod(
+            lambda fn, **kwargs: (
+                fn(),
+                captured_timer_kwargs.update(kwargs),
+                2.0,
+            )[2]
+        ),
     )
     monkeypatch.setattr(
         torch_gemm_runner.Energy,
@@ -761,6 +832,7 @@ def test_torch_linear_single_gemm_uses_model_weight_layout(
     assert captured_shapes == [((2, 4), (3, 4)), ((2, 4), (3, 4))]
     assert metrics.time_ms == 2.0
     assert metrics.energy_j == 0.2
+    assert captured_timer_kwargs == {"interval_union": True}
 
 
 def test_single_gemm_perf_api_query_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1345,6 +1417,58 @@ def test_local_chunk_rejects_mixed_backends_before_subprocess(monkeypatch: pytes
         )
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_local_chunk_puts_the_energy_policy_in_the_worker_payload(
+    enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The payload is the channel, on every worker path.
+
+    ``Energy.perf`` is read 96 runner call sites down, so the policy has to be
+    process state by the time a runner loads; the payload is how that state gets
+    into the worker's process rather than being inferred from an environment the
+    controller hoped it inherited.
+    """
+
+    from profiling.profilers import energy as energy_mod
+
+    # The host path; the container path is test_profile_container's.
+    monkeypatch.setenv("VIBESIM_PROFILE_RUNTIME", "host")
+    energy_mod.set_energy_enabled(enabled)
+    seen: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        del cmd
+        input_path = next(
+            Path(argument) for argument in _last_command if argument.endswith("input.json")
+        )
+        seen["payload"] = json.loads(input_path.read_text(encoding="utf-8"))
+        raise _StopWorker
+
+    _last_command: list[str] = []
+    real_host_command = local_exec._host_worker_command
+
+    def capture_host_command(*args, **kwargs):
+        cmd, env = real_host_command(*args, **kwargs)
+        _last_command[:] = cmd
+        return cmd, env
+
+    monkeypatch.setattr(local_exec, "_host_worker_command", capture_host_command)
+    monkeypatch.setattr(local_exec.subprocess, "run", fake_run)
+
+    with pytest.raises(_StopWorker):
+        LocalGpuChunk([0]).run(
+            "single_gemm",
+            [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"}],
+        )
+
+    assert seen["payload"]["energy"] is enabled
+
+
+class _StopWorker(Exception):
+    """Ends the chunk once the payload has been read; no GPU is involved."""
+
+
 def test_local_chunk_uses_selected_external_python_and_project_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1400,8 +1524,11 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
     )
     monkeypatch.setattr("profiling.exec.local.resolve_profile_env", fake_resolve_profile_env)
     monkeypatch.setattr("profiling.exec.local.subprocess.run", fake_subprocess_run)
-    existing_pythonpath = os.pathsep.join(["/existing/first", "/existing/second"])
-    monkeypatch.setenv("PYTHONPATH", existing_pythonpath)
+    # The launcher's PyO3 child points these at the project venv; an env with
+    # its own interpreter must not import the project's Torch through them.
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["/project/site-packages", "/existing"]))
+    monkeypatch.setenv("PYTHONHOME", "/project/python-home")
+    monkeypatch.setenv("VIRTUAL_ENV", "/project/.venv")
     monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
 
     results = LocalGpuChunk([2]).run(
@@ -1422,13 +1549,21 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
             str(Path(__file__).parents[1]),
             str(first_import_root),
             str(second_import_root),
-            existing_pythonpath,
         ]
     )
-    assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join(
-        [str(library_root), "/existing/lib"]
-    )
+    assert "PYTHONHOME" not in captured_env
+    assert "VIRTUAL_ENV" not in captured_env
+    assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join([str(library_root), "/existing/lib"])
     assert isinstance(results[0].metrics, ComputeMetrics)
+
+
+def test_project_interpreter_worker_keeps_the_inherited_pythonpath(monkeypatch):
+    from profiling.exec.env import _default_python, set_worker_python_env
+
+    env = {"PYTHONPATH": "/existing", "PYTHONHOME": "/home"}
+    set_worker_python_env(ProfileEnv("default_env", _default_python()), env)
+    assert env["PYTHONPATH"] == os.pathsep.join([str(Path(__file__).parents[1]), "/existing"])
+    assert env["PYTHONHOME"] == "/home"
 
 
 def test_run_profile_batch_rejects_invalid_gpu_count():
@@ -1443,9 +1578,11 @@ def test_run_profile_batch_rejects_invalid_gpu_count():
 
 def test_documented_profile_env_registry_complete():
     expected_envs = {
+        "causal_conv1d_env",
         "default_env",
         "flashinfer_pip_env",
-        "flashinfer_local",
+        "flashinfer_kda_env",
+        "sglang_env",
         "vllm_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
@@ -1453,27 +1590,17 @@ def test_documented_profile_env_registry_complete():
         ENV_REGISTRY["flashinfer_pip_env"].python_executable
         == ENV_REGISTRY["default_env"].python_executable
     )
+    # The causal-conv1d wheel is ABI-matched to the project Torch, so its env
+    # must run the project interpreter, not a venv with another Torch.
+    assert (
+        ENV_REGISTRY["causal_conv1d_env"].python_executable
+        == ENV_REGISTRY["default_env"].python_executable
+    )
+    # vllm_env on the host is the fork's .venv, resolving Torch's CUDA runtime
+    # from that venv first.
     vllm_env = ENV_REGISTRY["vllm_env"]
-    assert vllm_env.python_executable == ENV_REGISTRY["default_env"].python_executable
-    worker_python_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    vllm_site_packages = (
-        Path(__file__).parents[1]
-        / "alignment"
-        / "profiler"
-        / "vllm"
-        / ".venv"
-        / "lib"
-        / worker_python_dir
-        / "site-packages"
-    )
-    assert vllm_env.additional_python_paths == (
-        vllm_site_packages,
-        Path(__file__).parents[1] / "alignment" / "profiler" / "vllm",
-    )
-    assert vllm_env.additional_library_paths == (
-        vllm_site_packages / "torch" / "lib",
-    )
-    vllm_env.validate()
+    assert vllm_env.additional_library_paths[0].parts[-2:] == ("torch", "lib")
+    assert vllm_env.python_executable.parents[2] in vllm_env.additional_python_paths
 
 
 def test_comm_launcher_interfaces_exist():

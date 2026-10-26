@@ -11,14 +11,17 @@ the accumulated specs.
 from __future__ import annotations
 
 import importlib
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import BackendDoc
 from profiling.db.kind import KernelKind
 from profiling.db.outlier import BatchOutlierPolicy
+from profiling.gpu_catalog import gpu_compute_capability
 from profiling.runners.metrics import Metrics, RunnerResult
 
 ProfileFn = Callable[..., Metrics]
@@ -54,9 +57,25 @@ class RunnerRef:
         return runner
 
 
+# NVIDIA target names a kernel build is compiled for: ``sm_<major><minor>`` plus
+# ``a`` (arch-specific: that exact compute capability) or ``f`` (family: every
+# minor of that major, e.g. ``sm_100f`` = SM100 and SM103).
+_SM_TARGET = re.compile(r"sm_(\d+)(\d)([af])")
+
+
+def _sm_target_matches(target: str, capability: tuple[int, int]) -> bool:
+    match = _SM_TARGET.fullmatch(target)
+    if match is None:
+        raise ValueError(f"unknown sm target {target!r}; expected e.g. 'sm_90a' or 'sm_100f'")
+    major, minor, kind = int(match[1]), int(match[2]), match[3]
+    if kind == "a":
+        return capability == (major, minor)
+    return capability[0] == major
+
+
 @dataclass(frozen=True)
 class BackendSupport:
-    """Which dtypes / GPU a ``(kernel_kind, backend)`` can actually run.
+    """Which dtypes / devices a ``(kernel_kind, backend)`` can actually run.
 
     The single source of truth for backend-selection validation and the dry-run
     ``options`` column — NOT ``profile.db`` row presence. A cold cache has no
@@ -74,7 +93,23 @@ class BackendSupport:
       fp8-kv, which is a current production config. Only fp8 *compute* needs
       ``fa3``. Keeping ``compute`` and ``kv`` separate is what lets ``fa2`` stay
       valid for fp8-KV while ``cudnn`` (bf16-kv only) is correctly excluded.
-    - ``gpus`` — ``None`` = any GPU; a set restricts to those ``gpu_name`` values.
+
+    The device axis is the CUDA compute capability the kernel build genuinely
+    needs, never the GPUs it happens to be measured on: a missing profile row is
+    a data gap the profiler fills, not a reason to refuse a backend. Declare it
+    only with source evidence. The worker checks it against the real device
+    before it loads the runner, so a runner does not repeat it.
+
+    - ``min_compute_capability`` — the oldest ``(major, minor)`` that can run the
+      kernel at all, e.g. ``(8, 9)`` for a Triton FP8 e4m3 conversion.
+    - ``sm_targets`` — the arch-specific builds the kernel exists for, as NVIDIA
+      target names: ``sm_90a`` = exactly SM90, ``sm_100f`` = the SM10x family.
+      The device must match one of them.
+
+    A GPU name resolves to its compute capability through ``gpu/spec.json``
+    (``profiling.gpu_catalog``). A GPU the catalog does not know, or a call
+    without a GPU, skips the device check — the worker still checks the real
+    device when it profiles.
 
     The profile.db cache still keys on the full dtype tuple; this type only gates
     *which backends are legal*. Fine, per-request shape constraints (e.g. cudnn
@@ -84,7 +119,8 @@ class BackendSupport:
 
     compute: frozenset[DType] | None
     kv: frozenset[DType] | None = None
-    gpus: frozenset[str] | None = None
+    min_compute_capability: tuple[int, int] | None = None
+    sm_targets: frozenset[str] | None = None
 
     def allows(
         self,
@@ -96,9 +132,33 @@ class BackendSupport:
             return False
         if self.kv is not None and kv_dtype is not None and kv_dtype not in self.kv:
             return False
-        if self.gpus is not None and gpu is not None and gpu not in self.gpus:
+        if gpu is None:
+            return True
+        return self.allows_compute_capability(gpu_compute_capability(gpu))
+
+    def allows_compute_capability(self, capability: tuple[int, int] | None) -> bool:
+        """Whether a device of this compute capability can run the kernel;
+        ``None`` (unknown device) is not refused."""
+        if capability is None:
+            return True
+        if self.min_compute_capability is not None and capability < self.min_compute_capability:
+            return False
+        if self.sm_targets is not None and not any(
+            _sm_target_matches(target, capability) for target in self.sm_targets
+        ):
             return False
         return True
+
+    def device_rule(self) -> str | None:
+        """The device requirement in words (``"sm_90a or sm_100f"``), or ``None``
+        when the backend runs on any CUDA device."""
+        rules = []
+        if self.min_compute_capability is not None:
+            major, minor = self.min_compute_capability
+            rules.append(f"compute capability {major}.{minor}+")
+        if self.sm_targets is not None:
+            rules.append(" or ".join(sorted(self.sm_targets)))
+        return " and ".join(rules) or None
 
 
 # Permissive default for specs that do not declare a capability (test fixtures);
@@ -125,13 +185,30 @@ class KernelProfilerSpec:
     # spec. When False (the default) the single-spec runner is wrapped by
     # ``batched`` to satisfy the same contract.
     list_native: bool = False
+    # Environment variables the execution backend sets on this row's worker
+    # process, on top of the inherited environment. For measurement policy that
+    # must hold before the framework is imported and that a runner therefore
+    # cannot set itself -- e.g. ``TRITON_CACHE_AUTOTUNING=0``, so a Triton
+    # ``@autotune`` selection never leaks between worker processes through
+    # ``TRITON_CACHE_DIR``. Runners must not mutate ``os.environ`` for this.
+    worker_env: tuple[tuple[str, str], ...] = ()
+    # The runner allocates CUDA fabric memory (CU_MEM_HANDLE_TYPE_FABRIC), as
+    # FlashInfer's MNNVL workspace does, which needs an IMEX channel device. A
+    # container worker gets that device only when this is set (see
+    # profiling/exec/local.py); a host worker sees the host's /dev directly.
+    imex_channel: bool = False
+    # Optional lazy ``(**schema_kwargs) -> str | None`` called in the worker
+    # right after the chunk runs, once per successful spec. A returned note is
+    # appended to the row's ``backend_version`` so worker-process state that
+    # changes the number (e.g. the pinned autotune configs) is recorded with it.
+    row_provenance_ref: RunnerRef | None = None
+    # Reader-facing description of this backend for the Kernel Library. None
+    # until the kind is documented; see profiling/db/doc.py.
+    doc: BackendDoc | None = None
 
     @property
     def runner_module(self) -> str:
         return self.subprocess_module or self.runner_ref.module_name
-
-    def load_runner(self) -> ProfileFn:
-        return self.runner_ref.load(self.runner_module)
 
     def load_list_runner(self) -> ListRunnerFn:
         """Load the runner as a list runner: native if ``list_native``, else the
@@ -141,6 +218,9 @@ class KernelProfilerSpec:
 
         runner = self.runner_ref.load(self.runner_module)
         return runner if self.list_native else batched(runner)
+
+    def load_row_provenance(self) -> Callable[..., str | None] | None:
+        return None if self.row_provenance_ref is None else self.row_provenance_ref.load()
 
 
 @dataclass(frozen=True)
@@ -214,8 +294,7 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
         key = (profiler_spec.kernel_kind, profiler_spec.backend)
         if key in registered_keys:
             raise ValueError(
-                f"duplicate profiler spec for {profiler_spec.kernel_kind}:"
-                f"{profiler_spec.backend}"
+                f"duplicate profiler spec for {profiler_spec.kernel_kind}:{profiler_spec.backend}"
             )
         registered_keys.add(key)
 
@@ -228,6 +307,20 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
                     f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares an "
                     f"empty {axis} dtype set; use None for a {axis}-agnostic axis"
                 )
+        if supports.sm_targets is not None:
+            if not supports.sm_targets:
+                raise ValueError(
+                    f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares an "
+                    "empty sm_targets set; use None when any architecture runs it"
+                )
+            for target in supports.sm_targets:
+                if _SM_TARGET.fullmatch(target) is None:
+                    raise ValueError(
+                        f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares "
+                        f"unknown sm target {target!r}; expected e.g. 'sm_90a' or 'sm_100f'"
+                    )
+
+        _validate_worker_env(profiler_spec)
 
         expected_contract = table_contracts.get(profiler_spec.table_name)
         actual_contract = _TableContract(
@@ -243,6 +336,23 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
                 f"conflicting table contract for {profiler_spec.table_name}: "
                 f"{expected_contract} vs {actual_contract}"
             )
+
+
+# The execution backend composes these itself (GPU selection, the env's import
+# and library paths); a row overriding them would silently undo that.
+_BACKEND_OWNED_WORKER_ENV = frozenset({"CUDA_VISIBLE_DEVICES", "PYTHONPATH", "LD_LIBRARY_PATH"})
+
+
+def _validate_worker_env(profiler_spec: KernelProfilerSpec) -> None:
+    label = f"{profiler_spec.kernel_kind}:{profiler_spec.backend}"
+    names = [name for name, _value in profiler_spec.worker_env]
+    if len(set(names)) != len(names):
+        raise ValueError(f"{label} sets a worker_env variable twice: {names}")
+    for name, value in profiler_spec.worker_env:
+        if not name or not isinstance(value, str):
+            raise ValueError(f"{label} worker_env entries must be (name, str value) pairs")
+        if name in _BACKEND_OWNED_WORKER_ENV:
+            raise ValueError(f"{label} worker_env must not set {name}; the backend owns it")
 
 
 def iter_kernel_profiler_specs(
@@ -310,10 +420,6 @@ def find_kernel_profiler_spec(
         if profiler_spec.backend == backend:
             return profiler_spec
     raise KeyError(f"no profiler spec registered for {kernel_kind}:{backend}")
-
-
-def load_runner(kernel_kind: KernelKind, backend: str) -> ProfileFn:
-    return find_kernel_profiler_spec(kernel_kind, backend).load_runner()
 
 
 def find_table(kernel_kind: KernelKind, backend: str) -> str:

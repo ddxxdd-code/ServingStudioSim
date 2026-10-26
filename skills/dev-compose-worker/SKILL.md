@@ -1,15 +1,15 @@
 ---
 name: dev-compose-worker
-description: "Use when planning or estimating a new VibeSim worker combination, or when implementing, composing, reviewing, renaming, moving, or tidying production L5 worker code under `simulator/src/worker/`: KV stores and capability traits, admission lifecycle/selection policies, execution adapters, cadence shells, family directories, `build_*_worker` recipes, and L6 wiring. Enforces the canonical four-axis ownership, share-vs-new and difficulty analysis, pending-membership rule, shell discriminator, construction/file boundaries, complete changed-file coverage, and behavior-preserving validation. Not for L4 kernel/cost-model implementation or an unrelated general file review."
+description: "Use when planning or estimating a new ServingStudio Sim worker combination, or when implementing, composing, reviewing, renaming, moving, or tidying production L5 worker code under `simulator/src/worker/`: KV stores and capability traits, admission lifecycle/selection policies, execution adapters, cadence shells, family directories, `build_*_worker` recipes, and L6 wiring. Enforces the canonical four-axis ownership, share-vs-new and difficulty analysis, pending-membership rule, shell discriminator, construction/file boundaries, complete changed-file coverage, and behavior-preserving validation. Not for L4 kernel/cost-model implementation or an unrelated general file review."
 ---
 
 # Compose Worker
 
 Apply these rules to production L5 worker changes. Treat
 `doc/detailed_design/L5.md` as the canonical design and
-`simulator/src/worker/README.md` as the production tree guide. Old reference or
-sketch code may explain behavior only when the canonical design and production
-code leave a detail unclear; it never overrides them.
+`simulator/src/worker/README.md` as the production tree guide. Git history may
+explain behavior only when the canonical design and production code leave a
+detail unclear; it never overrides them.
 
 This skill specializes `dev-file-design-review` for L5. Use the stricter rule
 when the two overlap.
@@ -80,7 +80,7 @@ Produce this share-vs-new table:
 | Part | Reuse by default | Write only when |
 |---|---|---|
 | Shell | nearest cadence family | the shell discriminator above fires |
-| KV | `FullAttnKv` plus existing capabilities | resource lifecycle or required observation is absent |
+| KV | `KvCacheStore` plus existing capabilities; a new kind of cached state is a `KvCachePart` in the arch's layout, not a new store | resource lifecycle or required observation is absent |
 | Lifecycle | nearest family lifecycle | required state transitions cannot be expressed by one existing lifecycle |
 | Policy | existing `PendingOrderPolicy` | ordering needs new frozen facts or a new algorithm |
 | Execution | matching production adapter | input lowering or cost evaluation needs new facts/shape |
@@ -136,6 +136,10 @@ Keep these invariants:
 - one request stays on one KV partition for its KV lifetime;
 - an AFD cadence slot is not a KV partition;
 - the KV implementation is the only strict capacity/accounting source;
+- charges come from the resolved `KvAccounting` in KV units; the store never
+  reads layout parts, and `current_kv` stays context tokens for the L4 input;
+- live checkpoints and retained prefixes are the soft tier: evictable, never in
+  `fits` or `kv_usage`;
 - input builders consume borrowed visitors/slices instead of cloning live
   membership;
 - `KvStore` never constructs an L4 input.
@@ -173,6 +177,13 @@ For future chunked prefill, keep fresh requests in the policy and at most one
 partially processed `active_chunk` per partition in lifecycle state. Never pop
 and push an active chunk through the policy: that rotates order and changes the
 scheduling semantics.
+
+Do not turn alignment observations into worker policy. A trace may supply
+request lengths and arrivals, but observed DP rank, equal-shaped adjacency, or
+profiler-created chunks are realized outcomes, not admission constraints.
+Implement generic chunk lifecycle over the original request stream; keep any
+observed-placement replay as an explicitly conditioned experiment outside the
+predictive worker.
 
 ### Execution
 

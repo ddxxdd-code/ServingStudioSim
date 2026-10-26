@@ -1,5 +1,5 @@
 //! Derive the launcher `ParamDef` schema directly from the config types, so a
-//! field and its schema entry cannot drift (new-interface-design §11).
+//! field and its schema entry cannot drift (L7 design).
 //!
 //! Two derives, both emitting an inherent `const` that `schema::dump::list_params`
 //! aggregates:
@@ -29,7 +29,7 @@
 //! also carries `#[serde(default)]` — in that case (and for any other type
 //! tagged `#[serde(default)]`) the param is marked `.optional()`, matching
 //! serde's "absent = Default::default()" semantics (e.g. `Vec<f32>` defaults to
-//! the empty list).
+//! the empty list). A `Vec<[int; 2]>` is an `int_pair_list`.
 
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
@@ -232,6 +232,21 @@ fn classify(ty: &Type) -> syn::Result<Classified> {
         return Ok(c);
     }
     if let Some(inner) = generic_inner(ty, "Vec") {
+        // `Vec<[int; 2]>`: a list of pairs.
+        if let Type::Array(pair) = inner {
+            if is_len_two(&pair.len) && matches!(scalar_kind(&pair.elem), Ok(Scalar::Int)) {
+                return Ok(Classified {
+                    ctor: "int_pair_list",
+                    default_method: "",
+                    optional: false,
+                    is_bool: false,
+                });
+            }
+            return Err(syn::Error::new(
+                ty.span(),
+                "param: the only array element a list takes is `[int; 2]`",
+            ));
+        }
         return Ok(Classified {
             ctor: list_ctor(scalar_kind(inner)?, inner)?,
             default_method: "",
@@ -253,7 +268,8 @@ fn classify_scalar(ty: &Type) -> syn::Result<Classified> {
 }
 
 fn scalar_kind(ty: &Type) -> syn::Result<Scalar> {
-    let ident = last_ident(ty).ok_or_else(|| syn::Error::new(ty.span(), "param: unsupported field type"))?;
+    let ident = last_ident(ty)
+        .ok_or_else(|| syn::Error::new(ty.span(), "param: unsupported field type"))?;
     match ident.as_str() {
         "f32" | "f64" => Ok(Scalar::Float),
         "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128"
@@ -299,6 +315,10 @@ fn list_ctor(s: Scalar, ty: &Type) -> syn::Result<&'static str> {
             "param: no bool_list ParamType (Vec<bool> unsupported)",
         )),
     }
+}
+
+fn is_len_two(len: &Expr) -> bool {
+    matches!(len, Expr::Lit(ExprLit { lit: Lit::Int(n), .. }) if n.base10_digits() == "2")
 }
 
 fn last_ident(ty: &Type) -> Option<String> {
@@ -373,7 +393,10 @@ fn parse_param_attr(attrs: &[Attribute]) -> syn::Result<ParamAttr> {
                     if let Expr::Lit(ExprLit { lit, .. }) = nv.value {
                         out.default = Some(lit);
                     } else {
-                        return Err(syn::Error::new(nv.value.span(), "param: default must be a literal"));
+                        return Err(syn::Error::new(
+                            nv.value.span(),
+                            "param: default must be a literal",
+                        ));
                     }
                 }
                 Meta::NameValue(nv) if nv.path.is_ident("choices") => out.choices = Some(nv.value),
@@ -420,5 +443,7 @@ fn combine(errors: Vec<syn::Error>) -> Option<syn::Error> {
 }
 
 fn err(tokens: &impl ToTokens, msg: &str) -> TokenStream {
-    syn::Error::new_spanned(tokens, msg).to_compile_error().into()
+    syn::Error::new_spanned(tokens, msg)
+        .to_compile_error()
+        .into()
 }

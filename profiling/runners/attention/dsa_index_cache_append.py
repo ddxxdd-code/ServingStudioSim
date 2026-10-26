@@ -12,15 +12,23 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_INDEX_DIM = 128
-_BLOCK_SIZE = 64
-_QUANT_BLOCK_SIZE = 128
+# vLLM indexer_k_quant_and_cache_kernel reduces each scale's amax across one
+# 32-lane warp of 4-element vectors (csrc/libtorch_stable/cache_kernels.cu:620,
+# 640), so its quantization group is 128 elements whatever the argument says.
+_VLLM_QUANT_BLOCK_SIZE = 128
+# SGLang FusedKIndexerNormRopeStoreKernel fixes kHeadDim=128 (one 128-element
+# scale group) and requires a power-of-two page (jit/csrc/deepseek_v32/indexer_k.cuh).
+_SGLANG_INDEX_DIM = 128
 _INPUT_DTYPE = DType.BF16
 _CACHE_DTYPE = DType.FP8_E4M3
 _SCALE_FORMAT = "ue8m0"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
-_REQUIRED_GPU = "NVIDIA H200"
 _VLLM_KERNEL_NAME = "indexer_k_quant_and_cache_kernel"
+_SGLANG_SCALE_FORMAT = "fp32"
+_SGLANG_ROPE_DIM = 64
+_SGLANG_ROPE_TABLE_ROWS = 131_072
+_INDEX_HEADS = 32
+_LAYERNORM_EPS = 1e-6
 _FP8_E4M3_MAX = 448.0
 _AMAX_FLOOR = 1e-4
 
@@ -45,6 +53,9 @@ def _validate_args(
     cache_dtype: DType | str,
     scale_format: str,
     cache_format: str,
+    *,
+    expected_scale_format: str = _SCALE_FORMAT,
+    backend: str = "torch",
 ) -> tuple[int, int, int, int, DType, DType, str, str]:
     num_tokens = int(num_tokens)
     index_dim = int(index_dim)
@@ -60,14 +71,25 @@ def _validate_args(
             "num_tokens, index_dim, block_size, and quant_block_size must be > 0, "
             f"got {num_tokens}, {index_dim}, {block_size}, and {quant_block_size}"
         )
-    if (index_dim, block_size, quant_block_size) != (
-        _INDEX_DIM,
-        _BLOCK_SIZE,
-        _QUANT_BLOCK_SIZE,
+    # The page-planar layout needs whole scale groups per key.
+    if index_dim % quant_block_size:
+        raise ValueError(
+            "dsa_index_cache_append requires index_dim to be a multiple of "
+            f"quant_block_size, got {index_dim} and {quant_block_size}"
+        )
+    if backend == "vllm_cuda" and quant_block_size != _VLLM_QUANT_BLOCK_SIZE:
+        raise ValueError(
+            "dsa_index_cache_append vllm_cuda requires quant_block_size=128 "
+            f"(one warp-reduced scale group), got {quant_block_size}"
+        )
+    if backend == "sglang" and (
+        index_dim != _SGLANG_INDEX_DIM
+        or quant_block_size != _SGLANG_INDEX_DIM
+        or block_size & (block_size - 1)
     ):
         raise ValueError(
-            "torch dsa_index_cache_append requires "
-            "(index_dim, block_size, quant_block_size) == (128, 64, 128), "
+            "dsa_index_cache_append sglang requires index_dim=quant_block_size=128 "
+            "and a power-of-two block_size, "
             f"got ({index_dim}, {block_size}, {quant_block_size})"
         )
     if input_dtype is not _INPUT_DTYPE or cache_dtype is not _CACHE_DTYPE:
@@ -76,9 +98,10 @@ def _validate_args(
             "input_dtype=bf16 and cache_dtype=fp8_e4m3, "
             f"got {input_dtype.value} and {cache_dtype.value}"
         )
-    if scale_format != _SCALE_FORMAT:
+    if scale_format != expected_scale_format:
         raise ValueError(
-            f"torch dsa_index_cache_append requires scale_format='ue8m0', got {scale_format!r}"
+            f"dsa_index_cache_append requires scale_format={expected_scale_format!r}, "
+            f"got {scale_format!r}"
         )
     if cache_format != _CACHE_FORMAT:
         raise ValueError(
@@ -96,30 +119,6 @@ def _validate_args(
         scale_format,
         cache_format,
     )
-
-
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the torch dsa_index_cache_append backend"
-        )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            f"torch dsa_index_cache_append is verified only on {_REQUIRED_GPU}, got {gpu_name}"
-        )
-
-
-def _validate_vllm_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the dsa_index_cache_append vllm_cuda backend"
-        )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            f"dsa_index_cache_append vllm_cuda is verified only on {_REQUIRED_GPU}, got {gpu_name}"
-        )
 
 
 def _build_operands(
@@ -271,8 +270,6 @@ def profile_dsa_index_cache_append_torch(
             "torch is required for the torch dsa_index_cache_append backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -317,6 +314,126 @@ def profile_dsa_index_cache_append_torch(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
+def profile_dsa_index_cache_append_sglang_fused_norm_rope_store(
+    num_tokens: int,
+    index_dim: int,
+    block_size: int,
+    quant_block_size: int,
+    input_dtype: DType | str,
+    cache_dtype: DType | str,
+    scale_format: str,
+    cache_format: str,
+) -> ComputeMetrics:
+    """Profile SGLang's fused key layernorm, RoPE, quantize, and paged store."""
+    (
+        num_tokens,
+        index_dim,
+        block_size,
+        quant_block_size,
+        input_dtype,
+        cache_dtype,
+        _scale_format,
+        _cache_format,
+    ) = _validate_args(
+        num_tokens,
+        index_dim,
+        block_size,
+        quant_block_size,
+        input_dtype,
+        cache_dtype,
+        scale_format,
+        cache_format,
+        expected_scale_format=_SGLANG_SCALE_FORMAT,
+        backend="sglang",
+    )
+    try:
+        import torch
+        from sglang.kernels.ops.quantization.dsv32 import fused_k_indexer_norm_rope_store
+    except (ImportError, OSError) as exc:
+        raise ProfilerNotImplemented(
+            "dsa_index_cache_append:sglang_fused_norm_rope_store requires the SGLang environment"
+        ) from exc
+
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        generator = torch.Generator(device=device).manual_seed(42)
+        num_groups = index_dim // quant_block_size
+        cache_width = index_dim + num_groups * 4
+        num_blocks = max(256, math.ceil(num_tokens / block_size) + 1)
+        key_and_weight = torch.randn(
+            (num_tokens, index_dim + _INDEX_HEADS),
+            dtype=input_dtype.torch(),
+            device=device,
+            generator=generator,
+        )
+        cache = torch.full(
+            (num_blocks, cache_width * block_size),
+            0xA5,
+            dtype=torch.uint8,
+            device=device,
+        )
+        out_cache_loc = torch.randperm(
+            num_blocks * block_size,
+            device=device,
+            generator=generator,
+        )[:num_tokens].to(torch.int64)
+        weight = torch.randn((index_dim,), dtype=torch.float32, device=device, generator=generator)
+        bias = torch.randn((index_dim,), dtype=torch.float32, device=device, generator=generator)
+        cos_sin_cache = torch.randn(
+            (_SGLANG_ROPE_TABLE_ROWS, _SGLANG_ROPE_DIM),
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        positions = torch.randint(
+            0,
+            _SGLANG_ROPE_TABLE_ROWS,
+            (num_tokens,),
+            dtype=torch.int64,
+            device=device,
+            generator=generator,
+        )
+        key = key_and_weight[:, :index_dim]
+
+        def kernel() -> None:
+            fused_k_indexer_norm_rope_store(
+                key,
+                cache,
+                out_cache_loc,
+                weight,
+                bias,
+                _LAYERNORM_EPS,
+                cos_sin_cache,
+                positions,
+                block_size,
+            )
+
+        kernel()
+        torch.cuda.synchronize()
+        time_ms = Timer.cupti(kernel, warmup=5)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+    logical_bytes = (
+        _logical_bytes(
+            num_tokens=num_tokens,
+            index_dim=index_dim,
+            quant_block_size=quant_block_size,
+            input_dtype=input_dtype,
+            cache_dtype=cache_dtype,
+        )
+        + num_tokens * _SGLANG_ROPE_DIM * 4
+    )
+    bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        tflops=0.0,
+        memory_bandwidth_gbps=float(bandwidth_gbps),
+        energy_j=float(energy_j),
+    )
+
+
 def profile_dsa_index_cache_append_vllm_cuda(
     num_tokens: int,
     index_dim: int,
@@ -346,6 +463,7 @@ def profile_dsa_index_cache_append_vllm_cuda(
         cache_dtype,
         scale_format,
         cache_format,
+        backend="vllm_cuda",
     )
     try:
         import torch
@@ -355,8 +473,6 @@ def profile_dsa_index_cache_append_vllm_cuda(
             "the instrumented vLLM environment is required for "
             "the dsa_index_cache_append vllm_cuda backend"
         ) from exc
-
-    _validate_vllm_cuda_device(torch)
 
     try:
         operands = _build_operands(

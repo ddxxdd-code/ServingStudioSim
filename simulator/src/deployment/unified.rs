@@ -3,15 +3,24 @@
 //!
 //! `build` reads the structured `UnifiedConfig`: a single pool (`main`) with one
 //! homogeneous group. The arch is selected by its explicit tag (NO `tp_size`
-//! dispatch — provider-first, new-interface-design §4). Wired arms are
+//! dispatch; see the L4/L6 design). Wired arms are
 //! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
-//! `hp_unified`, and `glm52_dsa_moe` + `hp_unified`. GLM's TP1 local attention
-//! uses one independent KV/input partition per EP rank; the existing HP shell
-//! and mutable request/KV lifecycle are unchanged. Each wired arm
+//! `hp_unified`, `glm52_vllm_dsa_moe` + `hp_unified`, and
+//! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`,
+//! `glm52_vllm_nvfp4_dsa_moe_speculative` + `speculative`, and
+//! `glm52_sglang_nvfp4_tp_dsa_moe` + `chunked_prefill`, and `deepseek_v4_vllm`
+//! / `deepseek_v41_vllm` + either `hp_unified` or `chunked_prefill`. GLM's TP1 local
+//! attention uses one independent KV/input partition per EP rank; the worker
+//! shells and mutable request/KV lifecycle are unchanged. Each wired arm
 //! monomorphizes its concrete model/worker pair and
 //! erases to `Box<dyn Flow>` — the single `dyn` point (the cost path is
 //! `dyn`-free, L4 §4.1).
+//!
+//! The speculative pair is the one arm whose model does not implement
+//! `IterwiseUnifiedModel` at all — it implements `SpeculativeUnifiedModel`
+//! instead — which is why neither `assemble_flow` nor `UnifiedWorkerFactory`
+//! names an L4 contract on `M`. The recipe each arm passes already does.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +29,7 @@ use anyhow::{bail, ensure};
 
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::arch::IterArchSel;
+use crate::arch::{Glm52MtpMode, IterArchSel};
 use crate::common::{PoolId, SharedRequests};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
@@ -30,8 +39,9 @@ use crate::orchestrator::{
 };
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    build_barebone_worker, build_hp_worker, build_qwen36_hybrid_worker,
-    resolve_prefix_cache_config, IterWorker, IterWorkerSel, WorkerConfig,
+    build_barebone_worker, build_chunked_prefill_worker, build_hp_worker, build_speculative_worker,
+    resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorker, IterWorkerSel,
+    KvAdmissionConfig, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -80,7 +90,6 @@ impl Deployment for UnifiedDeployment {
         // L5 worker env: `attn_kv_bytes` sizes the worker's KV partitions, and
         // `log_output_token_times` controls request_slo detail logging. The
         // worker *type* is matched against the arch in the arms below.
-        // chunked_prefill is not wired yet.
         let (
             attn_gpu_memory_gb,
             gpu_time_multiplier,
@@ -89,6 +98,8 @@ impl Deployment for UnifiedDeployment {
             prefix_cache_mode,
             prefix_cache_policy,
             prefix_cache_max_gpu_memory_gb,
+            batch_policy,
+            kv_admission,
         ) = match &g.worker {
             IterWorkerSel::Barebone {
                 attn_gpu_memory_gb,
@@ -98,8 +109,8 @@ impl Deployment for UnifiedDeployment {
                 prefix_cache_mode,
                 prefix_cache_policy,
                 prefix_cache_max_gpu_memory_gb,
-                // Hybrid-only; read separately so the two arms keep the same
-                // bindings. See `ssm_checkpoint_interval_tokens` below.
+                // Read by `prefill_gpu_time_multiplier` below, so the two arms
+                // keep the same bindings.
                 ..
             }
             | IterWorkerSel::RemoteCacheUnified {
@@ -120,6 +131,7 @@ impl Deployment for UnifiedDeployment {
                 prefix_cache_mode,
                 prefix_cache_policy,
                 prefix_cache_max_gpu_memory_gb,
+                ..
             } => (
                 *attn_gpu_memory_gb,
                 *gpu_time_multiplier,
@@ -128,15 +140,56 @@ impl Deployment for UnifiedDeployment {
                 *prefix_cache_mode,
                 *prefix_cache_policy,
                 *prefix_cache_max_gpu_memory_gb,
+                BatchPolicy::Mix,
+                KvAdmissionConfig::FullFootprint,
             ),
-            IterWorkerSel::ChunkedPrefill { .. } => {
-                bail!("unified: chunked_prefill worker not wired yet")
-            }
+            IterWorkerSel::ChunkedPrefill {
+                attn_gpu_memory_gb,
+                max_batch_tokens,
+                batch_policy,
+                kv_admission,
+                gpu_time_multiplier,
+                // Read by `prefill_gpu_time_multiplier` below.
+                ..
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                Some(*max_batch_tokens),
+                PendingOrderKind::Fifo,
+                PrefixCacheMode::Opportunistic,
+                PrefixCachePolicy::Lru,
+                None,
+                *batch_policy,
+                kv_admission.resolve()?,
+            ),
+            IterWorkerSel::Speculative {
+                attn_gpu_memory_gb,
+                max_batch_tokens,
+                batch_policy,
+                kv_admission,
+                gpu_time_multiplier,
+                // Read by the two helpers below so this arm keeps the same
+                // bindings as its siblings.
+                ..
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                Some(*max_batch_tokens),
+                PendingOrderKind::Fifo,
+                PrefixCacheMode::Opportunistic,
+                PrefixCachePolicy::Lru,
+                None,
+                *batch_policy,
+                kv_admission.resolve()?,
+            ),
             IterWorkerSel::PdPrefill { .. }
             | IterWorkerSel::PdDecode { .. }
             | IterWorkerSel::RemoteCachePdPrefill { .. }
             | IterWorkerSel::RemoteCachePdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
+            }
+            IterWorkerSel::PipelineChunkedPrefill { .. } => {
+                bail!("unified: the pipeline_chunked_prefill worker belongs to the `pp` deployment")
             }
         };
         let max_inflight_remote_reads = match g.worker {
@@ -161,19 +214,32 @@ impl Deployment for UnifiedDeployment {
             prefix_cache_max_gpu_memory_gb,
             attn_gpu_memory_gb,
         )?;
-        let worker_config = WorkerConfig {
+        let mut worker_config = WorkerConfig {
             max_inflight_remote_reads,
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
             log_output_token_times: cfg.io.log_output_token_times,
             log_stage_transitions: cfg.io.log_stage_transitions,
             kv_log_stride: cfg.io.kv_log_stride,
             gpu_time_multiplier,
+            prefill_gpu_time_multiplier: prefill_gpu_time_multiplier(&g.worker)?,
             max_batch_tokens,
             pending_order,
+            batch_policy,
+            kv_admission,
             prefix_cache,
-            ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
+            prefill_chunk_alignment: g.worker.prefill_chunk_alignment(),
+            max_model_len: g.arch.max_model_len().ok(),
+            speculative_draft_tokens: speculative_draft_tokens(&g.worker),
+            speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
+            dp_placement: match &g.worker {
+                IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
+                _ => DpPlacement::RoundRobin,
+            },
             ..WorkerConfig::default()
         };
+        g.worker
+            .kv_accounting()
+            .apply("unified", &mut worker_config)?;
 
         let dp_cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
@@ -198,16 +264,16 @@ impl Deployment for UnifiedDeployment {
         // single-group barebone worker; the DP-attn / MoE archs run on the
         // multi-group hp_unified worker (one KV partition state per DP shard).
         match &g.arch {
-            // Barebone cadence, hybrid KV: 30 GDN layers of per-request
-            // recurrent state and 10 GQA layers of per-token KV live in one
-            // attention budget, so only the KV axis differs from the arms below.
+            // 30 GDN layers of per-request recurrent state and 10 GQA layers of
+            // per-token KV share one attention budget through the arch's KV
+            // layout.
             IterArchSel::Qwen36Local {
                 routing,
                 routing_seed,
                 expert_popularity_file,
                 ..
             } => {
-                ensure_barebone(&g.worker)?;
+                ensure_barebone_or_chunked_worker("Qwen3.6 local", &g.worker)?;
                 let model = Arc::new(arch_build::qwen36_local(
                     model_spec,
                     *routing,
@@ -217,15 +283,121 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_flow(
+                assemble_barebone_or_chunked_flow(
                     cfg.kv_store.as_ref(),
+                    "Qwen3.6 local",
                     model,
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_qwen36_hybrid_worker,
+                    &g.worker,
+                )
+            }
+            // Like Qwen3.6: 34 KDA layers of per-request recurrent state (fp32
+            // SSM + conv window) and 11 DSA layers of per-token MLA latent +
+            // kpool index cache share one attention budget.
+            IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
+                tp_size,
+                enable_expert_parallel,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            }
+            | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
+                tp_size,
+                enable_expert_parallel,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_barebone_or_chunked_worker("GLM-5.3-Flash vLLM", &g.worker)?;
+                let model = Arc::new(arch_build::glm53_flash_vllm_fp8_kda_dsa_moe(
+                    model_spec,
+                    arch_build::glm53_flash_quant(&g.arch),
+                    *tp_size,
+                    *enable_expert_parallel,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    arch_build::glm53_flash_kernel_path(&g.arch)?,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_barebone_or_chunked_flow(
+                    cfg.kv_store.as_ref(),
+                    "GLM-5.3-Flash vLLM",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            // Same hybrid KV as the TP arch, held per DP rank: each rank's
+            // partition charges its own requests' MLA/kpool KV and KDA state.
+            IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
+                ep_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            }
+            | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
+                ep_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                // Barebone holds one partition, not one per rank.
+                ensure_chunked_prefill_worker("GLM-5.3-Flash vLLM DP-attention/EP", &g.worker)?;
+                let model = Arc::new(arch_build::glm53_flash_vllm_fp8_dp_attn_ep_moe(
+                    model_spec,
+                    arch_build::glm53_flash_quant(&g.arch),
+                    *ep_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    arch_build::glm53_flash_kernel_path(&g.arch)?,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_barebone_or_chunked_flow(
+                    cfg.kv_store.as_ref(),
+                    "GLM-5.3-Flash vLLM DP-attention/EP",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
                 )
             }
             IterArchSel::Llama3Dense { .. } => {
@@ -233,7 +405,7 @@ impl Deployment for UnifiedDeployment {
                 let model = Arc::new(arch_build::dense(
                     model_spec, &gpu_name, MODEL_NAME, bridge,
                 )?);
-                assemble_flow(
+                assemble_remote_or_local_flow(
                     cfg.kv_store.as_ref(),
                     model,
                     store,
@@ -249,7 +421,7 @@ impl Deployment for UnifiedDeployment {
                 let model = Arc::new(arch_build::dense_tp(
                     model_spec, *tp_size, &gpu_name, MODEL_NAME, bridge,
                 )?);
-                assemble_flow(
+                assemble_remote_or_local_flow(
                     cfg.kv_store.as_ref(),
                     model,
                     store,
@@ -274,7 +446,7 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_flow(
+                assemble_remote_or_local_flow(
                     cfg.kv_store.as_ref(),
                     model,
                     store,
@@ -309,7 +481,7 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_flow(
+                assemble_remote_or_local_flow(
                     cfg.kv_store.as_ref(),
                     model,
                     store,
@@ -344,7 +516,7 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_flow(
+                assemble_remote_or_local_flow(
                     cfg.kv_store.as_ref(),
                     model,
                     store,
@@ -379,7 +551,7 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_flow(
+                assemble_remote_or_local_flow(
                     cfg.kv_store.as_ref(),
                     model,
                     store,
@@ -388,6 +560,92 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_hp_worker,
+                )
+            }
+            arch @ (IterArchSel::DeepseekV4Vllm {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                ..
+            }
+            | IterArchSel::DeepseekV4VllmSerialStreams {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                ..
+            }) => {
+                ensure_hp_or_chunked_worker("DeepSeek-V4", &g.worker)?;
+                let serialize_streams =
+                    matches!(arch, IterArchSel::DeepseekV4VllmSerialStreams { .. });
+                let model = Arc::new(arch_build::deepseek_v4_vllm(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    serialize_streams,
+                    chunk_tokens(&g.worker),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    cfg.kv_store.as_ref(),
+                    "DeepSeek-V4",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            arch @ (IterArchSel::DeepseekV41Vllm {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                decoder_swa_bounded_replay,
+                max_model_len,
+                ..
+            }
+            | IterArchSel::DeepseekV41VllmSerialStreams {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                decoder_swa_bounded_replay,
+                max_model_len,
+                ..
+            }) => {
+                // Pure TP4 attention (one attention group, four replicated KV
+                // shards) like the GLM-5.2 SGLang TP4 arch.
+                ensure_hp_or_chunked_worker("DeepSeek-V4.1", &g.worker)?;
+                let serialize_streams =
+                    matches!(arch, IterArchSel::DeepseekV41VllmSerialStreams { .. });
+                let model = Arc::new(arch_build::deepseek_v41_vllm(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    serialize_streams,
+                    *decoder_swa_bounded_replay,
+                    *max_model_len,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    cfg.kv_store.as_ref(),
+                    "DeepSeek-V4.1",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
                 )
             }
             IterArchSel::Glm52VllmDsaMoe {
@@ -412,7 +670,7 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_flow(
+                assemble_remote_or_local_flow(
                     cfg.kv_store.as_ref(),
                     model,
                     store,
@@ -423,37 +681,348 @@ impl Deployment for UnifiedDeployment {
                     build_hp_worker,
                 )
             }
-            IterArchSel::Glm52DsaMoe {
+            IterArchSel::Glm52VllmNvfp4DsaMoe {
                 ep_size,
                 nvl_num_gpu,
+                max_model_len,
                 routing,
                 routing_seed,
                 mtp_mode,
                 expert_popularity_file,
+                token_corpus_file,
                 ..
             } => {
-                ensure_hp_unified(&g.worker)?;
-                let model = Arc::new(arch_build::glm52_dsa_moe(
+                ensure_hp_or_chunked_worker("GLM-4.5 NVFP4", &g.worker)?;
+                let model = Arc::new(arch_build::glm52_vllm_nvfp4_dsa_moe(
                     model_spec,
                     *ep_size,
                     *nvl_num_gpu,
+                    *max_model_len,
                     *routing,
                     *routing_seed,
                     *mtp_mode,
                     expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_flow(
+                assemble_hp_or_chunked_flow(
                     cfg.kv_store.as_ref(),
+                    "GLM-4.5 NVFP4",
                     model,
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_hp_worker,
+                    &g.worker,
+                )
+            }
+            IterArchSel::InklingVllmNvfp4RelAttnMoe {
+                tp_size,
+                enable_expert_parallel,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("Inkling NVFP4 vLLM", &g.worker)?;
+                let model = Arc::new(arch_build::inkling_vllm_nvfp4_rel_attn_moe(
+                    model_spec,
+                    *tp_size,
+                    *enable_expert_parallel,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    cfg.kv_store.as_ref(),
+                    "Inkling NVFP4 vLLM",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            IterArchSel::MimoV2VllmFp8SwaMoe {
+                tp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("MiMo-V2 FP8 vLLM", &g.worker)?;
+                let model = Arc::new(arch_build::mimo_v2_vllm_fp8_swa_moe(
+                    model_spec,
+                    *tp_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    cfg.kv_store.as_ref(),
+                    "MiMo-V2 FP8 vLLM",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            IterArchSel::Qwen35VllmNvfp4GdnDense {
+                max_model_len,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("Qwen3.5 NVFP4 vLLM", &g.worker)?;
+                let model = Arc::new(arch_build::qwen35_vllm_nvfp4_gdn_dense(
+                    model_spec,
+                    *max_model_len,
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    cfg.kv_store.as_ref(),
+                    "Qwen3.5 NVFP4 vLLM",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative {
+                ep_size,
+                nvl_num_gpu,
+                max_model_len,
+                routing,
+                routing_seed,
+                mtp_mode,
+                draft_tokens,
+                expert_popularity_file,
+                token_corpus_file,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                ensure!(
+                    *mtp_mode != Glm52MtpMode::Off,
+                    "unified: a speculative GLM must run its MTP layer; mtp_mode=off \
+                     leaves it with nothing to draft with"
+                );
+                let model = Arc::new(arch_build::glm52_vllm_nvfp4_dsa_moe_speculative(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    *mtp_mode,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *draft_tokens,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
+            IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
+                max_model_len,
+                draft_tokens,
+                kv_cache_dtype,
+                indexer_kv_dtype,
+                ple_table_residency,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
+                    model_spec,
+                    *max_model_len,
+                    *draft_tokens,
+                    *kv_cache_dtype,
+                    *indexer_kv_dtype,
+                    *ple_table_residency,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
+            IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 {
+                ep_size,
+                nvl_num_gpu,
+                max_model_len,
+                routing,
+                routing_seed,
+                draft_tokens,
+                draft_sliding_window,
+                expert_popularity_file,
+                token_corpus_file,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::glm53_vllm_nvfp4_dsa_moe_dflash2(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *draft_tokens,
+                    *draft_sliding_window,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
+            IterArchSel::Glm52VllmNvfp4DpAttnDsaMoe {
+                ep_size,
+                nvl_num_gpu,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("GLM-5.2 NVFP4 DP attention", &g.worker)?;
+                let model = Arc::new(arch_build::glm52_vllm_nvfp4_dp_attn_dsa_moe(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    cfg.kv_store.as_ref(),
+                    "GLM-5.2 NVFP4 DP attention",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            // A pipeline stage is its own worker cadence, so the arch is not a
+            // unified worker's model.
+            IterArchSel::Glm52VllmNvfp4PpDsaMoe { .. } => {
+                bail!("unified: glm52_vllm_nvfp4_pp_dsa_moe runs only under deployment `pp`")
+            }
+            IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. }
+            | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe { .. } => {
+                bail!(
+                    "unified: the glm53_flash_vllm_*_pp_kda_dsa_moe archs run only under deployment `pp`"
+                )
+            }
+            IterArchSel::Glm52SglangNvfp4TpDsaMoe {
+                tp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                mtp_mode,
+                expert_popularity_file,
+                token_corpus_file,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("GLM-5.2 SGLang NVFP4 pure TP", &g.worker)?;
+                let model = Arc::new(arch_build::glm52_sglang_nvfp4_tp_dsa_moe(
+                    model_spec,
+                    *tp_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    *mtp_mode,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    cfg.kv_store.as_ref(),
+                    "GLM-5.2 SGLang NVFP4 pure TP",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
                 )
             }
         }
@@ -471,15 +1040,149 @@ fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
-/// The hybrid KV recipe's optional snapshot-interval override. Only `barebone`
-/// carries it; every other selector leaves the arch's own alignment in force.
-fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
+/// Recurrent-state archs run under either lifecycle: barebone admission or
+/// hard-capped chunked prefill. Their KV layout, not the recipe, carries the
+/// state.
+fn ensure_barebone_or_chunked_worker(
+    arch_name: &str,
+    worker: &IterWorkerSel,
+) -> anyhow::Result<()> {
     match worker {
+        IterWorkerSel::Barebone { .. }
+        | IterWorkerSel::ChunkedPrefill { .. }
+        | IterWorkerSel::RemoteCacheUnified { .. } => Ok(()),
+        other => bail!(
+            "unified: {arch_name} requires worker `barebone` or `chunked_prefill`, got {other:?}"
+        ),
+    }
+}
+
+fn ensure_chunked_prefill_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
+        other => bail!("unified: {arch_name} requires worker `chunked_prefill`, got {other:?}"),
+    }
+}
+
+fn assemble_barebone_or_chunked_flow<M>(
+    kv_store: Option<&KvStorePoolSpec>,
+    arch_name: &str,
+    model: Arc<M>,
+    store: SharedRequests,
+    worker_config: WorkerConfig,
+    log_dir: Option<PathBuf>,
+    gpu_name: String,
+    dp_cfg: SimpleDpConfig,
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Box<dyn Flow>>
+where
+    M: IterwiseUnifiedModel,
+{
+    match worker {
+        IterWorkerSel::RemoteCacheUnified { .. } => assemble_remote_or_local_flow(
+            kv_store,
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_barebone_worker,
+        ),
+        IterWorkerSel::Barebone { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_barebone_worker,
+        )),
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_chunked_prefill_worker,
+        )),
+        other => bail!("unified: unsupported {arch_name} worker {other:?}"),
+    }
+}
+
+/// Prefill-iteration multiplier of any co-located selector. The PD selectors do
+/// not carry it: every PD prefill iteration schedules prefill and no PD decode
+/// iteration does, so `gpu_time_multiplier` already expresses either stage.
+fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<f64>> {
+    let multiplier = match worker {
         IterWorkerSel::Barebone {
-            ssm_checkpoint_interval_tokens,
+            prefill_gpu_time_multiplier,
             ..
-        } => *ssm_checkpoint_interval_tokens,
+        }
+        | IterWorkerSel::HpUnified {
+            prefill_gpu_time_multiplier,
+            ..
+        }
+        | IterWorkerSel::ChunkedPrefill {
+            prefill_gpu_time_multiplier,
+            ..
+        }
+        | IterWorkerSel::Speculative {
+            prefill_gpu_time_multiplier,
+            ..
+        } => *prefill_gpu_time_multiplier,
+        IterWorkerSel::PdPrefill { .. }
+        | IterWorkerSel::PdDecode { .. }
+        | IterWorkerSel::PipelineChunkedPrefill { .. }
+        | IterWorkerSel::RemoteCacheUnified { .. }
+        | IterWorkerSel::RemoteCachePdPrefill { .. }
+        | IterWorkerSel::RemoteCachePdDecode { .. } => None,
+    };
+    if let Some(multiplier) = multiplier {
+        ensure!(
+            multiplier.is_finite() && multiplier >= 1.0,
+            "unified: prefill_gpu_time_multiplier must be a finite value >= 1.0 (got {multiplier})"
+        );
+    }
+    Ok(multiplier)
+}
+
+/// Draft candidate count, carried by the `speculative` selector only. Every other
+/// worker leaves it at `0`, which is what marks it as not speculating.
+fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
+    match worker {
+        IterWorkerSel::Speculative { draft_tokens, .. } => *draft_tokens,
+        _ => 0,
+    }
+}
+
+/// Which deterministic acceptance stream the speculative worker draws from.
+fn speculative_acceptance_seed(worker: &IterWorkerSel) -> Option<u64> {
+    match worker {
+        IterWorkerSel::Speculative {
+            acceptance_seed, ..
+        } => *acceptance_seed,
         _ => None,
+    }
+}
+
+/// The speculative GLM arch pairs only with the speculative worker: it builds a
+/// different model type, so no other recipe can even name it.
+fn ensure_speculative(worker: &IterWorkerSel, arch_draft_tokens: u32) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::Speculative { draft_tokens, .. } => {
+            ensure!(
+                *draft_tokens == arch_draft_tokens,
+                "unified: worker draft_tokens={draft_tokens} must match the arch's \
+                 draft_tokens={arch_draft_tokens} — the width selects a profiled \
+                 kernel shape, so the two cannot differ"
+            );
+            Ok(())
+        }
+        other => {
+            bail!("unified: this speculative arch requires worker `speculative`, got {other:?}")
+        }
     }
 }
 
@@ -493,10 +1196,109 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
+/// The most tokens one step of `worker` runs: its chunk under chunked
+/// prefill; None for a worker that runs each prompt whole.
+fn chunk_tokens(worker: &IterWorkerSel) -> Option<u32> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            max_batch_tokens, ..
+        } => Some(*max_batch_tokens),
+        _ => None,
+    }
+}
+
+/// Whole-iteration arches with a captured chunked-prefill runtime may use the
+/// ordinary HP admission recipe or the dedicated hard-cap/chunking recipe.
+fn ensure_hp_or_chunked_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::HpUnified { .. }
+        | IterWorkerSel::ChunkedPrefill { .. }
+        | IterWorkerSel::RemoteCacheUnified { .. } => Ok(()),
+        other => bail!(
+            "unified: {arch_name} requires worker `hp_unified` or `chunked_prefill`, got {other:?}"
+        ),
+    }
+}
+
+fn assemble_hp_or_chunked_flow<M>(
+    kv_store: Option<&KvStorePoolSpec>,
+    arch_name: &str,
+    model: Arc<M>,
+    store: SharedRequests,
+    worker_config: WorkerConfig,
+    log_dir: Option<PathBuf>,
+    gpu_name: String,
+    dp_cfg: SimpleDpConfig,
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Box<dyn Flow>>
+where
+    M: IterwiseUnifiedModel,
+{
+    match worker {
+        IterWorkerSel::RemoteCacheUnified { .. } => assemble_remote_or_local_flow(
+            kv_store,
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_hp_worker,
+        ),
+        IterWorkerSel::HpUnified { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_hp_worker,
+        )),
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_chunked_prefill_worker,
+        )),
+        other => bail!("unified: unsupported {arch_name} worker {other:?}"),
+    }
+}
+
 /// Wrap a built iter-wise model in a `simple_dp` flow. Generic over the concrete
 /// model `M` and worker `W`; `build_fn` is the chosen worker's `new`. The returned
 /// `Box<dyn Flow>` is the only `dyn` erasure point.
 fn assemble_flow<M, W>(
+    model: Arc<M>,
+    store: SharedRequests,
+    worker_config: WorkerConfig,
+    log_dir: Option<PathBuf>,
+    gpu_name: String,
+    dp_cfg: SimpleDpConfig,
+    build_fn: WorkerBuildFn<M, W>,
+) -> Box<dyn Flow>
+where
+    // No L4 bound on `M`: `build_fn` already states the model contract its
+    // recipe needs, and the speculative recipe's model implements
+    // `SpeculativeUnifiedModel` rather than `IterwiseUnifiedModel`.
+    W: IterWorker<Event = crate::worker::WorkerEventCommon> + 'static,
+    W::Msg: From<crate::common::RequestId>,
+{
+    let factory = UnifiedWorkerFactory::new(
+        model,
+        store,
+        worker_config,
+        log_dir,
+        gpu_name,
+        "main",
+        build_fn,
+    );
+    Box::new(SimpleDpFlow::new(dp_cfg, factory))
+}
+
+fn assemble_remote_or_local_flow<M, W>(
     kv_store: Option<&KvStorePoolSpec>,
     model: Arc<M>,
     store: SharedRequests,
@@ -512,7 +1314,11 @@ where
     W::Msg: From<crate::common::RequestId>,
 {
     if let Some(spec) = kv_store {
-        let bytes = model.total_kv_bytes_per_token();
+        let bytes = crate::worker::workers::remote_kv_bytes_per_token(
+            &model.kv_cache_layout(),
+            model.num_attn_shards(),
+            &worker_config,
+        )?;
         spec.validate(bytes)?;
         let net_log = log_dir.clone();
         let factory = UnifiedWorkerFactory::new(
@@ -552,9 +1358,12 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::{Glm52DsaMoeModel, Qwen36LocalModel};
+    use crate::arch::{
+        Glm52VllmDsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+        Glm53FlashVllmModel, Qwen36LocalModel,
+    };
     use crate::common::RequestId;
-    use crate::worker::{HpUnifiedWorker, WorkerEventCommon};
+    use crate::worker::{BareboneWorker, ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
 
     #[test]
     fn assembled_remote_unified_reuses_twenty_tokens_on_a_different_replica() {
@@ -574,7 +1383,7 @@ mod tests {
             backlog_weight_per_ms: 1.0,
             policy: crate::worker::PrefixCachePolicy::Lru,
         };
-        let mut flow = assemble_flow(
+        let mut flow = assemble_remote_or_local_flow(
             Some(&spec),
             Arc::new(FakeModel::for_ms(1.0)),
             requests.clone(),
@@ -637,6 +1446,8 @@ mod tests {
             prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
             prefix_cache_max_gpu_memory_gb: None,
+            prefill_gpu_time_multiplier: None,
+            kv_accounting: Default::default(),
         }
     }
 
@@ -649,7 +1460,22 @@ mod tests {
             prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
             prefix_cache_max_gpu_memory_gb: None,
-            ssm_checkpoint_interval_tokens: None,
+            prefill_gpu_time_multiplier: None,
+            kv_accounting: Default::default(),
+        }
+    }
+
+    fn chunked_prefill_worker() -> IterWorkerSel {
+        IterWorkerSel::ChunkedPrefill {
+            attn_gpu_memory_gb: 120.0,
+            max_batch_tokens: 2048,
+            batch_policy: BatchPolicy::Mix,
+            kv_admission: crate::worker::config::KvAdmissionSpec::default(),
+            gpu_time_multiplier: 1.0,
+            prefill_gpu_time_multiplier: None,
+            dp_placement: DpPlacement::RoundRobin,
+            prefill_chunk_alignment: None,
+            kv_accounting: Default::default(),
         }
     }
 
@@ -662,49 +1488,80 @@ mod tests {
 
     #[test]
     fn glm52_hp_unified_pair_satisfies_the_iter_worker_contract() {
-        assert_iter_worker_contract::<HpUnifiedWorker<Glm52DsaMoeModel>>();
+        assert_iter_worker_contract::<HpUnifiedWorker<Glm52VllmDsaMoeModel>>();
         ensure_hp_unified(&hp_worker()).expect("GLM accepts hp_unified");
     }
 
-    /// Qwen3.6 local keeps the `barebone` preset tag — cadence, admission and
-    /// execution really are barebone — but composes the hybrid KV store, so the
-    /// contract is asserted against `Qwen36HybridWorker`, not `BareboneWorker`.
+    #[test]
+    fn glm52_nvfp4_chunked_prefill_pair_satisfies_the_iter_worker_contract() {
+        assert_iter_worker_contract::<ChunkedPrefillWorker<Glm52VllmNvfp4DsaMoeModel>>();
+        ensure_hp_or_chunked_worker("GLM-4.5 NVFP4", &chunked_prefill_worker())
+            .expect("GLM NVFP4 accepts the dedicated chunked-prefill worker");
+    }
+
     #[test]
     fn qwen36_local_barebone_pair_satisfies_the_iter_worker_contract() {
-        assert_iter_worker_contract::<crate::worker::Qwen36HybridWorker<Qwen36LocalModel>>();
+        assert_iter_worker_contract::<BareboneWorker<Qwen36LocalModel>>();
         ensure_barebone(&barebone_worker()).expect("Qwen3.6 local accepts barebone");
         let error = ensure_barebone(&hp_worker()).unwrap_err().to_string();
         assert!(error.contains("requires worker `barebone`"));
     }
 
+    /// Both recurrent-state archs run under either lifecycle.
     #[test]
-    fn the_snapshot_interval_override_is_barebone_only_and_defaults_to_the_arch() {
-        assert_eq!(ssm_checkpoint_interval_tokens(&barebone_worker()), None);
-        assert_eq!(ssm_checkpoint_interval_tokens(&hp_worker()), None);
-        let IterWorkerSel::Barebone {
-            attn_gpu_memory_gb,
-            gpu_time_multiplier,
-            max_batch_tokens,
-            pending_order,
-            prefix_cache_mode,
-            prefix_cache_policy,
-            prefix_cache_max_gpu_memory_gb,
-            ..
-        } = barebone_worker()
-        else {
-            unreachable!()
+    fn recurrent_state_archs_pair_with_barebone_or_chunked_prefill() {
+        assert_iter_worker_contract::<BareboneWorker<Glm53FlashVllmModel>>();
+        assert_iter_worker_contract::<ChunkedPrefillWorker<Glm53FlashVllmModel>>();
+        assert_iter_worker_contract::<ChunkedPrefillWorker<Qwen36LocalModel>>();
+        for worker in [barebone_worker(), chunked_prefill_worker()] {
+            ensure_barebone_or_chunked_worker("GLM-5.3-Flash", &worker).expect("hybrid lifecycle");
+        }
+        let error = ensure_barebone_or_chunked_worker("GLM-5.3-Flash", &hp_worker())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires worker `barebone` or `chunked_prefill`"));
+    }
+
+    #[test]
+    fn every_co_located_selector_carries_a_prefill_multiplier_of_at_least_one() {
+        let with = |mut worker: IterWorkerSel, multiplier: f64| {
+            match &mut worker {
+                IterWorkerSel::Barebone {
+                    prefill_gpu_time_multiplier,
+                    ..
+                }
+                | IterWorkerSel::HpUnified {
+                    prefill_gpu_time_multiplier,
+                    ..
+                }
+                | IterWorkerSel::ChunkedPrefill {
+                    prefill_gpu_time_multiplier,
+                    ..
+                }
+                | IterWorkerSel::Speculative {
+                    prefill_gpu_time_multiplier,
+                    ..
+                } => *prefill_gpu_time_multiplier = Some(multiplier),
+                other => panic!("not a co-located selector: {other:?}"),
+            }
+            worker
         };
-        let overridden = IterWorkerSel::Barebone {
-            attn_gpu_memory_gb,
-            gpu_time_multiplier,
-            max_batch_tokens,
-            pending_order,
-            prefix_cache_mode,
-            prefix_cache_policy,
-            prefix_cache_max_gpu_memory_gb,
-            ssm_checkpoint_interval_tokens: Some(528),
-        };
-        assert_eq!(ssm_checkpoint_interval_tokens(&overridden), Some(528));
+        for worker in [
+            barebone_worker(),
+            hp_worker(),
+            chunked_prefill_worker(),
+            speculative_worker(3),
+        ] {
+            assert_eq!(prefill_gpu_time_multiplier(&worker).unwrap(), None);
+            assert_eq!(
+                prefill_gpu_time_multiplier(&with(worker.clone(), 1.2)).unwrap(),
+                Some(1.2)
+            );
+            let error = prefill_gpu_time_multiplier(&with(worker, 0.9))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("prefill_gpu_time_multiplier must be a finite value >= 1.0"));
+        }
     }
 
     #[test]
@@ -721,6 +1578,7 @@ mod tests {
             prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
             prefix_cache_max_gpu_memory_gb: None,
+            kv_accounting: Default::default(),
         };
         let error = ensure_hp_unified(&pd_prefill).unwrap_err().to_string();
         assert!(error.contains("worker `hp_unified`"));
@@ -731,7 +1589,7 @@ mod tests {
     fn glm52_unified_config_preserves_ep8_hp_pairing() {
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
+workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
 io: { log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }
 pools:
   main:
@@ -740,7 +1598,7 @@ pools:
       - gpu: "NVIDIA H200"
         replicas: 1
         arch:
-          type: glm52_dsa_moe
+          type: glm52_vllm_dsa_moe
           model_config: model/config/glm52.json
           fp8: false
           ep_size: 8
@@ -758,7 +1616,7 @@ pools:
             panic!("expected unified config")
         };
         let group = &cfg.pools.main.groups[0];
-        let IterArchSel::Glm52DsaMoe {
+        let IterArchSel::Glm52VllmDsaMoe {
             ep_size,
             nvl_num_gpu,
             mtp_mode,
@@ -772,6 +1630,110 @@ pools:
         ensure_hp_unified(&group.worker).expect("GLM hp_unified pairing is accepted");
     }
 
+    fn speculative_worker(draft_tokens: u32) -> IterWorkerSel {
+        IterWorkerSel::Speculative {
+            attn_gpu_memory_gb: 180.0,
+            max_batch_tokens: 8192,
+            draft_tokens,
+            acceptance_seed: Some(7),
+            batch_policy: BatchPolicy::Mix,
+            kv_admission: Default::default(),
+            gpu_time_multiplier: 1.0,
+            prefill_gpu_time_multiplier: None,
+            kv_accounting: Default::default(),
+            prefill_chunk_alignment: None,
+        }
+    }
+
+    #[test]
+    fn the_speculative_pair_satisfies_the_iter_worker_contract() {
+        assert_iter_worker_contract::<
+            crate::worker::SpeculativeWorker<Glm52VllmNvfp4DsaMoeSpeculativeModel>,
+        >();
+        ensure_speculative(&speculative_worker(3), 3).expect("matching widths pair");
+    }
+
+    #[test]
+    fn a_verify_width_that_disagrees_with_the_arch_is_rejected_before_anything_is_built() {
+        // The defect this catches: the arch compiles a tree for k=3 while the
+        // worker submits k=5 rows. The model would reject the batch at runtime,
+        // deep inside an iteration, instead of at configuration time.
+        let error = ensure_speculative(&speculative_worker(5), 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("draft_tokens=5"));
+        assert!(error.contains("draft_tokens=3"));
+
+        let error = ensure_speculative(&chunked_prefill_worker(), 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires worker `speculative`"));
+    }
+
+    #[test]
+    fn a_speculative_preset_parses_into_the_paired_arch_and_worker() {
+        // Both selectors are new serde surfaces. This is the shape a preset
+        // author actually writes, so a rename or a missing `serde(default)`
+        // shows up here rather than at run time.
+        let yaml = r#"
+deployment: unified
+workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
+io: { log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }
+pools:
+  main:
+    placement: least-queued
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm52_vllm_nvfp4_dsa_moe_speculative
+          model_config: model/config/glm52.json
+          fp8: false
+          ep_size: 4
+          nvl_num_gpu: 4
+          max_model_len: 8192
+          draft_tokens: 3
+        worker:
+          type: speculative
+          attn_gpu_memory_gb: 180.0
+          max_batch_tokens: 8192
+          draft_tokens: 3
+"#;
+        let cfg: crate::deployment::RunConfig =
+            serde_yaml::from_str(yaml).expect("speculative config parses");
+        let crate::deployment::RunConfig::Unified(cfg) = cfg else {
+            panic!("expected unified config")
+        };
+        let group = &cfg.pools.main.groups[0];
+        let IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative {
+            draft_tokens,
+            mtp_mode,
+            max_model_len,
+            ..
+        } = &group.arch
+        else {
+            panic!("expected the speculative GLM arch")
+        };
+        assert_eq!((*draft_tokens, *max_model_len), (3, 8192));
+        // A speculative arch has to run its drafter, so unlike the ordinary
+        // selector it does not default `mtp_mode` to `off`.
+        assert_eq!(*mtp_mode, Glm52MtpMode::IndexShare);
+        ensure_speculative(&group.worker, *draft_tokens).expect("the pair is accepted");
+        assert_eq!(speculative_draft_tokens(&group.worker), 3);
+        assert_eq!(speculative_acceptance_seed(&group.worker), None);
+    }
+
+    #[test]
+    fn only_the_speculative_selector_carries_a_verify_width_or_an_acceptance_seed() {
+        // Every other worker must read as "not speculating"; a nonzero default
+        // would silently turn an ordinary recipe's assertion into a live width.
+        assert_eq!(speculative_draft_tokens(&speculative_worker(5)), 5);
+        assert_eq!(speculative_acceptance_seed(&speculative_worker(5)), Some(7));
+        for worker in [barebone_worker(), hp_worker(), chunked_prefill_worker()] {
+            assert_eq!(speculative_draft_tokens(&worker), 0);
+            assert_eq!(speculative_acceptance_seed(&worker), None);
+        }
+    }
     #[test]
     fn kv_store_and_remote_selector_require_each_other_and_an_enabled_cache() {
         use crate::common::RequestStore;
@@ -782,7 +1744,7 @@ pools:
             let yaml = format!(
                 r#"
 deployment: unified
-{store}workload: {{ trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1.0, run_to_end: true, request_rate: 1.0 }}
+{store}workload: {{ trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 1.0, run_to_end: true, request_rate: 1.0 }}
 io: {{ log_dir: "unused", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }}
 pools:
   main:

@@ -1,4 +1,4 @@
-"""Four explicit alignment phases under ``python -m launcher alignment``.
+"""Four explicit alignment phases plus report comparison under ``launcher alignment``.
 
 Each command accepts exactly its own YAML/JSON contract. Cross-stage commands
 consume completed artifact directories, never earlier config files. Launcher
@@ -9,9 +9,11 @@ NSYS normalization, and timing-predict input conversion.
 from __future__ import annotations
 
 import argparse
+import filecmp
 import json
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -28,24 +30,35 @@ from .alignment_config import (
     load_timing_predict_config,
 )
 from .artifact_kind import ArtifactKind, write_artifact_kind
-from .schema.loader import PresetError, _load_preset
+from .corpus import CorpusError, resolve_hf_references
+from .schema.loader import PresetError, SchemaNotFound, _load_preset, load_schema
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_SUFFIXES = frozenset({".json", ".yaml", ".yml"})
 ALIGNMENT_MANIFEST_NAME = "alignment_manifest.json"
 # Bumped when either typed manifest shape changes; must match the analyzer's
 # SCHEMA_VERSION in analyzer/rust/src/alignment_input.rs.
-ALIGNMENT_MANIFEST_SCHEMA_VERSION = 8
+ALIGNMENT_MANIFEST_SCHEMA_VERSION = 9
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m launcher alignment",
-        description="Run one explicit stage of the VibeSim↔vLLM alignment workflow.",
+        description="Run one explicit stage of the ServingStudioSim↔vLLM alignment workflow.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    sim = commands.add_parser("sim", help="Run the ordinary VibeSim simulation.")
+    prepare = commands.add_parser(
+        "prepare-workload", help="Build an explicitly observed-conditioned acceptance trace."
+    )
+    prepare.add_argument("--source-trace", type=Path, required=True)
+    prepare.add_argument("--profile-dir", type=Path, required=True)
+    prepare.add_argument("--output-trace", type=Path, required=True)
+    prepare.add_argument("--draft-tokens", type=int, required=True)
+    prepare.add_argument("--missing-acceptance", choices=["error", "run-aggregate"], required=True)
+    prepare.add_argument("--request-id-prefix", default="")
+
+    sim = commands.add_parser("sim", help="Run the ordinary ServingStudioSim simulation.")
     sim.add_argument("config", type=Path, help="Simulation preset YAML/JSON")
     sim.add_argument("--dry-run", action="store_true", help="Validate and expand only.")
     sim.add_argument("--build-type", default="release", help="Cargo profile (default: release).")
@@ -54,16 +67,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-analyze",
         action="store_true",
         help="Skip the simulation's ordinary post-run analyzer.",
-    )
-    sim.add_argument(
-        "--gpu-time-multiplier-from",
-        type=Path,
-        default=None,
-        metavar="KERNEL_ALIGN_DIR",
-        help=(
-            "Kernel-align analysis dir; auto-injects its derived "
-            "recommended_gpu_time_multiplier into the worker as an override."
-        ),
     )
 
     profile = commands.add_parser(
@@ -87,23 +90,73 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     predict.add_argument("config", type=Path, help="Timing-predict phase YAML/JSON")
     predict.add_argument("--build-type", default="release", help="Cargo profile.")
+    predict.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build and validate the cases in a scratch directory; predict and write nothing.",
+    )
 
     analyze = commands.add_parser(
         "analyze", help="Compare completed profile, prediction, and simulation artifacts."
     )
     analyze.add_argument("config", type=Path, help="Analyze phase YAML/JSON")
     analyze.add_argument("--build-type", default="release", help="Cargo profile.")
+
+    compare = commands.add_parser(
+        "compare", help="Compare aggregate errors from two completed kernel-align reports."
+    )
+    compare.add_argument("baseline", type=Path, help="Baseline analysis dir or report JSON")
+    compare.add_argument("candidate", type=Path, help="Candidate analysis dir or report JSON")
+    compare.add_argument(
+        "--limit", type=int, default=20, help="Maximum operation rows to print (default: 20)."
+    )
+    compare.add_argument("--json", action="store_true", help="Emit the complete comparison JSON.")
     return parser
 
 
 def _load_simulation_preset(path: Path) -> dict[str, Any]:
-    """Validate one ordinary simulation preset without introducing a wrapper."""
+    """Validate one ordinary simulation preset without introducing a wrapper.
+
+    Hub references are resolved here, as the ordinary launcher resolves them,
+    because the arch this returns reaches the binary through timing-predict.
+    """
     if path.suffix.lower() not in CONFIG_SUFFIXES:
         raise ValueError(f"simulation config must be YAML or JSON: {path}")
     try:
-        return _load_preset(path)
-    except PresetError as exc:
+        return resolve_hf_references(_load_preset(path))
+    except (PresetError, CorpusError) as exc:
         raise ValueError(str(exc)) from exc
+
+
+def _normalize_simulation_preset(path: Path, *, build_type: str) -> dict[str, Any]:
+    """The sim preset as `launcher sim` hands it to the binary: `backends_file`
+    folded into a nested `backends` map, schema defaults filled (an omitted
+    `fp8` becomes `false`), and hub references resolved.
+
+    timing-predict forwards this arch and backend policy to the predictor, whose
+    config has no defaults of its own, so it must not read the raw preset.
+    """
+    from .__main__ import _expand_preset
+    from .exec import cargo_build
+
+    preset = _load_simulation_preset(path)
+    # The schema comes from `list-params`, which the build writes; building
+    # first keeps it in step with the binary that will run the prediction.
+    if not cargo_build(build_type, build_analyzer=False):
+        raise ValueError("simulator build failed (see error above)")
+    try:
+        schema = load_schema(build_type)
+    except SchemaNotFound as exc:
+        raise ValueError(str(exc)) from exc
+    candidates = _expand_preset(preset, schema, str(path))
+    if candidates is None:
+        raise ValueError(f"invalid simulation preset: {path} (see errors above)")
+    if len(candidates) != 1:
+        raise ValueError(
+            f"simulation preset {path} expands to {len(candidates)} runs; "
+            "alignment timing-predict needs exactly one"
+        )
+    return candidates[0]
 
 
 def _load_simulation_params(log_dir: Path) -> dict[str, Any]:
@@ -137,49 +190,25 @@ def _simulation_target(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return gpu, arch
 
 
-def _preset_backends(preset: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
-    """Re-nest the sim preset's flat ``"pool/role": [candidates]`` backend map
-    into the ``{pool: {role: [candidates]}}`` form the timing predictor expects —
-    the same shape the launcher resolves into a completed run's params.json. The
-    backend policy is part of the simulated CostTree identity, so this must match
-    what the simulation will use.
+def _simulation_backends(params: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
+    """The normalized preset's ``{pool: {role: [candidates]}}`` backend map, the
+    form the timing predictor expects. The backend policy is part of the
+    simulated CostTree identity, so this must match what the simulation will use.
     """
-    flat = preset.get("backends", {})
-    if not isinstance(flat, dict):
+    nested = params.get("backends", {})
+    if not isinstance(nested, dict):
         raise ValueError("simulation preset backends must be a mapping")
-    nested: dict[str, dict[str, list[str]]] = {}
-    for key, candidates in flat.items():
-        pool, separator, role = str(key).partition("/")
-        if not separator or not pool or not role:
-            raise ValueError(f"simulation preset backend key {key!r} must be 'pool/role'")
-        if (
-            not isinstance(candidates, list)
-            or not candidates
-            or not all(isinstance(candidate, str) for candidate in candidates)
-        ):
-            raise ValueError(
-                f"simulation preset backend {key!r} must map to a non-empty string list"
-            )
-        nested.setdefault(pool, {})[role] = list(candidates)
+    for pool, roles in nested.items():
+        for role, candidates in roles.items():
+            if (
+                not isinstance(candidates, list)
+                or not candidates
+                or not all(isinstance(candidate, str) for candidate in candidates)
+            ):
+                raise ValueError(
+                    f"simulation preset backend '{pool}/{role}' must map to a non-empty string list"
+                )
     return nested
-
-
-def _read_recommended_multiplier(analysis_log_dir: Path) -> float:
-    """Read the duty-cycle multiplier the kernel-align pass derived from the
-    measured side (Σ measured_gpu_cycle_ms / Σ measured_ms)."""
-    report_path = analysis_log_dir / "reports" / "alignment_iteration_report.json"
-    if not report_path.is_file():
-        raise ValueError(
-            f"kernel-align report not found: {report_path}; run the kernel-align analyze first"
-        )
-    report = json.loads(report_path.read_text())
-    meta = report.get("meta") if isinstance(report, dict) else None
-    multiplier = meta.get("recommended_gpu_time_multiplier") if isinstance(meta, dict) else None
-    if not isinstance(multiplier, (int, float)) or isinstance(multiplier, bool) or multiplier < 1.0:
-        raise ValueError(
-            f"kernel-align report has no valid recommended_gpu_time_multiplier: {report_path}"
-        )
-    return float(multiplier)
 
 
 def _load_profile_result(profile_log_dir: Path) -> dict[str, Any]:
@@ -212,40 +241,22 @@ def _optional_profile_artifact(result: dict[str, Any], key: str) -> Path | None:
     return _profile_artifact(result, key)
 
 
-def _validate_e2e_profile_pair(
-    nsys_result: dict[str, Any], workload_result: dict[str, Any]
-) -> None:
-    """Reject an E2E profile pair that cannot describe the same serving run.
-
-    Device ordinals may differ between captures, but the logical topology and
-    replay source are part of the comparison identity and must remain equal.
-    """
-    nsys_kind = nsys_result.get("profile_kind")
-    if nsys_kind not in {None, "nsys"}:
-        raise ValueError(f"profile_log_dir must contain an nsys profile, got {nsys_kind!r}")
-    workload_kind = workload_result.get("profile_kind")
-    if workload_result is not nsys_result and workload_kind != "workload_metrics":
-        raise ValueError(
-            "workload_profile_log_dir must contain a workload_metrics profile, "
-            f"got {workload_kind!r}"
+def _same_trace_source(left: Any, right: Any) -> bool:
+    """Accept copied trace artifacts only when their bytes are identical."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return left == right
+    left_path = Path(left).resolve()
+    right_path = Path(right).resolve()
+    if left_path == right_path:
+        return True
+    try:
+        return (
+            left_path.is_file()
+            and right_path.is_file()
+            and filecmp.cmp(left_path, right_path, shallow=False)
         )
-
-    identity_fields = ("gpu", "server_tp_size", "server_dp_size")
-    for field in identity_fields:
-        if nsys_result.get(field) != workload_result.get(field):
-            raise ValueError(
-                f"E2E profile provenance mismatch for {field}: "
-                f"{nsys_result.get(field)!r} != {workload_result.get(field)!r}"
-            )
-    nsys_drive = nsys_result.get("drive_summary")
-    workload_drive = workload_result.get("drive_summary")
-    if isinstance(nsys_drive, dict) and isinstance(workload_drive, dict):
-        for field in ("source_trace", "frontend_type"):
-            if nsys_drive.get(field) != workload_drive.get(field):
-                raise ValueError(
-                    f"E2E profile provenance mismatch for drive_summary.{field}: "
-                    f"{nsys_drive.get(field)!r} != {workload_drive.get(field)!r}"
-                )
+    except OSError:
+        return False
 
 
 def _warn_if_trace_mismatch(params: dict[str, Any], profile_result: dict[str, Any]) -> None:
@@ -262,7 +273,7 @@ def _warn_if_trace_mismatch(params: dict[str, Any], profile_result: dict[str, An
     aligned = (
         len(resolved_simulation) == 1
         and isinstance(profile_trace, str)
-        and resolved_simulation[0] == Path(profile_trace).resolve()
+        and _same_trace_source(str(resolved_simulation[0]), profile_trace)
     )
     if not aligned:
         print(
@@ -309,19 +320,19 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
     An analyze config is exactly one phase (enforced by load_analyze_config):
     kernel-align (iteration) writes a kernel-only manifest with no simulation;
     e2e-align (workload/e2e) writes a simulation-consuming manifest. The two
-    shapes share only the measured-profile anchor.
+    shapes are deliberately disjoint: NSYS belongs only to kernel alignment,
+    while request/workload alignment reads only the full workload-metrics run.
     """
-    profile_result = _load_profile_result(config.profile_log_dir)
-
     config.log_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = config.log_dir / ALIGNMENT_MANIFEST_NAME
     common = {
         "schema_version": ALIGNMENT_MANIFEST_SCHEMA_VERSION,
         "analysis_log_dir": str(config.log_dir),
-        "profile_log_dir": str(config.profile_log_dir),
     }
 
     if config.iteration.enabled:
+        assert config.profile_log_dir is not None  # config validation
+        profile_result = _load_profile_result(config.profile_log_dir)
         assert config.timing_predict_log_dir is not None  # config validation
         input_manifest = _read_input_manifest(config.timing_predict_log_dir)
         _require_manifest_dir(input_manifest, "profile_log_dir", config.profile_log_dir)
@@ -339,8 +350,12 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
         # Captures taken before the host sidecar existed simply have no host
         # lane; the subject degrades to the device-only view it always drew.
         host_timeline = _optional_profile_artifact(profile_result, "host_timeline")
+        # A schema-6 parse is unreadable without its kernel-row sibling; fail here,
+        # naming the file, rather than inside the analyzer. Older captures name none.
+        _optional_profile_artifact(profile_result, "parsed_kernel_rows")
         manifest = {
             **common,
+            "profile_log_dir": str(config.profile_log_dir),
             "parsed_nsys": str(_manifest_path(input_manifest, "parsed_nsys")),
             "predict_log_dir": str(config.timing_predict_log_dir),
             "timing_predict_case_map": str(
@@ -351,24 +366,31 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
         }
     else:
         assert config.simulation_log_dir is not None  # enforced by load_analyze_config
+        assert config.workload_profile_log_dir is not None  # config validation
         _simulation_target(_load_simulation_params(config.simulation_log_dir))
         workload_profile_result = _load_profile_result(config.workload_profile_log_dir)
-        if config.workload_profile_log_dir.resolve() == config.profile_log_dir.resolve():
-            workload_profile_result = profile_result
-        _validate_e2e_profile_pair(profile_result, workload_profile_result)
+        if workload_profile_result.get("profile_kind") != "workload_metrics":
+            raise ValueError(
+                "workload_profile_log_dir must contain a workload_metrics profile, "
+                f"got {workload_profile_result.get('profile_kind')!r}"
+            )
         request_timings_result = _optional_profile_artifact(
             workload_profile_result, "request_timings_jsonl"
         )
+        drive_summary = workload_profile_result.get("drive_summary")
+        if not isinstance(drive_summary, dict):
+            drive_summary = {}
         manifest = {
             **common,
             "workload_profile_log_dir": str(config.workload_profile_log_dir),
-            "parsed_nsys": str(_profile_artifact(profile_result, "parsed_nsys")),
             "simulation_log_dir": str(config.simulation_log_dir),
             "metrics_jsonl": str(_profile_artifact(workload_profile_result, "metrics_jsonl")),
             "replay_result": str(_profile_artifact(workload_profile_result, "replay_result")),
             "request_timings_result": (
                 str(request_timings_result) if request_timings_result else None
             ),
+            "replay_start_monotonic_ns": drive_summary.get("replay_start_monotonic_ns"),
+            "replay_end_monotonic_ns": drive_summary.get("replay_end_monotonic_ns"),
             "throughput_bins": config.e2e.throughput_bins,
         }
 
@@ -383,13 +405,10 @@ def _launch_simulation(
     build_type: str,
     refresh: bool,
     no_analyze: bool,
-    overrides: list[str] | None = None,
 ) -> int:
     from .__main__ import main as launcher_main
 
     argv = [str(path), "--build-type", build_type]
-    for override in overrides or []:
-        argv.extend(["--override", override])
     if dry_run:
         argv.append("--dry-run")
     if refresh:
@@ -402,14 +421,17 @@ def _launch_simulation(
         return int(exc.code) if isinstance(exc.code, int) else 2
 
 
-def _launch_timing_predict(config_path: Path, *, build_type: str) -> int:
+def _launch_timing_predict(config_path: Path, *, build_type: str, dry_run: bool = False) -> int:
     from .timing_predict import main as timing_predict_main
 
+    argv = [str(config_path), "--build-type", build_type]
+    if dry_run:
+        argv.append("--dry-run")
     try:
         # A prediction is not complete until Analyzer has materialized its cost
         # subjects. In particular, unlocked optimality needs the cached grid-peak
         # sidecar; skipping analysis silently collapses R3 onto R2 in the UI.
-        return timing_predict_main([str(config_path), "--build-type", build_type])
+        return timing_predict_main(argv)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
@@ -422,20 +444,11 @@ def _launch_alignment_analysis(log_dir: Path, *, build_type: str, subjects: list
     if not analyzer_binary_path(build_type).is_file():
         print("[alignment] analyzer build failed", file=sys.stderr)
         return False
-    run_alignment_analysis(log_dir, build_type, subjects)
-    return True
+    return run_alignment_analysis(log_dir, build_type, subjects)
 
 
 def _run_sim(args: argparse.Namespace) -> int:
     preset = _load_simulation_preset(args.config)
-    overrides: list[str] = []
-    if args.gpu_time_multiplier_from is not None:
-        multiplier = _read_recommended_multiplier(args.gpu_time_multiplier_from)
-        overrides.append(f"pools.main.groups.0.worker.gpu_time_multiplier={multiplier}")
-        print(
-            f"[alignment] injecting worker.gpu_time_multiplier={multiplier} "
-            f"from kernel-align {args.gpu_time_multiplier_from}"
-        )
     print(f"[alignment] simulation: {args.config}")
     if not args.dry_run:
         io_config = preset.get("io")
@@ -452,12 +465,14 @@ def _run_sim(args: argparse.Namespace) -> int:
         build_type=args.build_type,
         refresh=args.refresh,
         no_analyze=args.no_analyze,
-        overrides=overrides,
     )
 
 
 def _run_profile(args: argparse.Namespace) -> int:
-    config = load_profile_config(args.config)
+    config = load_profile_config(
+        args.config,
+        require_python_runtime=not args.resume,
+    )
     if args.dry_run:
         print(f"[alignment] profile validated: {args.config} (log_dir={config.log_dir})")
         return 0
@@ -480,12 +495,30 @@ def _run_profile(args: argparse.Namespace) -> int:
 
 def _run_timing_predict(args: argparse.Namespace) -> int:
     config: TimingPredictPhaseConfig = load_timing_predict_config(args.config)
+    if args.dry_run:
+        # The same inputs, built where nothing reads them and removed afterwards.
+        with tempfile.TemporaryDirectory(prefix="alignment-timing-predict-") as scratch:
+            predict_config = _build_timing_predict_inputs(
+                config, Path(scratch), build_type=args.build_type
+            )
+            print(f"[alignment] timing-predict dry run: {args.config}")
+            return _launch_timing_predict(predict_config, build_type=args.build_type, dry_run=True)
     write_artifact_kind(config.log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
+    predict_config = _build_timing_predict_inputs(
+        config, config.log_dir, build_type=args.build_type
+    )
+    _snapshot_config(args.config, config.log_dir, "timing_predict")
+    print(f"[alignment] timing-predict: {predict_config}")
+    return _launch_timing_predict(predict_config, build_type=args.build_type)
+
+
+def _build_timing_predict_inputs(
+    config: TimingPredictPhaseConfig, output_dir: Path, *, build_type: str
+) -> Path:
+    """Write the measured cases and predictor config under `output_dir`; return the config."""
     # Read the sim *preset* (not a completed run): timing-predict is kernel-only,
-    # so it needs the gpu / arch / backends but never a finished simulation. This
-    # lets it run before the sim, so kernel-align can derive the multiplier the
-    # sim then bakes in.
-    preset = _load_simulation_preset(config.simulation_preset)
+    # so it needs the gpu / arch / backends but never a finished simulation.
+    preset = _normalize_simulation_preset(config.simulation_preset, build_type=build_type)
     gpu, arch = _simulation_target(preset)
     profile_result = _load_profile_result(config.profile_log_dir)
     # No profile/simulation parallelism pre-check here: every arch spells its
@@ -498,22 +531,55 @@ def _run_timing_predict(args: argparse.Namespace) -> int:
             simulation_preset=config.simulation_preset,
             profile_log_dir=config.profile_log_dir,
             parsed_nsys=_profile_artifact(profile_result, "parsed_nsys"),
-            output_dir=config.log_dir,
+            output_dir=output_dir,
             gpu=gpu,
             arch=arch,
-            backends=_preset_backends(preset),
+            backends=_simulation_backends(preset),
             input_spec=config.input_builder,
         )
     )
-    _snapshot_config(args.config, config.log_dir, "timing_predict")
-    print(f"[alignment] timing-predict: {build_result.predict_config}")
-    return _launch_timing_predict(build_result.predict_config, build_type=args.build_type)
+    return build_result.predict_config
+
+
+def _check_arrival_time_scale(manifest_path: Path) -> None:
+    """Refuse a simulation that replays the trace at another arrival scale.
+
+    Only the arrival-scale check blocks here; the rest of the request
+    population audit is reported, as the campaign metrics already do.
+    """
+    from alignment.request_population import (
+        ARRIVAL_TIME_SCALE_TOLERANCE,
+        audit_alignment_population,
+    )
+
+    if "replay_result" not in json.loads(manifest_path.read_text()):
+        return
+    try:
+        audit = audit_alignment_population(manifest_path, repo_root=REPO_ROOT)
+    except (KeyError, OSError, ValueError) as error:
+        print(f"[alignment] request population audit unavailable: {error}")
+        return
+    if not audit.get("available"):
+        return
+    if audit["checks"].get("arrival_time_scale_matches") is False:
+        measured = audit["arrival_time_scale"]
+        simulated = audit["simulated_arrival_time_scale"]
+        raise ValueError(
+            f"simulated arrival-time scale {simulated} differs from the measured replay's "
+            f"{measured} by more than {ARRIVAL_TIME_SCALE_TOLERANCE:.0%}; a trace_timed "
+            f"simulation divides trace offsets by `request_rate`, so it should be "
+            f"{1 / measured if measured else float('inf'):g}"
+        )
+    if not audit["all_ok"]:
+        failed = [name for name, ok in audit["checks"].items() if not ok]
+        print(f"[alignment] warning: request population audit failed: {failed}")
 
 
 def _run_analyze(args: argparse.Namespace) -> int:
     config = load_analyze_config(args.config)
     write_artifact_kind(config.log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
     manifest = _write_analysis_manifest(config)
+    _check_arrival_time_scale(manifest)
     _snapshot_config(args.config, config.log_dir, "analyze")
     print(f"[alignment] analyzer manifest: {manifest}")
     return (
@@ -525,9 +591,29 @@ def _run_analyze(args: argparse.Namespace) -> int:
     )
 
 
+def _run_compare(args: argparse.Namespace) -> int:
+    from .alignment_compare import compare_reports, render_comparison
+
+    if args.limit < 0:
+        raise ValueError("compare --limit must be nonnegative")
+    comparison = compare_reports(args.baseline, args.candidate)
+    if args.json:
+        print(json.dumps(comparison, indent=2))
+    else:
+        print(render_comparison(comparison, args.limit))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        if args.command == "prepare-workload":
+            from alignment.workload_input import prepare_workload
+
+            options = vars(args).copy()
+            options.pop("command")
+            print(json.dumps(prepare_workload(**options), indent=2))
+            return 0
         if args.command == "sim":
             return _run_sim(args)
         if args.command == "profile":
@@ -536,6 +622,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_timing_predict(args)
         if args.command == "analyze":
             return _run_analyze(args)
+        if args.command == "compare":
+            return _run_compare(args)
         raise AssertionError(f"unhandled alignment command {args.command!r}")
     except (KeyError, OSError, ValueError) as exc:
         print(f"[invalid] alignment {args.command}: {exc}", file=sys.stderr)

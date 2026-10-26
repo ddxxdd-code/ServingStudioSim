@@ -1,4 +1,4 @@
-//! GLM-5.2 DSA paged decode MQA-logits kernel.
+//! DSA paged decode MQA-logits kernel.
 //!
 //! The first cache stays on the physical `(batch_size, context_len)` coordinates.
 //! Its boundary points bracket the block-64 page seams, the 256-token DeepGEMM
@@ -135,7 +135,7 @@ mod tests {
     use serde_json::Value;
 
     const TORCH_BACKEND: &str = "torch";
-    const DEEPGEMM_BACKEND: &str = "vllm_deepgemm_fp8";
+    const DEEPGEMM_BACKEND: &str = "deepgemm_fp8";
     const BATCH_AXIS: &[f64] = &[
         1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 130.0, 131.0, 132.0, 133.0,
         185.0, 256.0, 384.0, 512.0,
@@ -149,10 +149,14 @@ mod tests {
     const FULL_MAX_MODEL_LEN: u32 = 1_048_576;
 
     fn config(max_model_len: u32) -> DsaPagedMqaLogitsDecodeKernelConfig {
+        config_with_next_n(1, max_model_len)
+    }
+
+    fn config_with_next_n(next_n: u32, max_model_len: u32) -> DsaPagedMqaLogitsDecodeKernelConfig {
         DsaPagedMqaLogitsDecodeKernelConfig {
             backends: vec![TORCH_BACKEND, DEEPGEMM_BACKEND],
             gpu_name: "NVIDIA H200".to_string(),
-            next_n: 1,
+            next_n,
             max_model_len: Dim::param("max_model_len", max_model_len),
             num_heads: Dim::param("num_index_heads", 64),
             head_dim: Dim::param("index_head_dim", 128),
@@ -166,6 +170,35 @@ mod tests {
             page_mapping: "unique_scattered".to_string(),
             cache_format: "page_planar_fp8_fp32_scale".to_string(),
             clean_logits: false,
+        }
+    }
+
+    /// The paged index cache is one page set per sequence, so verify width
+    /// changes what is measured but not the shape of the sweep. `next_n` must
+    /// therefore reach the payload — and so the cache identity — while leaving
+    /// the grid and the allocation guard alone; a `next_n` that never reached the
+    /// wire would silently reuse group-of-one timings for a group-of-six decode.
+    #[test]
+    fn wider_verify_groups_reach_the_payload_without_moving_the_grid() {
+        let baseline_cfg = config(FULL_MAX_MODEL_LEN);
+        let baseline_grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&baseline_cfg);
+        let baseline_mask =
+            DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&baseline_cfg, &baseline_grid);
+
+        for next_n in [1, 2, 6] {
+            let cfg = config_with_next_n(next_n, FULL_MAX_MODEL_LEN);
+            let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&cfg);
+            assert_eq!(grid.axes(), baseline_grid.axes());
+            assert_eq!(
+                DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&cfg, &grid),
+                baseline_mask
+            );
+
+            let payloads = DsaPagedMqaLogitsDecodeSpec::enumerate(&cfg, &grid, DEEPGEMM_BACKEND);
+            assert!(!payloads.is_empty());
+            for payload in &payloads {
+                assert_eq!(payload.fields().get("next_n"), Some(&Value::from(next_n)));
+            }
         }
     }
 

@@ -90,6 +90,8 @@ def _run_args(output_dir: Path | None, **overrides) -> SimpleNamespace:
         db=None,
         gpu_name="NVIDIA H200",
         force=False,
+        fresh=False,
+        energy=True,
         output_dir=output_dir,
         json=True,
     )
@@ -145,6 +147,17 @@ def test_resolve_gpu_spec_maps_aliases_and_dense_peaks() -> None:
     assert resolved.dense_peak_tflops("fp8_e4m3") == 1979.0
     assert resolved.dense_peak_tflops("totally-made-up-dtype") is None
     assert resolve_gpu_spec("Totally Made Up GPU") is None
+
+
+def test_dense_peak_tflops_reads_fp4_for_nvfp4_and_none_without_it() -> None:
+    b200 = resolve_gpu_spec("NVIDIA B200")
+    assert b200 is not None and b200.fp4_tflops == 9000.0
+    # NVFP4 carries fp8 group scales; its compute dtype must not read as fp8.
+    assert b200.dense_peak_tflops("nvfp4_e2m1") == 9000.0
+    assert b200.dense_peak_tflops("fp8_e4m3") == 4500.0
+    h200 = resolve_gpu_spec("NVIDIA H200")
+    assert h200 is not None and h200.fp4_tflops is None
+    assert h200.dense_peak_tflops("nvfp4_e2m1") is None
 
 
 def test_development_profile_writes_identity_and_cached_only_provenance(
@@ -639,6 +652,8 @@ def test_managed_measure_registration_carries_analyzer_resource_id(
             telemetry_hz=20.0,
             telemetry=True,
             clear_l2=True,
+            cuda_graph=False,
+            energy=True,
         )
     )
     assert exit_code == 0

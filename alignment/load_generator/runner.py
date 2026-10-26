@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 REQ_FRONTEND_ROOT = Path(__file__).resolve().parent / "req-frontend"
 REPLAY_MANIFEST = REQ_FRONTEND_ROOT / "Cargo.toml"
 SESSION_RUNNER = REQ_FRONTEND_ROOT / "target" / "release" / "session_runner"
+# Draws or materializes a canonical trace (`tracegen describe` lists its knobs).
+TRACEGEN = REQ_FRONTEND_ROOT / "target" / "release" / "tracegen"
 
 
 @dataclass(frozen=True)
@@ -71,8 +74,15 @@ def run_replay(
     *,
     base_url: str,
     model: str,
+    measurement_ready: Callable[[], None] | None = None,
+    routed_experts_dir: Path | None = None,
 ) -> dict:
-    """Replay the shared trace through its explicitly selected wire backend."""
+    """Replay the shared trace through its explicitly selected wire backend.
+
+    `routed_experts_dir` turns the replay non-streaming and collects the routes
+    the server took per request. The caller decides when that trade is worth
+    making; this layer only knows that it costs the per-event timeline.
+    """
     prepared.log_path.parent.mkdir(parents=True, exist_ok=True)
     protocol_base_url = (
         f"{base_url.rstrip('/')}/v1"
@@ -115,13 +125,47 @@ def run_replay(
             argv.extend([flag, str(value)])
     if config.context_limit_skip_enabled:
         argv.append("--skip-when-reaching-limit")
+    if config.warmup:
+        argv.append("--warmup")
+    if measurement_ready is not None:
+        argv.append("--measurement-gate")
+    if routed_experts_dir is not None:
+        argv.extend(["--routed-experts-dir", str(routed_experts_dir)])
     argv.extend(config.extra_args)
 
-    subprocess.run(argv, cwd=REPO_ROOT, check=True)
+    if measurement_ready is None:
+        subprocess.run(argv, cwd=REPO_ROOT, check=True)
+    else:
+        with subprocess.Popen(
+            argv, cwd=REPO_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        ) as proc:
+            released = False
+            try:
+                for line in proc.stdout:
+                    if line.rstrip("\n") == "REQ_FRONTEND_MEASUREMENT_READY_V1":
+                        if released:
+                            raise RuntimeError("duplicate frontend measurement boundary")
+                        measurement_ready()
+                        proc.stdin.write("continue\n")
+                        proc.stdin.flush()
+                        released = True
+                    else:
+                        print(line, end="", flush=True)
+                returncode = proc.wait()
+                if returncode:
+                    raise subprocess.CalledProcessError(returncode, argv)
+                if not released:
+                    raise RuntimeError("frontend exited without a measurement boundary")
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
     return {
         "source_trace": str(prepared.trace_path.resolve()),
         "frontend_type": config.frontend.type,
         "backend_type": config.backend.type,
         "log_path": str(prepared.log_path),
         "summary_path": str(prepared.summary_path),
+        "warmup": config.warmup,
+        "routed_experts_dir": str(routed_experts_dir) if routed_experts_dir else None,
     }

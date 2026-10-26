@@ -1,4 +1,4 @@
-"""L7 launcher unit tests (structured config interface, new-interface-design §11).
+"""L7 launcher unit tests for the structured config interface.
 
 Most tests run against an inline `Registry` fixture (deterministic, no build
 dependency); a few integration tests load the real Rust-generated schema /
@@ -23,11 +23,14 @@ from launcher.cache_build import cache_key
 from launcher.exec import (
     _build_subprocess_env,
     _cargo_build_env,
+    _launcher_python,
     _run_capture,
     binary_path,
     run_analysis,
+    run_essential_analysis,
     run_iter_breakdown,
     run_logged_process,
+    run_sweep_analysis,
 )
 from launcher.process import ProcessResult
 from launcher.process.artifacts import ArtifactValidation
@@ -174,13 +177,6 @@ _FIXTURE = {
                 "choices": ["trace_timed", "saturated"],
                 "description": "",
             },
-            {
-                "name": "session_dependency",
-                "type": "string",
-                "required": True,
-                "choices": ["independent", "chained"],
-                "description": "",
-            },
         ],
         "io": [
             {"name": "log_dir", "type": "path", "default": "logs", "description": ""},
@@ -216,7 +212,6 @@ def _base(*, arch=None, worker=None, log_dir="logs/x", **extra):
             "trace_files": ["t.csv"],
             "input_file_format": "text-generation-independent",
             "arrival_mode": "trace_timed",
-            "session_dependency": "independent",
         },
         "io": {"log_dir": log_dir},
         "pools": {
@@ -316,6 +311,115 @@ def test_run_analysis_delegates_both_optimality_modes_to_analyzer(monkeypatch, t
     assert analyzer_run_commands == [[str(analyzer_path), "run", str(log_dir), "optimality"]]
 
 
+@pytest.mark.parametrize("render", [True, False])
+def test_run_analysis_renders_only_when_asked(monkeypatch, tmp_path, render):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "run"
+    log_dir.mkdir()
+    (log_dir / "stdout.log").write_text("")
+    stages: list[str] = []
+
+    async def supervise(spec):
+        stages.append(spec.name)
+        return ProcessResult(
+            argv=tuple(str(argument) for argument in spec.argv),
+            pid=1,
+            process_group_id=1,
+            exit_code=0,
+            elapsed_seconds=0.0,
+        )
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._PROCESS_SUPERVISOR.run", supervise)
+    for validator in (
+        "validate_json_outputs",
+        "validate_render_artifacts",
+        "validate_trace_artifacts",
+    ):
+        monkeypatch.setattr(f"launcher.exec.{validator}", lambda _path: ArtifactValidation(()))
+
+    asyncio.run(run_analysis(log_dir, render=render))
+
+    assert sorted(stages) == sorted(["analyze_compute", "trace", *(["render"] if render else [])])
+
+
+def _analysis_harness(monkeypatch, tmp_path, supervise):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "run"
+    log_dir.mkdir()
+    (log_dir / "stdout.log").write_text("")
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._PROCESS_SUPERVISOR.run", supervise)
+    for validator in (
+        "validate_json_outputs",
+        "validate_render_artifacts",
+        "validate_trace_artifacts",
+    ):
+        monkeypatch.setattr(f"launcher.exec.{validator}", lambda _path: ArtifactValidation(()))
+    return log_dir
+
+
+def _succeeded(spec):
+    return ProcessResult(
+        argv=tuple(str(argument) for argument in spec.argv),
+        pid=1,
+        process_group_id=1,
+        exit_code=0,
+        elapsed_seconds=0.0,
+    )
+
+
+def test_render_only_skips_compute_and_trace(monkeypatch, tmp_path):
+    stages: list[str] = []
+
+    async def supervise(spec):
+        stages.append(spec.name)
+        return _succeeded(spec)
+
+    log_dir = _analysis_harness(monkeypatch, tmp_path, supervise)
+    asyncio.run(run_analysis(log_dir, render_only=True))
+
+    assert stages == ["render"]
+
+
+def test_a_render_that_cannot_start_waits_for_the_trace(monkeypatch, tmp_path):
+    finished: list[str] = []
+
+    async def supervise(spec):
+        if spec.name == "render":
+            raise OSError("cannot spawn the renderer")
+        await asyncio.sleep(0.05)
+        finished.append(spec.name)
+        return _succeeded(spec)
+
+    log_dir = _analysis_harness(monkeypatch, tmp_path, supervise)
+    with pytest.raises(OSError, match="cannot spawn"):
+        asyncio.run(run_analysis(log_dir))
+
+    assert finished == ["analyze_compute", "trace"]
+
+
+@pytest.mark.parametrize("render", [True, False])
+def test_sweep_analysis_renders_only_when_asked(monkeypatch, tmp_path, render):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    commands: list[list[str]] = []
+
+    def capture(argv):
+        commands.append([str(argument) for argument in argv])
+        return 0, ""
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._run_capture_sync", capture)
+
+    run_sweep_analysis(tmp_path, render=render)
+
+    assert [command[1] for command in commands if command[0] == str(analyzer_path)] == ["sweep"]
+    assert any("render" in command for command in commands) == render
+
+
 def test_run_capture_avoids_asyncio_subprocess_transport(monkeypatch):
     async def reject_asyncio_subprocess(*_arguments, **_keyword_arguments):
         raise AssertionError("analysis capture must not use the asyncio subprocess transport")
@@ -362,8 +466,40 @@ def test_iter_breakdown_uses_shared_process_supervisor(monkeypatch, tmp_path):
 
     asyncio.run(run_iter_breakdown(log_dir))
 
-    assert captured_commands == [[str(analyzer_path), "gen-iter-breakdown", str(log_dir)]]
+    assert captured_commands == [
+        [str(analyzer_path), "gen-iter-breakdown", str(log_dir), "--max-iters", str(2**31)]
+    ]
     assert "generated" in (log_dir / "stdout.log").read_text()
+
+
+def test_essential_analysis_runs_only_the_breakdown_and_the_kernel_ranking(monkeypatch, tmp_path):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "prediction"
+    log_dir.mkdir()
+    captured_commands: list[list[str]] = []
+
+    async def supervise(spec):
+        command = [str(argument) for argument in spec.argv]
+        captured_commands.append(command)
+        return ProcessResult(
+            argv=tuple(command),
+            pid=1,
+            process_group_id=1,
+            exit_code=0,
+            elapsed_seconds=0.0,
+            output="",
+        )
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._PROCESS_SUPERVISOR.run", supervise)
+
+    asyncio.run(run_essential_analysis(log_dir))
+
+    assert captured_commands == [
+        [str(analyzer_path), "gen-iter-breakdown", str(log_dir), "--max-iters", str(2**31)],
+        [str(analyzer_path), "run", str(log_dir), "kernel-time-share"],
+    ]
 
 
 # ── validation ──────────────────────────────────────────────────────────────
@@ -385,12 +521,11 @@ def test_validate_rejects_legacy_replay_mode(schema):
     assert any("workload.replay_mode" in error and "unknown" in error for error in errs)
 
 
-@pytest.mark.parametrize("axis", ["arrival_mode", "session_dependency"])
-def test_validate_requires_both_replay_axes(schema, axis):
+def test_validate_requires_the_arrival_mode(schema):
     preset = _base()
-    del preset["workload"][axis]
+    del preset["workload"]["arrival_mode"]
     errs = validate_params(preset, schema)
-    assert any(axis in error and "required" in error for error in errs)
+    assert any("arrival_mode" in error and "required" in error for error in errs)
 
 
 def test_validate_unknown_arch_payload_key(schema):
@@ -1303,7 +1438,6 @@ def test_readme_worked_example(schema):
             "trace_files": ["trace/aime_long.csv"],
             "input_file_format": "text-generation-independent",
             "arrival_mode": "trace_timed",
-            "session_dependency": "independent",
         },
         "io": {"log_dir": "logs/pd_{prefill_tp}_d{decode_tp}tp_r{decode_replicas}_{batch}"},
         "pools": {
@@ -1413,6 +1547,15 @@ def test_cache_key_distinguishes_tp(schema):
     assert cache_key(a, schema) != cache_key(b, schema)
 
 
+def test_cache_key_distinguishes_arch_type(schema):
+    # Provider tags are not ParamDefs; two arch tags with the same params build
+    # different kernels.
+    a = normalize_params(_base(arch={"type": "llama3_dense_tp", "tp_size": 4}), schema)
+    b = normalize_params(_base(arch={"type": "llama3_dense_tp", "tp_size": 4}), schema)
+    b["pools"]["main"]["groups"][0]["arch"]["type"] = "llama3_dense"
+    assert cache_key(a, schema) != cache_key(b, schema)
+
+
 def test_cache_key_from_real_schema():
     try:
         real = load_schema("debug")
@@ -1428,6 +1571,8 @@ def test_cache_key_from_real_schema():
     keys = {path for path, _ in cache_key(cfg, real)}
     assert any(k.endswith("arch.model_config") for k in keys)
     assert any(k.endswith("arch.tp_size") for k in keys)
+    # the group's GPU is the profile.db key
+    assert any(k.endswith("groups.0.gpu") for k in keys)
     assert not any("request_rate" in k or "log_dir" in k for k in keys)
 
 
@@ -1639,12 +1784,15 @@ def test_aggregate_calls_rust_sweep_pipeline(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         "launcher.sweep.run_sweep_analysis",
-        lambda experiment_dir, build_type: calls.append((experiment_dir, build_type)),
+        lambda experiment_dir, build_type, *, render: calls.append(
+            (experiment_dir, build_type, render)
+        ),
     )
 
     _aggregate(tmp_path, "release")
+    _aggregate(tmp_path, "release", plot=False)
 
-    assert calls == [(tmp_path, "release")]
+    assert calls == [(tmp_path, "release", True), (tmp_path, "release", False)]
 
 
 # ── real subprocess plumbing (uses the built binary) ────────────────────────
@@ -1658,10 +1806,27 @@ def test_cargo_build_env_pins_launcher_python_and_drops_runtime_paths(
 
     env = _cargo_build_env()
 
-    assert env["PYTHON"] == sys.executable
-    assert env["PYO3_PYTHON"] == sys.executable
+    assert env["PYTHON"] == _launcher_python()
+    assert env["PYO3_PYTHON"] == _launcher_python()
     assert "PYTHONHOME" not in env
     assert "PYTHONPATH" not in env
+
+
+def test_launcher_python_collapses_venv_spellings_without_leaving_the_venv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    base = tmp_path / "base" / "python3.12"
+    base.parent.mkdir()
+    base.write_text("")
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").symlink_to(base)
+    (bin_dir / "python3").symlink_to("python")
+    (bin_dir / "python3.12").symlink_to("python")
+
+    for spelling in ("python", "python3", "python3.12"):
+        monkeypatch.setattr(sys, "executable", str(bin_dir / spelling))
+        assert _launcher_python() == str(bin_dir / "python")
 
 
 def test_logged_process_captures_stdout(tmp_path):
@@ -1681,7 +1846,6 @@ def test_logged_process_captures_stdout(tmp_path):
                     "run_to_end": False,
                     "request_rate": 10.0,
                     "arrival_mode": "trace_timed",
-                    "session_dependency": "independent",
                 },
                 "io": {
                     "log_dir": str(tmp_path),
@@ -1742,6 +1906,30 @@ def test_resume_skips_completed_run(tmp_path, schema, monkeypatch):
     )
     params = normalize_params(_base(log_dir=str(log_dir)), schema)
     assert asyncio.run(_run_single_async(params, None, schema, "debug")) is True
+
+
+@pytest.mark.parametrize("plot", [True, False])
+def test_resume_renders_a_run_finished_without_plots(tmp_path, schema, monkeypatch, plot):
+    log_dir = tmp_path / "run"
+    (log_dir / "payloads").mkdir(parents=True)
+    (log_dir / "payloads" / "slo_general_cdf.json").write_text("{}")
+    _mark_complete(log_dir)
+    monkeypatch.setattr(
+        "launcher.sweep.validate_simulation_artifacts",
+        lambda _log_dir: ArtifactValidation(()),
+    )
+    calls: list[dict] = []
+
+    async def analysis(_log_dir, _build_type, _subjects, **options):
+        calls.append(options)
+
+    monkeypatch.setattr("launcher.sweep.run_analysis", analysis)
+    params = normalize_params(_base(log_dir=str(log_dir)), schema)
+
+    assert asyncio.run(_launch_one(params, "debug", render=plot)) is True
+    assert asyncio.run(_run_single_async(params, None, schema, "debug", plot=plot)) is True
+
+    assert calls == ([{"render_only": True}] * 2 if plot else [])
 
 
 def test_public_run_entrypoints_require_explicit_schema():
@@ -1943,3 +2131,215 @@ def test_real_schema_shape():
     assert "barebone" in real.worker_tags("iter_wise")
     tp = next(p for p in real.arch_params("iter_wise", "llama3_dense_tp") if p["name"] == "tp_size")
     assert tp["affects_cache"] is True
+
+
+# ── energy policy ────────────────────────────────────────────────────────────
+#
+# `energy:` decides whether profiling opens the NVML window. It defaults to off
+# because the window is a second ~500 ms loop per spec: on a clean tp4/ep4 fill
+# it cost more than the timing it accompanies (64 rms_norm specs took 3.57 s
+# with it off and 77.95 s with it on). Turning it on also requires that every
+# row the simulator consumes actually carries energy, because `energy_j = 0.0`
+# means "not measured" and would otherwise reach the output parquet as zero
+# joules.
+
+
+def _energy_env(monkeypatch):
+    from launcher.__main__ import _apply_energy_policy
+    from profiling.profilers import energy
+
+    monkeypatch.delenv(energy.ENERGY_ENV, raising=False)
+    monkeypatch.delenv(energy.REQUIRE_ENERGY_ENV, raising=False)
+    return _apply_energy_policy, energy
+
+
+def test_energy_defaults_off_when_no_preset_or_flag_says_otherwise(monkeypatch):
+    apply, energy = _energy_env(monkeypatch)
+    assert apply(None, [None], ["p.yaml"]) is True
+    assert energy.energy_enabled() is False
+    assert energy.require_measured_energy() is False
+
+
+def test_energy_true_in_a_preset_also_requires_rows_to_carry_it(monkeypatch):
+    apply, energy = _energy_env(monkeypatch)
+    assert apply(None, [True], ["p.yaml"]) is True
+    assert energy.energy_enabled() is True
+    # The second half of the switch: asking for energy means a cache filled
+    # without it is an error, not a silent zero.
+    assert energy.require_measured_energy() is True
+
+
+def test_energy_flag_overrides_the_preset(monkeypatch):
+    apply, energy = _energy_env(monkeypatch)
+    assert apply(False, [True], ["p.yaml"]) is True
+    assert energy.energy_enabled() is False
+    assert energy.require_measured_energy() is False
+
+
+def test_energy_rejects_presets_that_disagree(monkeypatch, capsys):
+    """One batch is one process and therefore one measurement policy, so a
+    last-wins would silently measure some presets and not others."""
+
+    apply, _ = _energy_env(monkeypatch)
+    assert apply(None, [True, False], ["a.yaml", "b.yaml"]) is False
+    assert "disagree on `energy:`" in capsys.readouterr().err
+
+
+def test_energy_rejects_a_non_boolean(monkeypatch, capsys):
+    apply, _ = _energy_env(monkeypatch)
+    assert apply(None, ["maybe"], ["p.yaml"]) is False
+    assert "must be true or false" in capsys.readouterr().err
+
+
+def test_simulation_refuses_rows_whose_energy_was_never_measured(monkeypatch):
+    """The check the launcher arms: a row with energy_j = 0.0 cannot answer a
+    run that asked for energy, so it fails at the shared facade core rather than
+    becoming a plausible zero in the output parquet."""
+
+    from profiling.facade import UnmeasuredEnergyError, _reject_unmeasured_energy
+    from profiling.profilers import energy
+    from profiling.runners.metrics import ComputeMetrics
+
+    monkeypatch.setenv(energy.REQUIRE_ENERGY_ENV, "1")
+    measured = ComputeMetrics(
+        time_ms=1.0, tflops=2.0, memory_bandwidth_gbps=3.0, energy_j=4.0
+    )
+    unmeasured = ComputeMetrics(
+        time_ms=1.0, tflops=2.0, memory_bandwidth_gbps=3.0, energy_j=0.0
+    )
+
+    _reject_unmeasured_energy([measured], "single_gemm", "torch_linear", "NVIDIA B200")
+
+    with pytest.raises(UnmeasuredEnergyError, match="not measured"):
+        _reject_unmeasured_energy(
+            [measured, unmeasured], "single_gemm", "torch_linear", "NVIDIA B200"
+        )
+
+    # Timing-only runs are a legitimate use of the same rows.
+    monkeypatch.setenv(energy.REQUIRE_ENERGY_ENV, "0")
+    _reject_unmeasured_energy([unmeasured], "single_gemm", "torch_linear", "NVIDIA B200")
+
+
+def test_energy_requirement_does_not_reject_comm_rows(monkeypatch):
+    """`CommMetrics.energy_j` is a structural zero, not a skipped measurement.
+
+    No comm runner has ever measured it. Judging it by the compute rule made
+    `energy: true` raise on the first all-reduce of any tp>1 run, with a message
+    telling the user to re-profile with energy on -- which could never succeed,
+    so the run was unfixably broken rather than merely wrong.
+    """
+
+    from profiling.facade import _reject_unmeasured_energy
+    from profiling.profilers import energy
+    from profiling.runners.metrics import CommMetrics
+
+    monkeypatch.setenv(energy.REQUIRE_ENERGY_ENV, "1")
+    comm = CommMetrics(time_ms=1.0, algbw_gbps=2.0, busbw_gbps=3.0)
+    assert comm.energy_j == 0.0
+
+    _reject_unmeasured_energy([comm], "all_reduce", "nccl", "NVIDIA B200")
+
+
+def test_energy_leaves_an_exported_policy_alone_when_nothing_states_one(monkeypatch):
+    """No flag and no preset key means the launcher has no opinion to record.
+
+    Settling it anyway wrote `VIBESIM_PROFILE_ENERGY=0` into the simulator
+    child's environment, so `VIBESIM_PROFILE_ENERGY=1 python -m launcher ...`
+    measured no energy. The CLI already guards the same way.
+    """
+
+    apply, energy = _energy_env(monkeypatch)
+    monkeypatch.setenv(energy.ENERGY_ENV, "1")
+
+    assert apply(None, [None], ["p.yaml"]) is True
+    assert energy.energy_enabled() is True
+
+
+def test_energy_flag_still_overrides_an_exported_policy(monkeypatch):
+    apply, energy = _energy_env(monkeypatch)
+    monkeypatch.setenv(energy.ENERGY_ENV, "1")
+
+    assert apply(False, [None], ["p.yaml"]) is True
+    assert energy.energy_enabled() is False
+
+
+def test_a_multi_preset_batch_gives_each_preset_its_own_manifest_coordinate(
+    tmp_path, schema, monkeypatch
+):
+    """Two presets sweeping the same axis into one experiment root used to write
+    duplicate manifest coordinates, so the sweep aggregate refused them."""
+    import launcher.exec as exec_module
+    import launcher.sweep as sweep_module
+    from launcher import __main__ as main_module
+
+    root = tmp_path / "exp"
+    for name, model in (("pp8", "m.json"), ("dp", "n.json")):
+        (tmp_path / f"{name}.json").write_text(
+            json.dumps(
+                _base(
+                    arch={"type": "llama3_dense_tp", "tp_size": "${ptp}", "model_config": model},
+                    sweep={"ptp": [1, 2]},
+                    log_dir=str(root / name / "tp{ptp}"),
+                )
+            )
+        )
+    seen = []
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
+    monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
+    monkeypatch.setattr(sweep_module, "run_sweep", lambda candidates, *a, **k: seen.extend(candidates) or 0)
+
+    assert main_module.main([str(tmp_path / "pp8.json"), str(tmp_path / "dp.json")]) == 0
+
+    manifest = json.loads(_write_sweep_manifest(seen, root).read_text())
+    assert manifest["axes"] == ["ptp", "preset"]
+    coordinates = [tuple(run["coordinates"].values()) for run in manifest["runs"]]
+    assert sorted(coordinates) == [(1, "dp"), (1, "pp8"), (2, "dp"), (2, "pp8")]
+
+
+def test_a_multi_preset_batch_rejects_presets_with_the_same_file_name(
+    tmp_path, schema, monkeypatch, capsys
+):
+    import launcher.exec as exec_module
+    from launcher import __main__ as main_module
+
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir()
+        (tmp_path / sub / "preset.json").write_text(json.dumps(_base(log_dir=f"logs/{sub}")))
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
+    monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
+
+    argv = [str(tmp_path / "a" / "preset.json"), str(tmp_path / "b" / "preset.json"), "--dry-run"]
+    assert main_module.main(argv) == 2
+    assert "distinct file names" in capsys.readouterr().err
+
+
+def test_parallelism_flag_caps_the_sweep_and_rejects_zero(tmp_path, schema, monkeypatch, capsys):
+    """`--parallelism` must reach run_sweep, its absence must keep run_sweep's
+    default, and a zero cap (a sweep that never starts) must be refused."""
+    import launcher.exec as exec_module
+    import launcher.sweep as sweep_module
+    from launcher import __main__ as main_module
+
+    preset = tmp_path / "p.json"
+    preset.write_text(
+        json.dumps(
+            _base(
+                arch={"type": "llama3_dense_tp", "tp_size": "${ptp}", "model_config": "m.json"},
+                sweep={"ptp": [1, 2]},
+                log_dir=str(tmp_path / "exp" / "tp{ptp}"),
+            )
+        )
+    )
+    calls = []
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
+    monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
+    monkeypatch.setattr(sweep_module, "run_sweep", lambda *a, **k: calls.append(k) or 0)
+
+    assert main_module.main([str(preset), "--parallelism", "4"]) == 0
+    assert main_module.main([str(preset)]) == 0
+    assert calls[0]["parallelism"] == 4
+    assert "parallelism" not in calls[1]
+
+    with pytest.raises(SystemExit):
+        main_module.main([str(preset), "--parallelism", "0"])
+    assert "must be at least 1" in capsys.readouterr().err

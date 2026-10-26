@@ -1,4 +1,4 @@
-# VibeSim Launcher (L7)
+# ServingStudio Sim Launcher (L7)
 
 The **run interface**: turn a **preset** (a JSON/YAML config) into one or more
 reproducible invocations of the Rust `simulator` binary. The launcher owns
@@ -8,8 +8,7 @@ repro metadata, spawning runs in parallel, and kicking off post-run analysis. It
 contains **no simulation logic**; the Rust binary does the actual work.
 
 This is the practical, code-matching reference. For the layer overview see
-`doc/detailed_design/L7.md`; the archived config-tree design intent is
-`old-doc/new-interface-design.md`. If this file disagrees with the code, the code wins — open an issue.
+`doc/detailed_design/L7.md`. If this file disagrees with the code, the code wins.
 
 ## What it exposes / what it requires
 
@@ -36,14 +35,48 @@ This is the practical, code-matching reference. For the layer overview see
 - Optionally the standalone **`analyzer`** crate + its Python renderer (post-run
   analysis is best-effort; a missing analyzer never fails a run).
 
+## Managed Agent Callbacks
+
+Agent processes provide a short-lived capability context via
+`VIBESIM_MANAGED_JOB_CONTEXT`, falling back to `VIBESIM_MANAGED_RUN_CONTEXT`
+only when the preferred variable is empty. Both simulation and typed jobs use
+this precedence. A configured but unreadable or invalid context is fatal;
+commands never silently become unmanaged after such a failure.
+
+The context remains schema version 1. An absent `managed_jobs_api` selects the
+legacy `/api/internal/managed-runs` or `/api/internal/managed-jobs` callback
+family. The explicit value `"agent-v1"` selects
+`/api/agent/v1/internal/jobs` for all four kinds: simulation, timing prediction,
+kernel profiling, and kernel measurement. Other values, including null, fail
+before any HTTP request. The Agent backend owns the context and its capability.
+
+Register at the selected prefix's `/register` before creating official
+artifacts. Post lifecycle status to `/{job_id}/status` under the same prefix.
+The client never switches endpoints after an HTTP failure: the server may
+already have accepted the request. It checks approved output paths and retains
+existing status deduplication. Descriptor and summary fields remain transmitted
+for compatibility but are currently ignored by the Agent server; Analyzer owns
+the numerical results.
+
+Without a context, developer commands remain local and simulation writes its
+stable development metadata. Existing workspace copies retain their old
+launcher clients after an image rebuild, so the backend must retain legacy
+callbacks until those copies are migrated.
+
 ## Directory map
 
 ```
 __main__.py    CLI entry. Thin dispatch only: parse argv, apply --override,
                build once, then validate → expand → (dry-run | cache-report |
-               run_single | run_sweep). No sim logic.
+               kv-report | run_single | run_sweep). No sim logic.
 alignment.py   Explicit alignment stage entry: sim, profile, timing-predict, and
                analyze. No stage implicitly starts the next one.
+alignment_campaign/
+               The layer above those stages: drive a whole matrix of alignment
+               cases from a declarative pack. Fans ONE phase out over N cases;
+               never chains phases. See its own README.
+golden.py      The per-GPU golden store (`tests/golden/<metric>/<gpu>.json`),
+               shared by `pytest --update-golden` and campaign `--record`.
 timing_predict.py
                Offline per-building-block timing prediction from a minimal
                YAML/JSON config; bypasses deployment schema expansion and DES.
@@ -61,6 +94,21 @@ schema/        The single source of param truth on the Python side. Per-param
                  grammar gate that stays in lock-step with it).
   argv.py        Concrete config tree → config file on disk + [binary, sub, path].
 
+binaries.py    Where the simulator/analyzer/schema live: `target/<build>/`, or a
+               prebuilt, source-pinned set under `VIBESIM_BIN_DIR`.
+source_stamp.py
+               `.source-stamp.json`: git provenance for a tree shipped without
+               `.git` (read by `metadata.save_git_snapshot` and profile.db rows).
+remote/        `--remote NAME`: run a command on another machine and copy the
+               results back (see Remote execution below).
+  config.py      remote.yaml lookup and validation, `--remote-set`.
+  transport.py   Local or ssh (BatchMode, shared connection) commands and rsync.
+  source.py      The shipped file list, its version, venv key and stamp.
+  layout.py      The remote workdir layout.
+  launch.py      direct (setsid) or Slurm (sbatch) jobs: submit, poll, cancel.
+  image_send.py  Send a profiler image: only the layers the remote lacks.
+  node.py        The remote side: build a version, run one job, prune.
+  run.py         The sending side: plan, register, ship, run, relay, copy back.
 exec.py        cargo_build (+ schema discovery, INV-8), the PyO3 subprocess env,
                supervised stage adapters, `run_analysis`, and the measured-profile
                `run_alignment_analysis` handoff.
@@ -68,6 +116,8 @@ sweep.py       Top-level flow: `run_single` / `run_sweep`. Resume markers,
                resource-scheduled parallel launch, sweep-axis aggregation contract.
 cache_build.py Prebuild profile.db per unique cache key, sequentially (INV-3),
                so parallel runs don't race the GPU / SQLite. `--cache-report`.
+kv_report.py   `--kv-report[-json]`: the binary's structure-only `kv-cache` report
+               per distinct candidate.
 metadata.py    Repro metadata written BEFORE spawn (INV-2): preset.json,
                git_snapshot/, raw/params.json, command.txt, manifest.json.
 
@@ -78,6 +128,9 @@ process/       The only child-process lifecycle implementation.
   leases.py      Cross-launcher shared/exclusive resource leases (`flock`).
   journal.py     Atomic `.launcher/` stage state and process identity records.
   artifacts.py   JSON/parquet/render/trace completion contracts.
+  markers.py     The `.complete` marker (INV-5): written only after a zero exit,
+                 replaced atomically. A claim about exit status, not artifacts —
+                 each caller pairs it with its own artifact validator.
 
 workflow/      Explicit stage topology and in-process resource scheduling.
   plan.py        Stage DAG; `--no-analyze` removes optional analysis nodes.
@@ -101,7 +154,8 @@ workflow/      Explicit stage topology and in-process resource scheduling.
 4. **Guard:** reject duplicate `log_dir`s across the whole plan
    (`validate_unique_log_dirs`).
 5. **Branch:** `--dry-run` prints the expanded configs and stops; `--cache-report`
-   probes coverage and stops; otherwise hand off to `sweep`.
+   probes coverage and stops; `--kv-report` prints KV capacity and stops;
+   otherwise hand off to `sweep`.
 6. **Run** (`sweep.run_single` / `run_sweep`): ensure cache → simulate → validate
    raw artifacts → optional analyzer compute/render/trace → finalize. A sweep
    schedules simulations and analysis independently instead of making one
@@ -147,6 +201,14 @@ EnsureCache → Simulate → ValidateRawArtifacts
 `ValidateRawArtifacts → Finalize`. BuildSimulator and BuildAnalyzer are batch
 stages before this per-run graph.
 
+`--no-plot` removes only `Render`, so `Trace → Finalize`, and the sweep skips
+its aggregate render too. Every run still gets its reports, payloads and trace,
+which the Analyzer UI reads. PNGs are the largest cost of a big grid: on a
+640-run Llama-3-8B sweep the renderer took ~22 CPU-s per run (16 forked
+matplotlib workers, 50 figures) against ~3 CPU-s for the simulation, 73% of the
+sweep's CPU, and `--no-plot` halved the sweep's wall time. Draw one run
+afterwards with `python analyzer/python render <run log_dir>`.
+
 Two concurrency mechanisms have different ownership:
 
 | Resource | Lease | Meaning |
@@ -182,7 +244,6 @@ workload:                        # run-global workload params
   trace_files: ["trace/smoke.csv"]
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
 io:                              # run-global output + logging
   log_dir: "logs/tp{tensor_parallel}"   # {name} drops a sweep value into the path
 pools:
@@ -334,7 +395,6 @@ workload:
     - trace/aime_long.csv
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
   duration_ms: 20000.0
   run_to_end: true
   request_rate: 12.0
@@ -533,6 +593,41 @@ only in non-kernel params (request rate, replicas, `log_dir`, …) collapse to o
 prebuild. `--cache-report` runs the binary's `dry-run` per key to show coverage
 without building anything.
 
+### `energy:` — measure NVML energy, or refuse rows that lack it
+
+```yaml
+energy: false     # default; may be omitted
+```
+`--energy` / `--no-energy` override it for one invocation. A batch shares one
+process and therefore one policy, so presets that disagree are rejected rather
+than last-wins.
+
+**Off by default because the window is expensive.** `Energy.perf` opens a second
+loop per spec that runs for a fixed `DEFAULT_MIN_DURATION_MS` (500 ms) plus
+warmup and a `pynvml.nvmlInit()`. Measured on B200: 64 `rms_norm` specs profile
+in 3.57 s with it off and 77.95 s with it on, and on a clean tp4/ep4 fill it was
+the single largest cost — larger than the CUPTI timing it accompanies. Nothing
+in the timing path needs it.
+
+**On means rows must actually carry it.** `energy_j = 0.0` means "not measured"
+on every path that can produce it (window skipped, pynvml absent, NVML handle
+unresolvable, column default), and the simulator writes the value straight into
+its output parquet — where a cache filled without the window reads as a run that
+drew no power. So `energy: true` also sets `VIBESIM_REQUIRE_ENERGY`, and
+`profiling.facade` raises `UnmeasuredEnergyError` naming the kernel, backend and
+count as soon as such a row is read. Re-profile those rows with energy on, or
+run `energy: false` and read the zeros for what they are.
+
+The policy is not a `RunConfig` field: the code that honours it is `Energy.perf`,
+read from 96 runner call sites whose signatures carry only the kernel's own
+arguments. So it is settled as process state (`set_energy_enabled`) and each
+spawn carries it into the child by writing it into that child's input —
+the simulator binary gets `VIBESIM_PROFILE_ENERGY` / `VIBESIM_REQUIRE_ENERGY` in
+the environment `launcher.exec` builds for it, and a profiling worker gets an
+`energy` key in the JSON payload, the same on the host path and the container
+path. Exporting the two variables yourself still works as the outermost default;
+an explicit flag or preset key overrides them without writing them back.
+
 ## Resume & output layout
 
 - **Resume (default):** `.complete` is only a finalize commit, not proof by
@@ -583,19 +678,27 @@ silently mixing incompatible sweep geometries.
 ```
 python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--override path=value ...]
-                   [--dry-run] [--cache-report] [--refresh]
+                   [--dry-run] [--cache-report] [--kv-report | --kv-report-json]
+                   [--refresh]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
-                   [--no-analyze] [--emit-backends [FILE]]
+                   [--energy | --no-energy]
+                   [--no-analyze] [--no-plot] [--emit-backends [FILE]]
 python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
-                   [--build-type <cargo-profile>] [--no-analyze]
-python -m launcher kernel-profile {list,query,count-missing,run,measure} ...
+                   [--build-type <cargo-profile>]
+                   [--no-analyze | --analyzer-essential-only] [--no-plot] [--dry-run]
+python -m launcher kernel-profile {list,query,count-missing,run,measure,merge-db,audit-provenance} ...
 python -m launcher list-params [--human] [--build-type ...]
 python -m launcher alignment sim <simulation.yaml|json> [simulation options]
 python -m launcher alignment profile <profile.yaml|json> [--dry-run]
-python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...]
+python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...] [--dry-run]
 python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
+python -m launcher alignment-campaign {check,render,run,label,extract,compare} ...
 python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
 ```
+
+Global options may be added anywhere to any of these commands (`launcher/cli.py`
+takes them off before dispatch): `--no-gpu`, and `--remote NAME` with repeatable
+`--remote-set key=value` (see Remote execution).
 
 - Simulation presets, timing-predict configs, and all alignment stage inputs
   accept YAML (`.yaml` / `.yml`) or JSON.
@@ -606,10 +709,26 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
   when possible, else kept as a bare string.
 - `--dry-run` validates + expands + prints the resolved configs; spawns nothing.
 - `--cache-report` reports profile.db coverage per unique cache key, then exits.
+- `--kv-report` prints each KV pool's layout, what one request at `max_model_len`
+  holds per part, and the max concurrency under both `kv_overhead` modes, then
+  exits (`kv_report.py`). It runs the binary's `kv-cache` subcommand, which
+  builds structure only: no profile.db, GPU or log_dir. Candidates differing only
+  in `workload`/`io` run once, and identical reports print once under every
+  run's log_dir. `--kv-report-json` prints one document,
+  `{schema_version, reports: [{log_dirs, kv_cache}]}`, where `kv_cache` is the
+  run's `raw/kv_cache.json`.
 - `--emit-backends [FILE]` enumerates the distinct kernels (structural, no GPU) and
   writes the annotated `backends:` skeleton (stdout, or `FILE`), then exits — the
   starting point for a `backends_file` (see the `backends` section above).
 - `--profile` wraps a single run with `perf record` (skill `operate-profile-sim-speed`).
+- `--no-gpu` (any mode, or `SERVINGSTUDIO_NO_GPU=1`) guarantees the command uses
+  no GPU. The launcher sets the variable and empties `CUDA_VISIBLE_DEVICES` for
+  itself and every child. Each GPU entry point in `profiling/` and
+  `alignment/runner.py` checks it (`profiling/gpu_policy.py`), so a step that
+  needs a GPU fails and names itself: a cache prebuild with missing rows
+  (before any builder starts), a timing-predict JIT fill, `kernel-profile
+  run`/`measure`, and an `alignment profile` capture (`--resume` still works).
+  A run over a warm `profile.db` is unaffected.
 - `timing-predict` evaluates explicit batch shapes without a workload, scheduler,
   clock, or discrete-event simulation; its config is not a deployment preset.
   The launcher snapshots a private `raw/params.json` model/GPU projection so the
@@ -618,6 +737,12 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
   `raw/prediction_provenance.json` from the concrete L4 model, and the launcher
   uses its authoritative `gpus_per_replica()` value in `prediction.meta.json`;
   timing-predict does not create simulation `run_meta.json`.
+- `timing-predict --dry-run` builds the model on the simulator's dry-run bridge,
+  checks every case against it, and prints the `profile.db` specs a real run
+  would JIT. It costs nothing, writes nothing under `log_dir`, announces no job,
+  and needs no GPU. `alignment timing-predict --dry-run` builds the measured
+  cases in a scratch directory and runs the same check. A real run also checks
+  every case before costing the first, so a bad case writes no rows.
 - Every first-class output root gets `artifact.meta.json` with one explicit kind:
   `simulation_run`, `simulation_sweep`, `timing_prediction`, `alignment_bundle`,
   `kernel_profile`, or `kernel_measurement`. Analyzer uses this marker as its only
@@ -635,6 +760,164 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
   result snapshot rather than a later mutable `profile.db` state.
 - `list-params` dumps the Rust-authoritative schema (`--human` for a table).
 
+### Remote execution
+
+`--remote NAME` runs a simulation, `timing-predict` or `kernel-profile
+run|measure` on another machine — to use its CPUs, disk or GPUs — and blocks
+until the results are back here. The command is otherwise the one you would run
+locally. A simulation or prediction runs with `--no-gpu --no-plot`, so it never
+profiles and never draws PNGs; a kernel profile runs each worker in its env's
+image (below).
+
+```
+python -m launcher presets/x.yaml --remote bigbox
+python -m launcher timing-predict presets/predict_x.json --remote cluster \
+    --remote-set launch.slurm.time=00:30:00
+python -m launcher kernel-profile run single_gemm --backend torch_linear \
+    --spec '{"m":8,"n":4096,"k":4096,"dtype":"bf16"}' \
+    --output-dir logs/20261011_1_gemm_h200 --remote gpubox
+```
+
+**Configuration.** Remotes live in an untracked `remote.yaml`: `$VIBESIM_REMOTE_CONFIG`,
+else this checkout's root, else the main checkout's root (so worktrees share one).
+`remote.example.yaml` documents every field; the axes are independent:
+
+| Field | Values |
+| --- | --- |
+| `access` | `local`, or `{ssh: host, port, identity_file, options}` (a server or a login node) |
+| `launch` | `direct` (detached on the access host), or `{slurm: {time, partition, cpus_per_task, mem, account, extra}}` |
+| `files` | `rsync` over the access host, or `shared` (the workdir is visible here at the same path) |
+| `workdir`, `node_local`, `env`, `keep_versions`, `profile_runtime`, `ephemeral` | see the example |
+
+ssh runs with `BatchMode=yes` (an agent turn has no terminal and no ssh-agent,
+so use a key file without a passphrase) and one shared ControlMaster connection
+under `$TMPDIR`. When `.remote/known_hosts` exists beside remote.yaml it is the
+only host-key store, so a sandbox that cannot write `~/.ssh` still connects;
+seed it once with `ssh-keyscan host >> .remote/known_hosts`. The remote needs
+`bash`, `rsync`, `flock`, `uv` and `cargo` on its login-shell PATH; Slurm needs
+the workdir on a filesystem its compute nodes share.
+
+**What happens** (`remote/run.py`):
+
+1. The command is planned here (built and expanded, as a dry run would), which
+   fixes the experiment root. It must be a relative directory under `logs/`, and
+   `--remote` must run from the checkout root, so the same relative path means
+   the same place on both sides. `--dry-run`, `--cache-report`,
+   `--emit-backends` and `--profile` stay local.
+2. Under a managed Agent job the job is registered here, and the identity file
+   that produced (`experiment.meta.json`, or a seed `prediction.meta.json`) is
+   copied into the remote output directory, where the remote run keeps it. The
+   remote job runs without the managed context and never registers.
+3. The code is shipped as a file tree with `.source-stamp.json` (commit, status,
+   capped diff, profiler stamp), not as a repository: tracked and untracked
+   non-ignored files, the req-frontend submodule, the ignored `Cargo.lock`, and
+   ignored data under `trace/`. Inputs under `logs/` named on the command line
+   (a preset, a predictor config or its cases file) are copied to the remote's
+   `logs/`; any other ignored input is an error.
+4. The remote builds once per set of build inputs and runs the job with its own
+   private profile.db copy on node-local disk (`remote/node.py`).
+5. Output is relayed every ~10 s, with a heartbeat at least once a minute.
+   Ctrl-C or SIGTERM stops the remote job (`kill` or `scancel`). A remote that
+   cannot be reached for 10 minutes ends the wait with an error that names the
+   job's remote directory; the job itself may still be running there.
+6. The output directory is copied back without `raw/cost_log/` and `plots/`
+   (everything, if the remote is `ephemeral`), and `remote-run.json` beside it
+   records the remote, host, remote path, code version, job and Slurm ids,
+   times and exit code. A copy that fails is recorded there as `incomplete` and
+   fails the run. Whatever stops a run early, no managed job is left `running`:
+   it is reported `failed`, or `interrupted` on Ctrl-C.
+
+Rerunning the same command resumes on the remote exactly as it would locally:
+the remote `logs/` is one tree across code versions.
+
+**Remote layout** (`remote/layout.py`). Only code is kept per version, hard-linked
+to the previous version so an unchanged file costs nothing; the heavy parts exist
+once per remote:
+
+```
+<workdir>/src/<version>/   shipped tree (+ .venv, bin, logs symlinks)
+<workdir>/venvs/<key>/     one per uv.lock + groups (CPU groups only: launcher, analyze, dev)
+<workdir>/build/src/       the one checkout cargo builds in (a fixed path keeps it incremental)
+<workdir>/build/target/    the one cargo target
+<workdir>/bin/<hash>/      binaries per set of build inputs
+<workdir>/logs/            every experiment, kept
+<workdir>/jobs/<id>/       job.json, stdout.log, exit_code, job.sbatch
+```
+
+A version whose Rust sources did not change reuses its predecessor's binaries;
+a Rust edit recompiles only this repository's crates. Builds are serialized by
+a lock on the access host. A failed analyzer build is not collected (the run
+skips post-run analysis), so a stale `analyze` never passes for the new one.
+`keep_versions` (default 10) prunes the least recently used `src/` trees other
+than the caller's and those of unfinished jobs, binaries no tree links to (under
+the build lock), and sends abandoned for a day; the shared `build/target` grows
+like any cargo target and can be cleaned with `cargo clean`. A checkout that
+changes while it is shipped fails the send rather than misname the copy.
+
+**Prebuilt binaries.** A job runs with `VIBESIM_BIN_DIR` set, which makes the
+launcher use that directory's `simulator`, `analyze` and `deployment_schema.json`
+instead of running cargo (`binaries.py`). The set records its build inputs
+(from cargo's dep-info, so `include_str!` data counts) and their hash; the
+launcher recomputes the hash against its own checkout and refuses a set built
+from other sources or another Python, and checks the schema against the
+simulator's own `list-params`. Only `--build-type release` can use it.
+
+**Kernel profiling** (`kernel-profile run|measure --remote`). The remote job
+runs with `VIBESIM_PROFILE_RUNTIME=container`: every worker runs in the image
+`profiling/container/images.py` assigns its profile env — never on a host
+interpreter, and an env with no image is refused — so the remote needs only
+docker with the NVIDIA runtime. The image is named by a hash of its dependency
+inputs; when the remote lacks it, it is sent from here, so build it here first.
+Only the layers the remote lacks move (`remote/image_send.py`): the image is
+pushed to a `registry` container on this machine's loopback, over a persistent
+store (`~/.cache/vibesim-profiler/registry`, or `VIBESIM_PROFILE_REGISTRY_DIR`),
+and the remote pulls it through an `ssh -R` forward, then the image id is
+checked against this one. A new tag of an image the remote already has costs
+its last few layers (seconds); the first send of an image pays for compressing
+all of it into the store, and a remote whose layers came from `docker load`
+pulls them once more, since docker cannot match them to registry digests. `python -m launcher.remote.image_send clear` empties the store.
+Under Slurm the job
+asks for the GPUs its specs need (`--gres=gpu:N`, or more with `launch.slurm.gpus`)
+and the controller addresses them by UUID. The JIT cache persists in
+`<workdir>/cache`.
+
+`--output-dir` is required and must be under `logs/`; `--db` is refused. The job
+measures into its own profile.db copy, which is fetched and merged into this
+checkout's (`VIBESIM_PROFILE_DB` or `profiling/profile.db`) under the profile-DB
+write lease. A conflicting row merges nothing: the report is left in the output
+directory. `--fresh` writes no rows and merges nothing. The whole output
+directory comes back; `remote-run.json` adds the image and its id, and the
+artifact metadata carries the observed GPU as for a local run. Under a managed
+job the `kp_`/`km_` id is registered here and seeded into the remote output
+directory, as for a prediction.
+
+**A remote that is a profiler image** (`profile_runtime: in-image`, e.g. a
+RunPod pod started from one). There is no docker inside, so the job runs with
+`VIBESIM_PROFILE_RUNTIME=in-image`: controller and workers run on the image's
+own interpreter, and only the envs that image serves. Before anything runs, the
+remote's `/etc/vibesim-profiler-image.json` (written by every profiler
+Dockerfile) must name the inputs of the image this checkout assigns the
+backend's env; nothing is built, synced or sent. Such a remote runs
+`kernel-profile` only. The image's entrypoint is the worker, so start the pod
+with entrypoint `bash -c` and this command, which installs ssh and rsync, keeps
+the image's environment for ssh sessions, and authorizes the pod's
+`PUBLIC_KEY`:
+
+```
+export -p | grep -vE '^declare -x (HOME|PWD|OLDPWD|SHLVL)=' > /etc/profile.d/00-vibesim-image.sh
+apt-get update -qq && apt-get install -y -qq openssh-server rsync >/dev/null
+mkdir -p /run/sshd /root/.ssh && echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e
+```
+
+Expose `22/tcp` (RunPod's proxied ssh cannot carry rsync), pull the image from
+a registry under the same tag (`docker tag` + `docker push` from here), and
+set `ephemeral: true` so results come back whole.
+
+**Limits.** One invocation is one blocking remote job; a managed job's
+capability token must outlive it (6 h). A job whose process or allocation
+vanishes without an exit code fails after three consecutive polls.
+
 ### Staged simulation ↔ real profiling alignment
 
 `launcher alignment` is the only launch surface for a cost-model alignment run.
@@ -647,8 +930,9 @@ It exposes four explicit stages with four independent configs:
   normalized `parsed.json`.
 - `alignment timing-predict` pairs those completed artifacts, generates exact
   predictor cases, and runs the offline predictor. Its arch, GPU, and complete
-  per-role backend policy come from the simulation run's normalized
-  `raw/params.json`, not the source preset.
+  per-role backend policy come from the simulation preset, normalized exactly as
+  `launcher sim` normalizes it: `backends_file` folded in and schema defaults
+  filled. No completed simulation is needed, and the preset must expand to one run.
 - `alignment analyze` assembles the analyzer manifest from completed artifact
   directories and invokes only the enabled top-level alignment subjects.
 
@@ -702,6 +986,20 @@ uv run python -m launcher alignment profile logs/<experiment>/profile.yaml
 uv run python -m launcher alignment timing-predict logs/<experiment>/timing_predict.yaml
 uv run python -m launcher alignment analyze logs/<experiment>/analyze.yaml
 ```
+
+### Alignment campaigns
+
+`alignment-campaign` sits above those stages and drives a whole matrix of cases
+from a declarative pack in `presets/alignment/<pack>/` — rendering every phase
+config, running one phase across all ready cases, labeling to a fixpoint,
+extracting metrics by a fixed formula table, and judging them against declared
+tolerances and a recorded golden.
+
+It adds no stage and no evidence: it invokes the four commands above unchanged.
+The batch axis is deliberately **one phase across N cases**, so `run` requires
+`--phase` and offers no `--all` — the inspection point between phases stays.
+
+See `launcher/alignment_campaign/README.md` for the pack schema and the verbs.
 
 See skill `operate-run-simulation` for preset/sweep authoring conventions and dated log
 dirs.

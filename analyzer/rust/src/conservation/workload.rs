@@ -15,19 +15,22 @@
 //!
 //! For one context-ready request, let `fresh` be its new suffix, `declared` its
 //! reusable-prefix requirement, `hit` the resident prefix found at admission,
-//! `p` the prefill tokens actually computed, and `d` the emitted output tokens.
+//! `p` the initial-prefill tokens actually computed, `rp` the tokens from any
+//! decode-retraction re-prefill episodes, `r` the number of completed episodes,
+//! and `d` the emitted output tokens.
 //! Prefix-aware requests must conserve `hit + p = fresh + declared`; the common
 //! logical context after prefill is therefore `context = hit + p` regardless of
 //! the dynamic cache result.
 //!
 //! Checks for iter-wise deployments:
-//!   1. `prefill_tokens`        Σ prefill_tokens            vs Σ p
+//!   1. `prefill_tokens`        Σ prefill_tokens            vs Σ (p + rp)
 //!   2. prefix telemetry presence, `hit <= declared`, and both aggregate and
 //!      per-request forms of `hit + p = fresh + declared`
-//!   3. `decode_passes`         Σ decode_request_count      vs Σ max(d-1, 0)
+//!   3. `decode_passes`         Σ decode_request_count      vs Σ max(d-1-r, 0)
 //!      (the first output token is produced by the prefill pass, not a decode
-//!      pass, so a request incurs `d-1` decode forward passes)
-//!   4. `ffn_token_pass`        Σ batch_tokens              vs Σ [p + max(d-1,0)]
+//!      pass, and every completed re-prefill likewise produces one output)
+//!   4. `ffn_token_pass`        Σ batch_tokens
+//!         vs Σ [p + rp + max(d-1-r,0)]
 //!   5. `prefill_causal_attn_work`
 //!         Σ_chunks [a·prefix + a(a+1)/2]
 //!             vs Σ [p·hit + p(p+1)/2]
@@ -42,8 +45,10 @@
 //!      `context(context+1)/2` baseline. `context = fresh + declared` for a
 //!      context-ready request; a sim-end partial prefill uses only its observed
 //!      `hit + p` context so unfinished future work is not invented.
-//!   7. `decode_kv_sum`         Σ decode_kv_total
-//!         vs Σ [m·context + m(m-1)/2], m = max(d-1, 0)
+//!   7. `decode_kv_sum` starts from the no-retraction baseline
+//!         Σ [m·context + m(m-1)/2], m = max(d-1, 0),
+//!      then subtracts the ordinary decode KV read replaced by each completed
+//!      re-prefill.
 //!      (decode reads the full post-prefill context, independent of how much of
 //!      that context was a cache hit.)
 //!   8. `cost_log_batch_self_consistency`  Σ batch_tokens vs Σ(prefill_tokens +
@@ -53,17 +58,22 @@
 //! `deployment=afd`, attention checks therefore use only
 //! `(pool_tag=attn, section=attn)` and multiply request-side expected work by
 //! the observed layer count; FFN checks use `pool_tag=ffn` and expect
-//! `Σ[p + max(d-1,0)] × (layers + 3)` section-token passes.
+//! `Σ[p + rp + max(d-1-r,0)] × (layers + 3)` section-token passes.
+//!
+//! A `deployment=pp` request passes every stage of its pipeline, and each stage
+//! logs the same microbatch, so every check sums all stages' rows and multiplies
+//! request-side expected work by the pipeline depth (`pp_size` of the stage
+//! pool's arch). A stage that dropped or repeated a microbatch fails the check.
 //!
 //! When EP/HP multi-group lands, the per-group reduction needs the same revisit
 //! as `batch::composition` (sum for partition-style, pick-one for replicate-style
 //! HP) — one group today (unified dense asserts a single HP group).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Result};
 use arrow_array::{
     Array, BooleanArray, ListArray, StringArray, StructArray, UInt16Array, UInt32Array,
 };
@@ -75,6 +85,8 @@ use crate::session::{
     col, collect, column_f64, register_cost_log, register_if_exists, require_columns, value_f64,
     COST_LOG_TABLE,
 };
+
+mod speculative;
 
 /// cost_log columns this subject depends on (drift guard).
 const COST_COLS: &[&str] = &["pool_tag", "section", "layer", "groups"];
@@ -101,22 +113,68 @@ const WARN_PCT: f64 = 5.0;
 enum WorkloadMode {
     Iterwise,
     Afd,
+    /// Pipeline stages: each stage logs every microbatch once.
+    Pp {
+        stages: usize,
+    },
 }
 
 impl WorkloadMode {
-    fn from_deployment(deployment: Option<&str>) -> Self {
-        match deployment {
+    fn from_run(deployment: Option<&str>, params: Option<&Value>) -> Result<Self> {
+        Ok(match deployment {
             Some("afd") => Self::Afd,
+            Some("pp") => Self::Pp {
+                stages: pipeline_depth(params)?,
+            },
             _ => Self::Iterwise,
-        }
+        })
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Iterwise => "iterwise",
             Self::Afd => "afd-layered",
+            Self::Pp { .. } => "pp-stages",
         }
     }
+
+    /// How many times one request's attention work appears in `cost_log`.
+    fn layer_multiplier(self, num_layers: usize) -> f64 {
+        match self {
+            Self::Iterwise => 1.0,
+            Self::Afd => num_layers as f64,
+            Self::Pp { stages } => stages as f64,
+        }
+    }
+
+    /// How many times one request's FFN token pass appears in `cost_log`.
+    fn ffn_multiplier(self, num_layers: usize) -> f64 {
+        match self {
+            Self::Iterwise => 1.0,
+            Self::Afd => num_layers as f64 + 3.0,
+            Self::Pp { stages } => stages as f64,
+        }
+    }
+}
+
+/// `pp_size` of the `stage` pool's arch: every request passes that many stages.
+fn pipeline_depth(params: Option<&Value>) -> Result<usize> {
+    let groups = params
+        .and_then(|p| p["pools"]["stage"]["groups"].as_array())
+        .ok_or_else(|| anyhow!("pp run has no `pools.stage.groups` in params.json"))?;
+    let depths: BTreeSet<u64> = groups
+        .iter()
+        .map(|group| {
+            group["arch"]["pp_size"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("pp stage group has no integer `arch.pp_size`"))
+        })
+        .collect::<Result<_>>()?;
+    ensure!(
+        depths.len() == 1,
+        "pp stage groups disagree on pp_size: {depths:?}"
+    );
+    Ok(*depths.first().unwrap() as usize)
 }
 
 /// Run-wide actuals summed from `cost_log` groups. f64 is exact for these integer
@@ -148,6 +206,8 @@ struct Expected {
     missing_prefix_resolution_requests: usize,
     prefix_hit_bound_violations: usize,
     prefix_token_balance_violations: usize,
+    reprocessed_token_balance_violations: usize,
+    reprocessed_prefill_episodes: usize,
     requests: usize,
     context_ready_requests: usize,
     incomplete_requests: usize,
@@ -155,7 +215,32 @@ struct Expected {
     max_context_len: f64,
 }
 
+// Conservation follows the worker's execution contract, independent of model family.
+fn uses_speculative_worker(params: &Value) -> bool {
+    params
+        .get("pools")
+        .and_then(Value::as_object)
+        .is_some_and(|pools| {
+            pools.values().any(|pool| {
+                pool.get("groups")
+                    .and_then(Value::as_array)
+                    .is_some_and(|groups| {
+                        groups
+                            .iter()
+                            .any(|group| group["worker"]["type"] == "speculative")
+                    })
+            })
+        })
+}
+
 pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
+    let params_path = resolve_artifact_path(log_dir, "params.json");
+    let params: Option<Value> = if params_path.is_file() {
+        Some(serde_json::from_reader(std::fs::File::open(params_path)?)?)
+    } else {
+        None
+    };
+    let speculative = params.as_ref().is_some_and(uses_speculative_worker);
     if !register_cost_log(ctx, log_dir).await? {
         let reason = "cost_log/ dir not found";
         return Ok((
@@ -176,11 +261,24 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
     require_columns(ctx, "slo", SLO_COLS).await?;
 
     let deployment = read_deployment(log_dir);
-    let mode = WorkloadMode::from_deployment(deployment.as_deref());
+    let mode = WorkloadMode::from_run(deployment.as_deref(), params.as_ref())?;
     let actual = collect_actual(ctx, mode).await?;
-    let expected = collect_expected(ctx, mode, actual.num_layers).await?;
+    let mut expected = collect_expected(ctx, mode, actual.num_layers).await?;
 
-    let checks = checks_for_mode(mode, &actual, &expected);
+    let checks = if speculative {
+        match speculative::checks(ctx, &actual, &mut expected).await {
+            Ok(checks) => checks,
+            Err(error) => {
+                let reason = format!("speculative conservation unavailable: {error:#}");
+                return Ok((
+                    unavailable(log_dir, &reason),
+                    unavailable_payload(log_dir, &reason),
+                ));
+            }
+        }
+    } else {
+        checks_for_mode(mode, &actual, &expected)
+    };
     let all_ok = checks.iter().all(|c| c["status"] == "OK");
 
     let report = json!({
@@ -188,13 +286,14 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
         "meta": {
             "log_dir": log_dir.display().to_string(),
             "deployment": deployment.as_deref().unwrap_or("unknown"),
-            "mode": mode.label(),
+            "mode": if speculative { "speculative" } else { mode.label() },
             "num_iterations": actual.iters,
             "num_layers": actual.num_layers,
             "num_requests": expected.requests,
             "num_context_ready_requests": expected.context_ready_requests,
             "num_incomplete_requests": expected.incomplete_requests,
             "num_boundary_decode_requests": expected.boundary_decode_requests,
+            "num_reprocessed_prefill_episodes": expected.reprocessed_prefill_episodes,
             "max_context_len": expected.max_context_len,
         },
         "available": true,
@@ -212,7 +311,7 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
             "log_dir": log_dir.display().to_string(),
             "available": true,
             "deployment": deployment.as_deref().unwrap_or("unknown"),
-            "mode": mode.label(),
+            "mode": if speculative { "speculative" } else { mode.label() },
             "tolerance_pct": TOLERANCE_PCT,
             "warn_pct": WARN_PCT,
             "all_ok": all_ok,
@@ -225,14 +324,8 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
 }
 
 fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> Vec<Value> {
-    let layer_multiplier = match mode {
-        WorkloadMode::Iterwise => 1.0,
-        WorkloadMode::Afd => actual.num_layers as f64,
-    };
-    let ffn_multiplier = match mode {
-        WorkloadMode::Iterwise => 1.0,
-        WorkloadMode::Afd => actual.num_layers as f64 + 3.0,
-    };
+    let layer_multiplier = mode.layer_multiplier(actual.num_layers);
+    let ffn_multiplier = mode.ffn_multiplier(actual.num_layers);
     let boundary_decode_requests = expected.boundary_decode_requests as f64;
     let decode_boundary_allowance = boundary_decode_requests * layer_multiplier;
     let ffn_boundary_allowance = boundary_decode_requests * ffn_multiplier;
@@ -246,6 +339,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
                 WorkloadMode::Iterwise => {
                     "tokens prefilled: Σ cost_log prefill_tokens vs Σ request_slo prefill_processed"
                 }
+                WorkloadMode::Pp { .. } => "PP stage prefill work: Σ cost_log prefill_tokens over stages vs Σ p × stages",
                 WorkloadMode::Afd => {
                     "AFD attention-layer prefill work: Σ attn cost_log prefill_tokens vs Σ p × layers"
                 }
@@ -283,13 +377,21 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
             0.0,
         ),
         (
+            "reprocessed_prefill_token_balance_violations",
+            "completed reprocessed-prefill episodes violating hit + processed = initial context + prior outputs vs 0",
+            expected.reprocessed_token_balance_violations as f64,
+            0.0,
+            0.0,
+        ),
+        (
             "decode_passes",
             match mode {
                 WorkloadMode::Iterwise => {
-                    "decode forward passes: Σ cost_log decode_request_count vs Σ max(d-1,0)"
+                    "decode forward passes: Σ cost_log decode_request_count vs Σ max(d-1-r,0), r=completed re-prefills"
                 }
+                WorkloadMode::Pp { .. } => "PP stage decode passes: Σ cost_log decode_request_count over stages vs Σ max(d-1-r,0) × stages",
                 WorkloadMode::Afd => {
-                    "AFD attention-layer decode passes: Σ attn cost_log decode_request_count vs Σ max(d-1,0) × layers"
+                    "AFD attention-layer decode passes: Σ attn cost_log decode_request_count vs Σ max(d-1-r,0) × layers"
                 }
             },
             actual.decode_passes,
@@ -300,10 +402,11 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
             "ffn_token_pass",
             match mode {
                 WorkloadMode::Iterwise => {
-                    "tokens through FFN: Σ cost_log batch_tokens vs Σ [p + max(d-1,0)]"
+                    "tokens through FFN: Σ cost_log batch_tokens vs Σ [p + rp + max(d-1-r,0)]"
                 }
+                WorkloadMode::Pp { .. } => "PP stage token pass: Σ cost_log batch_tokens over stages vs Σ[p + rp + max(d-1-r,0)] × stages",
                 WorkloadMode::Afd => {
-                    "AFD FFN section token pass: Σ ffn cost_log batch_tokens vs Σ[p + max(d-1,0)] × (layers+3)"
+                    "AFD FFN section token pass: Σ ffn cost_log batch_tokens vs Σ[p + rp + max(d-1-r,0)] × (layers+3)"
                 }
             },
             actual.batch_tokens,
@@ -316,6 +419,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
                 WorkloadMode::Iterwise => {
                     "causal prefill attn work: Σ [a·prefix + a(a+1)/2] vs Σ [p·hit + p(p+1)/2]"
                 }
+                WorkloadMode::Pp { .. } => "PP stage causal prefill work: Σ [a·prefix + a(a+1)/2] vs Σ [p·hit + p(p+1)/2] × stages",
                 WorkloadMode::Afd => {
                     "AFD attention-layer causal prefill work: Σ [a·prefix + a(a+1)/2] vs Σ [p·hit + p(p+1)/2] × layers"
                 }
@@ -330,6 +434,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
                 WorkloadMode::Iterwise => {
                     "cold-equivalent causal prefill work: actual + Σ hit(hit+1)/2 vs Σ (fresh+declared)(fresh+declared+1)/2"
                 }
+                WorkloadMode::Pp { .. } => "PP stage cold-equivalent causal prefill work: actual + saved prefix triangle vs immutable cold baseline × stages",
                 WorkloadMode::Afd => {
                     "AFD cold-equivalent causal prefill work: actual + saved prefix triangle vs immutable cold baseline × layers"
                 }
@@ -342,8 +447,9 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
             "decode_kv_sum",
             match mode {
                 WorkloadMode::Iterwise => {
-                    "decode KV read: Σ cost_log decode_kv_total vs Σ [m·(hit+p) + m(m-1)/2], m=max(d-1,0)"
+                    "decode KV read: no-retraction baseline minus the ordinary decode read replaced by each completed re-prefill"
                 }
+                WorkloadMode::Pp { .. } => "PP stage decode KV read: Σ cost_log decode_kv_total over stages vs Σ [m·(hit+p) + m(m-1)/2] × stages",
                 WorkloadMode::Afd => {
                     "AFD attention-layer decode KV read: Σ attn cost_log decode_kv_total vs Σ [m·(hit+p) + m(m-1)/2] × layers"
                 }
@@ -355,13 +461,13 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
     ];
 
     let self_actual = match mode {
-        WorkloadMode::Iterwise => actual.batch_tokens,
+        WorkloadMode::Iterwise | WorkloadMode::Pp { .. } => actual.batch_tokens,
         WorkloadMode::Afd => actual.attn_batch_tokens,
     };
     specs.push((
         "cost_log_batch_self_consistency",
         match mode {
-            WorkloadMode::Iterwise => {
+            WorkloadMode::Iterwise | WorkloadMode::Pp { .. } => {
                 "cost_log internal: Σ batch_tokens vs Σ(prefill_tokens + decode_request_count)"
             }
             WorkloadMode::Afd => {
@@ -441,8 +547,9 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
     a.iters = count_rows(ctx, "SELECT COUNT(*) AS c FROM cost_log").await?;
 
     match mode {
-        WorkloadMode::Iterwise => {
-            // One row = one iteration; sum every field over the flattened groups.
+        WorkloadMode::Iterwise | WorkloadMode::Pp { .. } => {
+            // One row = one iteration (one stage's microbatch under PP); sum every
+            // field over the flattened groups.
             let batches = collect(ctx, "SELECT groups FROM cost_log").await?;
             for batch in &batches {
                 let gs = groups_struct(groups_list(batch)?)?;
@@ -499,7 +606,7 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
 /// labeler roofline needs (prefill KV read + request count). All fields are additive,
 /// so pool / cluster levels are plain rollups of this map. A rollup of every worker
 /// reproduces the run-wide conservation `actual`, which is the cross-check.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct WorkloadTotals {
     pub(crate) matmul_tokens: f64,             // Σ batch_tokens
     pub(crate) prefill_tokens: f64,            // Σ prefill_tokens
@@ -509,19 +616,26 @@ pub(crate) struct WorkloadTotals {
     pub(crate) decode_kv: f64, // Σ decode_kv_total               (= labeler decode pairs / cached)
     pub(crate) prefill_requests: f64, // Σ prefill chunk count (lm_head sampled positions)
     pub(crate) prefill_stateful_requests: f64, // Σ chunks with prefix > 0 (state read)
+    /// Raw group geometries and multiplicities; no model-specific work formulas.
+    pub(crate) speculative_geometry: BTreeMap<String, f64>,
+    /// Exact per-request attention geometry and multiplicities, present only for
+    /// groups whose model logs `decode_kv_lens` (work not linear in the KV total):
+    /// `"prefill:<prefix>:<append>"` per prefill chunk and `"decode:<kv_len>"` per
+    /// decode request. Additive like the scalars, which it refines, not replaces.
+    pub(crate) request_geometry: BTreeMap<String, f64>,
 }
 
 /// One exact fixed-batch workload and the number of iterations with that shape.
 /// The labeler evaluates each distinct shape once; callers multiply its roofline
 /// result by `occurrences`, preserving batch boundaries without one subprocess row
 /// per iteration.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WeightedWorkload {
     pub(crate) totals: WorkloadTotals,
     pub(crate) occurrences: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct WorkloadShape {
     matmul_tokens: u64,
     prefill_tokens: u64,
@@ -531,6 +645,8 @@ struct WorkloadShape {
     decode_kv: u64,
     prefill_requests: u64,
     prefill_stateful_requests: u64,
+    speculative_geometry: BTreeMap<String, u64>,
+    request_geometry: BTreeMap<String, u64>,
 }
 
 impl WorkloadShape {
@@ -547,6 +663,16 @@ impl WorkloadShape {
                 totals.prefill_stateful_requests,
                 "prefill_stateful_requests",
             )?,
+            speculative_geometry: totals
+                .speculative_geometry
+                .into_iter()
+                .map(|(geometry, count)| Ok((geometry, exact_count(count, "geometry count")?)))
+                .collect::<Result<_>>()?,
+            request_geometry: totals
+                .request_geometry
+                .into_iter()
+                .map(|(geometry, count)| Ok((geometry, exact_count(count, "request count")?)))
+                .collect::<Result<_>>()?,
         })
     }
 
@@ -560,6 +686,16 @@ impl WorkloadShape {
             decode_kv: self.decode_kv as f64,
             prefill_requests: self.prefill_requests as f64,
             prefill_stateful_requests: self.prefill_stateful_requests as f64,
+            speculative_geometry: self
+                .speculative_geometry
+                .into_iter()
+                .map(|(geometry, count)| (geometry, count as f64))
+                .collect(),
+            request_geometry: self
+                .request_geometry
+                .into_iter()
+                .map(|(geometry, count)| (geometry, count as f64))
+                .collect(),
         }
     }
 }
@@ -583,6 +719,15 @@ impl WorkloadTotals {
         self.decode_kv += other.decode_kv;
         self.prefill_requests += other.prefill_requests;
         self.prefill_stateful_requests += other.prefill_stateful_requests;
+        for (geometry, count) in &other.speculative_geometry {
+            *self
+                .speculative_geometry
+                .entry(geometry.clone())
+                .or_default() += count;
+        }
+        for (geometry, count) in &other.request_geometry {
+            *self.request_geometry.entry(geometry.clone()).or_default() += count;
+        }
     }
 
     /// Replicate independent copies of one workload without changing sequence
@@ -597,6 +742,13 @@ impl WorkloadTotals {
         self.decode_kv *= factor;
         self.prefill_requests *= factor;
         self.prefill_stateful_requests *= factor;
+        for count in self
+            .speculative_geometry
+            .values_mut()
+            .chain(self.request_geometry.values_mut())
+        {
+            *count *= factor;
+        }
     }
 }
 
@@ -686,11 +838,14 @@ pub(crate) struct WorkerShapeSample {
     pub(crate) shapes: Vec<WeightedWorkload>,
     /// Iterations the weights add up to — the worker's exact total, by construction.
     pub(crate) iterations: u64,
-    /// Iterations actually drawn: every prefill-carrying one plus the sampled
-    /// decode-only ones. This is what the labeler's cost scales with.
+    /// Distinct shapes drawn from both strata. This is what the labeler's cost
+    /// scales with.
     pub(crate) labeled_iterations: u64,
     /// Stride applied to the decode-only stratum (1 = that stratum is exact too).
     pub(crate) decode_stride: u64,
+    /// Prefill-carrying iterations, and how many of them the sample kept.
+    pub(crate) prefill_iterations: u64,
+    pub(crate) sampled_prefill_iterations: u64,
 }
 
 /// Collect fixed-batch workloads for a run and deduplicate equal iteration shapes
@@ -702,21 +857,25 @@ pub(crate) struct WorkerShapeSample {
 /// "label every distinct shape" cost one label per iteration. So the iterations are
 /// **stratified**, not sampled flat:
 ///
-/// - **Prefill-carrying iterations are all kept.** On that run they are 0.76% of
-///   iterations but carry 70.7% of the matmul-token mass. They are also where the
-///   variance is, and they recur on a quasi-periodic schedule that an `iter_id %
-///   stride` sample aliases against: flat stride 50 moved the floors +0.37% while
-///   flat stride 19 — a *denser* sample — moved them +1.04%, because the phase, not
-///   the sample size, decided how many prefill steps were caught.
+/// - **Prefill-carrying iterations are sampled by a hash of `iter_id`** to about
+///   `target_sampled_prefill_iterations`. On a decode-heavy run they are 0.76% of
+///   iterations but carry 70.7% of the matmul-token mass, and they recur on a
+///   quasi-periodic schedule that an `iter_id % stride` sample aliases against:
+///   flat stride 50 moved the floors +0.37% while flat stride 19 — a *denser*
+///   sample — moved them +1.04%, because the phase, not the sample size, decided
+///   how many prefill steps were caught. A hash has no phase. A prefill-only run
+///   (a PP stage at saturation) has every iteration here — 404,476 distinct shapes
+///   per stage on an 8 h GLM-5.3 run — so this stratum must be sampled too.
 /// - **Decode-only iterations are sampled** to about
 ///   `target_sampled_decode_iterations`. They are numerous, cheap, and drift smoothly
 ///   with context length, so a systematic sample tracks them closely.
 ///
-/// The kept decode shapes are then reweighted so each worker's weights sum to its
-/// exact iteration count, which leaves the caller nothing to anchor.
+/// Each stratum's kept shapes are then reweighted so its weights sum to its exact
+/// iteration count, which leaves the caller nothing to anchor.
 pub(crate) async fn collect_workload_shapes_by_worker(
     ctx: &SessionContext,
     target_sampled_decode_iterations: u64,
+    target_sampled_prefill_iterations: u64,
 ) -> Result<HashMap<(String, u16), WorkerShapeSample>> {
     let batches = collect(
         ctx,
@@ -764,16 +923,32 @@ pub(crate) async fn collect_workload_shapes_by_worker(
         }
     }
 
-    // Decode-only iterations per worker, so each worker's stride is sized from its
-    // own stratum rather than from whichever worker ran longest.
+    // Each stratum's size per worker, so each worker's sampling rate is sized from
+    // its own strata rather than from whichever worker ran longest.
     let mut decode_iterations_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
+    let mut prefill_iterations_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
     for ((pool_index, worker_id, _iteration_id), totals) in &totals_by_iteration {
-        if !carries_prefill(totals) {
-            *decode_iterations_by_worker
-                .entry((*pool_index, *worker_id))
-                .or_default() += 1;
-        }
+        let stratum = if carries_prefill(totals) {
+            &mut prefill_iterations_by_worker
+        } else {
+            &mut decode_iterations_by_worker
+        };
+        *stratum.entry((*pool_index, *worker_id)).or_default() += 1;
     }
+    // Keep a prefill iteration when its hash falls under this cutoff.
+    let prefill_cutoff_by_worker: HashMap<(u16, u16), u64> = prefill_iterations_by_worker
+        .iter()
+        .map(|(worker_key, prefill_iterations)| {
+            let keep = target_sampled_prefill_iterations.max(1) as f64
+                / (*prefill_iterations).max(1) as f64;
+            let cutoff = if keep >= 1.0 {
+                u64::MAX
+            } else {
+                (keep * u64::MAX as f64) as u64
+            };
+            (*worker_key, cutoff)
+        })
+        .collect();
     let stride_by_worker: HashMap<(u16, u16), u64> = decode_iterations_by_worker
         .iter()
         .map(|(worker_key, decode_iterations)| {
@@ -786,11 +961,21 @@ pub(crate) async fn collect_workload_shapes_by_worker(
     let mut prefill_shapes: HashSet<((u16, u16), WorkloadShape)> = HashSet::new();
     let mut iterations_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
     let mut sampled_decode_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
+    let mut sampled_prefill_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
     for ((pool_index, worker_id, iteration_id), totals) in totals_by_iteration {
         let worker_key = (pool_index, worker_id);
         *iterations_by_worker.entry(worker_key).or_default() += 1;
         let prefill = carries_prefill(&totals);
-        if !prefill {
+        if prefill {
+            let cutoff = prefill_cutoff_by_worker
+                .get(&worker_key)
+                .copied()
+                .unwrap_or(u64::MAX);
+            if cutoff != u64::MAX && splitmix64(iteration_id) > cutoff {
+                continue;
+            }
+            *sampled_prefill_by_worker.entry(worker_key).or_default() += 1;
+        } else {
             let stride = stride_by_worker.get(&worker_key).copied().unwrap_or(1);
             if iteration_id % stride != 0 {
                 continue;
@@ -799,7 +984,7 @@ pub(crate) async fn collect_workload_shapes_by_worker(
         }
         let shape = WorkloadShape::from_totals(totals)?;
         if prefill {
-            prefill_shapes.insert((worker_key, shape));
+            prefill_shapes.insert((worker_key, shape.clone()));
         }
         *occurrence_by_shape.entry((worker_key, shape)).or_default() += 1;
     }
@@ -807,7 +992,7 @@ pub(crate) async fn collect_workload_shapes_by_worker(
     let mut shapes_by_worker: HashMap<(u16, u16), Vec<WeightedWorkload>> = HashMap::new();
     let mut prefill_flags_by_worker: HashMap<(u16, u16), Vec<bool>> = HashMap::new();
     for ((worker_key, shape), occurrences) in occurrence_by_shape {
-        let prefill = prefill_shapes.contains(&(worker_key, shape));
+        let prefill = prefill_shapes.contains(&(worker_key, shape.clone()));
         prefill_flags_by_worker
             .entry(worker_key)
             .or_default()
@@ -834,11 +1019,27 @@ pub(crate) async fn collect_workload_shapes_by_worker(
             .get(&worker_key)
             .copied()
             .unwrap_or(0);
-        reweight_decode_stratum(
+        reweight_stratum(
             &mut shapes,
             &prefill_flags,
+            false,
             decode_iterations,
             sampled_decode,
+        );
+        let prefill_iterations = prefill_iterations_by_worker
+            .get(&worker_key)
+            .copied()
+            .unwrap_or(0);
+        let sampled_prefill_iterations = sampled_prefill_by_worker
+            .get(&worker_key)
+            .copied()
+            .unwrap_or(0);
+        reweight_stratum(
+            &mut shapes,
+            &prefill_flags,
+            true,
+            prefill_iterations,
+            sampled_prefill_iterations,
         );
         let iterations = iterations_by_worker
             .get(&worker_key)
@@ -854,6 +1055,8 @@ pub(crate) async fn collect_workload_shapes_by_worker(
                 iterations,
                 labeled_iterations,
                 decode_stride,
+                prefill_iterations,
+                sampled_prefill_iterations,
             },
         );
     }
@@ -870,8 +1073,7 @@ fn carries_prefill(totals: &WorkloadTotals) -> bool {
 /// shape's prefill flag along so the two stay index-aligned.
 fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [bool]) {
     let mut order: Vec<usize> = (0..shapes.len()).collect();
-    order.sort_by_key(|&index| {
-        let totals = shapes[index].totals;
+    let scalar_key = |totals: &WorkloadTotals| {
         (
             totals.matmul_tokens as u64,
             totals.prefill_tokens as u64,
@@ -882,10 +1084,30 @@ fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [
             totals.prefill_requests as u64,
             totals.prefill_stateful_requests as u64,
         )
+    };
+    order.sort_by(|&left, &right| {
+        let left = &shapes[left].totals;
+        let right = &shapes[right].totals;
+        let geometry_key = |geometry: &'_ BTreeMap<String, f64>| {
+            geometry
+                .iter()
+                .map(|(key, count)| (key.clone(), count.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        scalar_key(left)
+            .cmp(&scalar_key(right))
+            .then_with(|| {
+                geometry_key(&left.speculative_geometry)
+                    .cmp(&geometry_key(&right.speculative_geometry))
+            })
+            .then_with(|| {
+                geometry_key(&left.request_geometry).cmp(&geometry_key(&right.request_geometry))
+            })
     });
-    let sorted_shapes: Vec<WeightedWorkload> = order.iter().map(|&index| shapes[index]).collect();
+    let sorted_shapes: Vec<WeightedWorkload> =
+        order.iter().map(|&index| shapes[index].clone()).collect();
     let sorted_flags: Vec<bool> = order.iter().map(|&index| prefill_flags[index]).collect();
-    shapes.copy_from_slice(&sorted_shapes);
+    shapes.clone_from_slice(&sorted_shapes);
     prefill_flags.copy_from_slice(&sorted_flags);
 }
 
@@ -895,24 +1117,27 @@ fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [
 /// them. Largest-remainder distribution over the (already sorted, so deterministic)
 /// shape list makes the weights sum to `decode_iterations` exactly, which is what
 /// lets the caller treat the returned weights as the run's true iteration counts.
-fn reweight_decode_stratum(
+/// Scale one stratum's sampled occurrences (`prefill_flags[i] == prefill`) up to
+/// its exact iteration count, in integers.
+fn reweight_stratum(
     shapes: &mut [WeightedWorkload],
     prefill_flags: &[bool],
-    decode_iterations: u64,
-    sampled_decode: u64,
+    prefill: bool,
+    stratum_iterations: u64,
+    sampled_iterations: u64,
 ) {
-    if sampled_decode == 0 || decode_iterations == sampled_decode {
+    if sampled_iterations == 0 || stratum_iterations == sampled_iterations {
         return;
     }
-    let decode_indices: Vec<usize> = (0..shapes.len())
-        .filter(|&index| !prefill_flags[index])
+    let stratum_indices: Vec<usize> = (0..shapes.len())
+        .filter(|&index| prefill_flags[index] == prefill)
         .collect();
     let mut assigned = 0u64;
-    let mut remainders: Vec<(u64, usize)> = Vec::with_capacity(decode_indices.len());
-    for &index in &decode_indices {
-        let numerator = shapes[index].occurrences * decode_iterations;
-        let weight = numerator / sampled_decode;
-        remainders.push((numerator % sampled_decode, index));
+    let mut remainders: Vec<(u64, usize)> = Vec::with_capacity(stratum_indices.len());
+    for &index in &stratum_indices {
+        let numerator = shapes[index].occurrences * stratum_iterations;
+        let weight = numerator / sampled_iterations;
+        remainders.push((numerator % sampled_iterations, index));
         shapes[index].occurrences = weight;
         assigned += weight;
     }
@@ -920,10 +1145,19 @@ fn reweight_decode_stratum(
     remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
     for (_, index) in remainders
         .iter()
-        .take((decode_iterations - assigned) as usize)
+        .take((stratum_iterations - assigned) as usize)
     {
         shapes[*index].occurrences += 1;
     }
+}
+
+/// A fixed 64-bit mix of `iter_id` (SplitMix64's finalizer): uniform, and with no
+/// period an iteration schedule can line up with.
+fn splitmix64(value: u64) -> u64 {
+    let mut z = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Typed, once-per-record-batch view of the fields needed by `model.work`.
@@ -936,6 +1170,8 @@ struct WorkloadGroupColumns<'a> {
     decode_kv: Vec<f64>,
     prefill_prefix_lists: &'a ListArray,
     prefill_append_lists: &'a ListArray,
+    speculative_geometry: Option<&'a StringArray>,
+    decode_kv_lens: Option<&'a ListArray>,
 }
 
 impl<'a> WorkloadGroupColumns<'a> {
@@ -947,15 +1183,60 @@ impl<'a> WorkloadGroupColumns<'a> {
             decode_kv: column_f64(field(groups, "decode_kv_total")?)?,
             prefill_prefix_lists: list_field(groups, "prefill_prefix_lens")?,
             prefill_append_lists: list_field(groups, "prefill_append_lens")?,
+            speculative_geometry: groups
+                .column_by_name("speculative_geometry")
+                .map(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| anyhow!("speculative_geometry must be Utf8"))
+                })
+                .transpose()?,
+            // Optional: older logs and models that do not opt in lack it or leave it null.
+            decode_kv_lens: groups
+                .column_by_name("decode_kv_lens")
+                .map(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .ok_or_else(|| anyhow!("decode_kv_lens must be a List"))
+                })
+                .transpose()?,
         })
     }
 
     fn add_range(&self, elements: Range<usize>, totals: &mut WorkloadTotals) -> Result<()> {
         for element in elements {
+            if let Some(geometry) = self.speculative_geometry {
+                if !geometry.is_null(element) {
+                    *totals
+                        .speculative_geometry
+                        .entry(geometry.value(element).to_owned())
+                        .or_default() += 1.0;
+                }
+            }
             totals.matmul_tokens += self.batch_tokens[element];
             totals.prefill_tokens += self.prefill_tokens[element];
             totals.decode_passes += self.decode_requests[element];
             totals.decode_kv += self.decode_kv[element];
+            let request_geometry = self.decode_kv_lens.filter(|lists| !lists.is_null(element));
+            if let Some(lists) = request_geometry {
+                let kv_lens = lists.value(element);
+                let kv_lens = u32_values(&kv_lens, "decode_kv_lens")?;
+                if kv_lens.len() as f64 != self.decode_requests[element] {
+                    return Err(anyhow!(
+                        "decode_kv_lens has {} entries but decode_request_count is {}",
+                        kv_lens.len(),
+                        self.decode_requests[element]
+                    ));
+                }
+                for kv_len in kv_lens.values() {
+                    *totals
+                        .request_geometry
+                        .entry(format!("decode:{kv_len}"))
+                        .or_default() += 1.0;
+                }
+            }
             if self.prefill_prefix_lists.is_null(element)
                 || self.prefill_append_lists.is_null(element)
             {
@@ -966,9 +1247,15 @@ impl<'a> WorkloadGroupColumns<'a> {
             let prefix_values = u32_values(&prefix_values, "prefill_prefix_lens")?;
             let append_values = u32_values(&append_values, "prefill_append_lens")?;
             for index in 0..prefix_values.len().min(append_values.len()) {
-                let prefix_length = prefix_values.value(index) as f64;
-                let append_length = append_values.value(index) as f64;
-                add_prefill_request(totals, prefix_length, append_length);
+                let prefix_length = prefix_values.value(index);
+                let append_length = append_values.value(index);
+                if request_geometry.is_some() {
+                    *totals
+                        .request_geometry
+                        .entry(format!("prefill:{prefix_length}:{append_length}"))
+                        .or_default() += 1.0;
+                }
+                add_prefill_request(totals, prefix_length as f64, append_length as f64);
             }
         }
         Ok(())
@@ -1066,7 +1353,15 @@ fn u32_values<'a>(arr: &'a arrow_array::ArrayRef, field: &str) -> Result<&'a UIn
         .ok_or_else(|| anyhow!("`{field}` items are not UInt32"))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ReprocessedPrefillWorkInput {
+    output_tokens_before: f64,
+    prefix_cache_hit_tokens: f64,
+    prefill_tokens_processed: f64,
+    completed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
 struct RequestSloWorkInput {
     completed: bool,
     fresh_prompt_tokens: f64,
@@ -1074,6 +1369,7 @@ struct RequestSloWorkInput {
     prefix_cache_hit_tokens: Option<f64>,
     prefill_tokens_processed: f64,
     num_output_tokens: f64,
+    reprocessed_prefills: Vec<ReprocessedPrefillWorkInput>,
 }
 
 impl Expected {
@@ -1109,25 +1405,39 @@ impl Expected {
             }
         }
 
-        let layer_multiplier = match mode {
-            WorkloadMode::Iterwise => 1.0,
-            WorkloadMode::Afd => num_layers as f64,
-        };
-        let ffn_multiplier = match mode {
-            WorkloadMode::Iterwise => 1.0,
-            WorkloadMode::Afd => num_layers as f64 + 3.0,
-        };
-        let decode_forward_passes = (input.num_output_tokens - 1.0).max(0.0);
+        let layer_multiplier = mode.layer_multiplier(num_layers);
+        let ffn_multiplier = mode.ffn_multiplier(num_layers);
+        let completed_reprocessed = input
+            .reprocessed_prefills
+            .iter()
+            .filter(|episode| episode.completed)
+            .count() as f64;
+        let decode_forward_passes =
+            (input.num_output_tokens - 1.0 - completed_reprocessed).max(0.0);
+        let reprocessed_prefill_tokens: f64 = input
+            .reprocessed_prefills
+            .iter()
+            .map(|episode| episode.prefill_tokens_processed)
+            .sum();
+        self.reprocessed_prefill_episodes += input.reprocessed_prefills.len();
         self.max_context_len = self
             .max_context_len
             .max(logical_context_tokens + input.num_output_tokens);
-        self.prefill_tokens += input.prefill_tokens_processed * layer_multiplier;
+        self.prefill_tokens +=
+            (input.prefill_tokens_processed + reprocessed_prefill_tokens) * layer_multiplier;
         self.decode_passes += decode_forward_passes * layer_multiplier;
         self.batch_tokens +=
-            (input.prefill_tokens_processed + decode_forward_passes) * ffn_multiplier;
-        self.decode_kv += (decode_forward_passes * logical_context_tokens
-            + decode_forward_passes * (decode_forward_passes - 1.0) / 2.0)
-            * layer_multiplier;
+            (input.prefill_tokens_processed + reprocessed_prefill_tokens + decode_forward_passes)
+                * ffn_multiplier;
+        let base_decode_passes = (input.num_output_tokens - 1.0).max(0.0);
+        let mut decode_kv = base_decode_passes * logical_context_tokens
+            + base_decode_passes * (base_decode_passes - 1.0) / 2.0;
+        for episode in &input.reprocessed_prefills {
+            if episode.completed {
+                decode_kv -= (logical_context_tokens + episode.output_tokens_before - 1.0).max(0.0);
+            }
+        }
+        self.decode_kv += decode_kv * layer_multiplier;
         self.causal += (input.prefill_tokens_processed * prefix_cache_hit_tokens
             + triangular(input.prefill_tokens_processed))
             * layer_multiplier;
@@ -1139,6 +1449,24 @@ impl Expected {
             logical_context_tokens
         };
         self.cold_causal += triangular(cold_equivalent_context_tokens) * layer_multiplier;
+
+        for episode in &input.reprocessed_prefills {
+            let episode_context =
+                episode.prefix_cache_hit_tokens + episode.prefill_tokens_processed;
+            let expected_context = logical_context_tokens + episode.output_tokens_before;
+            if episode.completed && episode_context != expected_context {
+                self.reprocessed_token_balance_violations += 1;
+            }
+            self.causal += (episode.prefill_tokens_processed * episode.prefix_cache_hit_tokens
+                + triangular(episode.prefill_tokens_processed))
+                * layer_multiplier;
+            self.saved_causal += triangular(episode.prefix_cache_hit_tokens) * layer_multiplier;
+            self.cold_causal += triangular(if episode.completed {
+                expected_context
+            } else {
+                episode_context
+            }) * layer_multiplier;
+        }
     }
 }
 
@@ -1152,12 +1480,20 @@ async fn collect_expected(
     mode: WorkloadMode,
     num_layers: usize,
 ) -> Result<Expected> {
-    let batches = collect(
-        ctx,
+    let has_reprocessed =
+        has_column(ctx, "slo", "reprocessed_prefill_output_tokens_before").await?;
+    let select = if has_reprocessed {
         "SELECT completed, fresh_prompt_tokens, declared_prefix_tokens, \
-         prefix_cache_hit_tokens, prefill_processed, num_output_tokens FROM slo",
-    )
-    .await?;
+         prefix_cache_hit_tokens, prefill_processed, num_output_tokens, \
+         reprocessed_prefill_output_tokens_before, \
+         reprocessed_prefill_prefix_hit_tokens, \
+         reprocessed_prefill_processed_tokens, \
+         reprocessed_prefill_completed FROM slo"
+    } else {
+        "SELECT completed, fresh_prompt_tokens, declared_prefix_tokens, \
+         prefix_cache_hit_tokens, prefill_processed, num_output_tokens FROM slo"
+    };
+    let batches = collect(ctx, select).await?;
     let mut expected = Expected::default();
     for batch in &batches {
         let completed = col(batch, "completed")?
@@ -1177,6 +1513,11 @@ async fn collect_expected(
         let prefill_tokens_processed = col(batch, "prefill_processed")?;
         let num_output_tokens = col(batch, "num_output_tokens")?;
         for row in 0..batch.num_rows() {
+            let reprocessed_prefills = if has_reprocessed {
+                reprocessed_prefills_at(batch, row)?
+            } else {
+                Vec::new()
+            };
             expected.add_request(
                 mode,
                 num_layers,
@@ -1188,11 +1529,64 @@ async fn collect_expected(
                         .then(|| prefix_cache_hit_tokens.value(row) as f64),
                     prefill_tokens_processed: value_f64(prefill_tokens_processed, row)?,
                     num_output_tokens: value_f64(num_output_tokens, row)?,
+                    reprocessed_prefills,
                 },
             );
         }
     }
     Ok(expected)
+}
+
+async fn has_column(ctx: &SessionContext, table: &str, column: &str) -> Result<bool> {
+    let data_frame = ctx.table(table).await?;
+    Ok(data_frame.schema().field_with_name(None, column).is_ok())
+}
+
+fn reprocessed_prefills_at(
+    batch: &arrow_array::RecordBatch,
+    row: usize,
+) -> Result<Vec<ReprocessedPrefillWorkInput>> {
+    let output = col(batch, "reprocessed_prefill_output_tokens_before")?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("reprocessed output tokens are not a List array"))?;
+    let hit = col(batch, "reprocessed_prefill_prefix_hit_tokens")?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("reprocessed prefix hits are not a List array"))?;
+    let processed = col(batch, "reprocessed_prefill_processed_tokens")?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("reprocessed tokens are not a List array"))?;
+    let completed = col(batch, "reprocessed_prefill_completed")?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("reprocessed completion is not a List array"))?;
+    let output_values = output.value(row);
+    let hit_values = hit.value(row);
+    let processed_values = processed.value(row);
+    let completed_values = completed.value(row);
+    let output_values = u32_values(&output_values, "reprocessed output tokens")?;
+    let hit_values = u32_values(&hit_values, "reprocessed prefix hits")?;
+    let processed_values = u32_values(&processed_values, "reprocessed tokens")?;
+    let completed_values = completed_values
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| anyhow!("reprocessed completion items are not Boolean"))?;
+    ensure!(
+        output_values.len() == hit_values.len()
+            && output_values.len() == processed_values.len()
+            && output_values.len() == completed_values.len(),
+        "request_slo row {row} has unequal reprocessed-prefill episode columns"
+    );
+    Ok((0..output_values.len())
+        .map(|index| ReprocessedPrefillWorkInput {
+            output_tokens_before: output_values.value(index) as f64,
+            prefix_cache_hit_tokens: hit_values.value(index) as f64,
+            prefill_tokens_processed: processed_values.value(index) as f64,
+            completed: completed_values.value(index),
+        })
+        .collect())
 }
 
 fn contributes_boundary_allowance(completed: bool, num_output_tokens: f64) -> bool {
@@ -1207,6 +1601,7 @@ fn definitions() -> Value {
         "hit": "request_slo.prefix_cache_hit_tokens (nullable admission-time resident-prefix observation)",
         "p": "request_slo.prefill_processed (tokens actually computed by prefill)",
         "d": "request_slo.num_output_tokens (terminal decode length)",
+        "rp": "request_slo reprocessed-prefill episode lists after decode retraction",
         "context": "hit + p = fresh + declared after prefill completes",
         "status": "OK |unexplained Δ%| <= tolerance_pct; WARN <= warn_pct; FAIL otherwise",
         "prefix_scope_note": "a request with d > 0 has completed prefill and must have a non-null hit observation plus exact hit+p=fresh+declared balance; never-admitted and sim-end prefill-only rows are partial observations and are excluded from that full-context equation",
@@ -1218,8 +1613,8 @@ fn definitions() -> Value {
         "afd_note": "for deployment=afd, attention actuals are summed from pool_tag=attn, \
                      section=attn and multiplied by observed layer count; FFN actuals are \
                      summed from pool_tag=ffn section rows and expected as Σ[p+m]×(layers+3)",
-        "causal_note": "cache-aware prefill work is p*hit+p(p+1)/2 and remains chunk-invariant; adding the saved hit(hit+1)/2 triangle recovers the cold baseline. For context-ready rows that baseline is the immutable (fresh+declared)(fresh+declared+1)/2; sim-end partial-prefill rows use only their observed hit+p context so unfinished work is not invented. This is causal work, not dense a*kv_len",
-        "decode_kv_note": "each decode pass reads the full logical post-prefill context hit+p, so m passes consume m(hit+p)+m(m-1)/2 KV-token reads where m=max(d-1,0)",
+        "causal_note": "cache-aware prefill work is p*hit+p(p+1)/2 and remains chunk-invariant; each reprocessed-prefill episode contributes the same form over its own hit/processed pair. Adding each saved hit triangle recovers the corresponding cold context.",
+        "decode_kv_note": "the no-retraction baseline is m*(hit+p)+m(m-1)/2. A completed reprocessed-prefill produces one output itself, so its would-be decode KV read is subtracted using output_tokens_before.",
         "decode_boundary_note": "a positive Δ on decode_passes / decode_kv_sum can be the \
                                  sim-end truncation boundary: an in-flight request's final \
                                  decode iteration is counted in cost_log but its token \
@@ -1249,6 +1644,81 @@ fn unavailable_payload(log_dir: &Path, reason: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conservation_mode_follows_explicit_worker_not_model_name() {
+        for arch in ["glm52_vllm_nvfp4_dsa_moe_speculative", "another_model"] {
+            for worker in ["speculative", "chunked_prefill"] {
+                let params = json!({"pools": {"main": {"groups": [{
+                    "arch": {"type": arch}, "worker": {"type": worker}
+                }]}}});
+                assert_eq!(uses_speculative_worker(&params), worker == "speculative");
+            }
+        }
+        assert!(!uses_speculative_worker(&json!({})));
+        assert!(!uses_speculative_worker(
+            &json!({"pools": {"main": {"groups": [{
+                "arch": {"type": "glm52_vllm_nvfp4_dsa_moe_speculative"}
+            }]}}})
+        ));
+    }
+
+    #[test]
+    fn reweighting_one_stratum_sums_to_its_count_and_leaves_the_other() {
+        let shape = |occurrences| WeightedWorkload {
+            totals: WorkloadTotals::default(),
+            occurrences,
+        };
+        let mut shapes = vec![shape(2), shape(1), shape(5)];
+        let prefill_flags = [true, true, false];
+        // 3 of 10 prefill iterations kept; the decode shape keeps its weight.
+        reweight_stratum(&mut shapes, &prefill_flags, true, 10, 3);
+        let weights: Vec<u64> = shapes.iter().map(|shape| shape.occurrences).collect();
+        assert_eq!(weights, vec![7, 3, 5]);
+    }
+
+    #[test]
+    fn the_prefill_hash_keeps_about_its_share_without_a_phase() {
+        // Catches a hash with a period: every 7th iteration is a prefill step
+        // here, and a phase-locked draw would keep all or none of them.
+        let cutoff = (0.1 * u64::MAX as f64) as u64;
+        let kept = (0..700_000u64)
+            .step_by(7)
+            .filter(|iteration| splitmix64(*iteration) <= cutoff)
+            .count();
+        assert!((9_000..11_000).contains(&kept), "kept {kept} of 100000");
+    }
+
+    #[test]
+    fn conservation_mode_scans_all_pools_and_groups() {
+        let params = json!({"pools": {
+            "first": {"groups": [{"worker": {"type": "chunked_prefill"}}]},
+            "second": {"groups": [{}, {"worker": {"type": "speculative"}}]}
+        }});
+        assert!(uses_speculative_worker(&params));
+    }
+
+    #[tokio::test]
+    async fn speculative_run_requires_observed_work() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("raw")).unwrap();
+        std::fs::write(
+            directory.path().join("raw/params.json"),
+            json!({
+                "pools": {"main": {"groups": [{
+                    "arch": {"type": "another_model"},
+                    "worker": {"type": "speculative", "draft_tokens": 5}
+                }]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (report, _) = run_workload(&SessionContext::new(), directory.path())
+            .await
+            .unwrap();
+        assert_eq!(report["available"], false);
+        assert!(report.to_string().contains("cost_log/ dir not found"));
+    }
 
     #[test]
     fn boundary_allowance_excludes_pending_and_completed_requests() {
@@ -1293,6 +1763,7 @@ mod tests {
                 prefix_cache_hit_tokens: Some(64.0),
                 prefill_tokens_processed: 32.0,
                 num_output_tokens: 4.0,
+                reprocessed_prefills: Vec::new(),
             },
         );
 
@@ -1325,8 +1796,57 @@ mod tests {
             ..Actual::default()
         };
         let checks = checks_for_mode(WorkloadMode::Iterwise, &actual, &expected);
-        assert_eq!(checks.len(), 11);
+        assert_eq!(checks.len(), 12);
         assert!(checks.iter().all(|check| check["status"] == "OK"));
+    }
+
+    #[test]
+    fn pp_expects_every_stage_to_log_each_prefill_once() {
+        let params = json!({"deployment": "pp", "pools": {"stage": {"groups": [{
+            "arch": {"type": "glm52_vllm_nvfp4_pp_dsa_moe", "pp_size": 4}
+        }]}}});
+        let mode = WorkloadMode::from_run(Some("pp"), Some(&params)).unwrap();
+        assert_eq!(mode, WorkloadMode::Pp { stages: 4 });
+        assert!(WorkloadMode::from_run(Some("pp"), Some(&json!({}))).is_err());
+
+        let mut expected = Expected::default();
+        expected.add_request(
+            mode,
+            0,
+            RequestSloWorkInput {
+                completed: true,
+                fresh_prompt_tokens: 100.0,
+                declared_prefix_tokens: 0.0,
+                prefix_cache_hit_tokens: Some(0.0),
+                prefill_tokens_processed: 100.0,
+                num_output_tokens: 1.0,
+                reprocessed_prefills: Vec::new(),
+            },
+        );
+        // Four stages each log the 100-token prompt, split into two chunks.
+        let stage_causal = (60.0 * 61.0 / 2.0) + (40.0 * 60.0 + 40.0 * 41.0 / 2.0);
+        let actual = Actual {
+            prefill_tokens: 400.0,
+            attn_batch_tokens: 400.0,
+            batch_tokens: 400.0,
+            causal: 4.0 * stage_causal,
+            ..Actual::default()
+        };
+        let checks = checks_for_mode(mode, &actual, &expected);
+        assert!(checks.iter().all(|check| check["status"] == "OK"));
+
+        // A stage that skipped one chunk is caught.
+        let short = Actual {
+            prefill_tokens: 360.0,
+            batch_tokens: 360.0,
+            ..actual
+        };
+        let checks = checks_for_mode(mode, &short, &expected);
+        let prefill = checks
+            .iter()
+            .find(|check| check["name"] == "prefill_tokens")
+            .unwrap();
+        assert_ne!(prefill["status"], "OK");
     }
 
     #[test]
@@ -1342,6 +1862,7 @@ mod tests {
                 prefix_cache_hit_tokens: Some(65.0),
                 prefill_tokens_processed: 32.0,
                 num_output_tokens: 1.0,
+                reprocessed_prefills: Vec::new(),
             },
         );
         expected.add_request(
@@ -1354,6 +1875,7 @@ mod tests {
                 prefix_cache_hit_tokens: None,
                 prefill_tokens_processed: 16.0,
                 num_output_tokens: 1.0,
+                reprocessed_prefills: Vec::new(),
             },
         );
 
@@ -1361,6 +1883,37 @@ mod tests {
         assert_eq!(expected.prefix_hit_bound_violations, 1);
         assert_eq!(expected.missing_prefix_resolution_requests, 1);
         assert_eq!(expected.prefix_token_balance_violations, 1);
+    }
+
+    #[test]
+    fn reprocessed_prefill_replaces_one_decode_pass_and_conserves_extra_work() {
+        let mut expected = Expected::default();
+        expected.add_request(
+            WorkloadMode::Iterwise,
+            0,
+            RequestSloWorkInput {
+                completed: true,
+                fresh_prompt_tokens: 10.0,
+                declared_prefix_tokens: 0.0,
+                prefix_cache_hit_tokens: Some(0.0),
+                prefill_tokens_processed: 10.0,
+                num_output_tokens: 5.0,
+                reprocessed_prefills: vec![ReprocessedPrefillWorkInput {
+                    output_tokens_before: 2.0,
+                    prefix_cache_hit_tokens: 0.0,
+                    prefill_tokens_processed: 12.0,
+                    completed: true,
+                }],
+            },
+        );
+
+        assert_eq!(expected.reprocessed_prefill_episodes, 1);
+        assert_eq!(expected.reprocessed_token_balance_violations, 0);
+        assert_eq!(expected.prefill_tokens, 22.0);
+        assert_eq!(expected.decode_passes, 3.0);
+        assert_eq!(expected.batch_tokens, 25.0);
+        assert_eq!(expected.causal, 133.0);
+        assert_eq!(expected.decode_kv, 35.0);
     }
 
     #[test]
@@ -1376,6 +1929,7 @@ mod tests {
                 prefix_cache_hit_tokens: Some(64.0),
                 prefill_tokens_processed: 8.0,
                 num_output_tokens: 0.0,
+                reprocessed_prefills: Vec::new(),
             },
         );
 
@@ -1417,12 +1971,94 @@ mod tests {
             decode_kv: 16.0,
             prefill_requests: 1.0,
             prefill_stateful_requests: 1.0,
+            ..WorkloadTotals::default()
         };
         totals.scale(1_000.0);
         assert_eq!(totals.matmul_tokens, 3_000.0);
         assert_eq!(totals.prefill_pairs, 7_000.0);
         assert_eq!(totals.decode_kv, 16_000.0);
         assert_eq!(totals.prefill_stateful_requests, 1_000.0);
+    }
+
+    #[tokio::test]
+    async fn logged_decode_kv_lens_carry_exact_request_geometry() {
+        use std::sync::Arc;
+
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::arrow::json::ReaderBuilder;
+
+        let list_u32 = || DataType::List(Arc::new(Field::new("item", DataType::UInt32, false)));
+        let groups = DataType::Struct(
+            vec![
+                Field::new("batch_tokens", DataType::UInt32, false),
+                Field::new("prefill_tokens", DataType::UInt32, false),
+                Field::new("decode_request_count", DataType::UInt32, false),
+                Field::new("decode_kv_total", DataType::UInt32, false),
+                Field::new("prefill_prefix_lens", list_u32(), false),
+                Field::new("prefill_append_lens", list_u32(), false),
+                Field::new("decode_kv_lens", list_u32(), true),
+            ]
+            .into(),
+        );
+        let schema = Schema::new(vec![
+            Field::new("pool_tag", DataType::Utf8, false),
+            Field::new("worker_id", DataType::UInt16, false),
+            Field::new("iter_id", DataType::UInt64, false),
+            Field::new(
+                "groups",
+                DataType::List(Arc::new(Field::new("item", groups, false))),
+                false,
+            ),
+        ]);
+        // Iteration 1 opts in (two decodes at 3000, one at 10, a 29-token chunk);
+        // iteration 2 is an older-style row with the column null.
+        let rows = [
+            json!({"pool_tag":"main","worker_id":0,"iter_id":1,"groups":[{
+                "batch_tokens":32,"prefill_tokens":29,"decode_request_count":3,
+                "decode_kv_total":6010,"prefill_prefix_lens":[2019],"prefill_append_lens":[29],
+                "decode_kv_lens":[3000,10,3000]}]}),
+            json!({"pool_tag":"main","worker_id":0,"iter_id":2,"groups":[{
+                "batch_tokens":1,"prefill_tokens":0,"decode_request_count":1,
+                "decode_kv_total":50,"prefill_prefix_lens":[],"prefill_append_lens":[],
+                "decode_kv_lens":null}]}),
+        ];
+        let encoded = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let batch = ReaderBuilder::new(Arc::new(schema))
+            .build(encoded.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("cost_log", batch).unwrap();
+
+        let exact = collect_iteration_workload(&ctx, "main", 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(exact.decode_kv, 6010.0);
+        assert_eq!(exact.prefill_pairs, 29.0 * 2019.0 + 29.0 * 30.0 / 2.0);
+        assert_eq!(
+            exact.request_geometry,
+            BTreeMap::from([
+                ("decode:10".to_string(), 1.0),
+                ("decode:3000".to_string(), 2.0),
+                ("prefill:2019:29".to_string(), 1.0),
+            ])
+        );
+        let legacy = collect_iteration_workload(&ctx, "main", 0, 2)
+            .await
+            .unwrap();
+        assert!(legacy.request_geometry.is_empty());
+        assert_eq!(legacy.decode_kv, 50.0);
+
+        let mut rollup = exact.clone();
+        rollup.add(&exact);
+        rollup.scale(0.5);
+        assert_eq!(rollup.request_geometry, exact.request_geometry);
     }
 
     #[test]

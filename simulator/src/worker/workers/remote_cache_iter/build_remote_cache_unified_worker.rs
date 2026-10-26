@@ -1,4 +1,4 @@
-//! Remote unified recipe: FullAttnKv × RemoteCachePrefillDecodeAdmission × unified execution.
+//! Remote unified recipe: KvCacheStore × RemoteCachePrefillDecodeAdmission × unified execution.
 use super::RemoteCacheIterWorker;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
@@ -6,11 +6,11 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{LoadBalance, PendingOrder, RemoteCachePrefillDecodeAdmission};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::FullAttnKv;
+use crate::worker::kv::KvCacheStore;
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter::IterBatchWorker;
-use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prepare_unified_iter_build_essentials,
+use crate::worker::workers::iter_build_essentials::{
+    kv_cache_store, prepare_iter_build_essentials, resolve_kv_accounting,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,29 +27,27 @@ pub(crate) fn build_remote_cache_unified_worker<M: IterwiseUnifiedModel>(
     gpu_name: &str,
     cluster: SharedGpuCluster,
 ) -> RemoteCacheIterWorker<
-    FullAttnKv,
+    KvCacheStore,
     RemoteCachePrefillDecodeAdmission<PendingOrder>,
     UnifiedIterExecution<M>,
 > {
     let logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let partitions = model.num_attn_dp_groups().max(1) as usize;
     let shards = model.num_attn_shards().max(1);
-    let bytes_per_token = model.total_kv_bytes_per_token();
-    let capacity = full_attention_token_capacity(model.as_ref(), &config);
-    let cache = config
-        .prefix_cache
-        .resolve_tokens(capacity, bytes_per_token, shards);
-    let essentials = prepare_unified_iter_build_essentials(
+    let accounting = resolve_kv_accounting(&model.kv_cache_layout(), shards, &config);
+    let bytes_per_token = accounting.transfer_bytes(1);
+    let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
-        model,
         requests,
         &config,
         cost_log_dir,
         pool,
         gpu_name,
         &cluster,
-        capacity,
+        model.gpus_per_replica(),
+        model.cost_log_manifest(),
+        &accounting,
         partitions,
     );
     let group = cluster.borrow_mut().register_comm_group(
@@ -58,7 +56,14 @@ pub(crate) fn build_remote_cache_unified_worker<M: IterwiseUnifiedModel>(
         pool_tag,
         id.0,
     );
-    let kv = FullAttnKv::with_prefix_cache(partitions, capacity, cache, essentials.sampler, logger);
+    let kv = kv_cache_store(
+        accounting,
+        partitions,
+        shards,
+        &config,
+        essentials.sampler,
+        logger,
+    );
     let balance = match config.balance {
         LoadBalance::Single if partitions > 1 => LoadBalance::RoundRobin { next: 0 },
         configured => configured,
@@ -71,7 +76,11 @@ pub(crate) fn build_remote_cache_unified_worker<M: IterwiseUnifiedModel>(
         config.max_inflight_remote_reads,
         group,
     );
-    let iteration =
-        IterBatchWorker::from_components(essentials.context, kv, admission, essentials.execution);
+    let iteration = IterBatchWorker::from_components(
+        essentials.context,
+        kv,
+        admission,
+        UnifiedIterExecution::new(model, essentials.cost),
+    );
     RemoteCacheIterWorker::new(iteration, cluster, bytes_per_token)
 }

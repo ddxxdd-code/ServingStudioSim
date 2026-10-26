@@ -92,6 +92,47 @@ pub async fn register_gpu_cluster(ctx: &SessionContext, log_dir: &std::path::Pat
     register_if_exists(ctx, GPU_CLUSTER_TABLE, path).await
 }
 
+/// The `slot_backend` value of a leaf not executed that iteration, as the
+/// simulator publishes it: the column's `none` field metadata
+/// (`simulator/src/log/schemas.rs`), read from the footer of `cost_log` (one
+/// parquet file, or the first in a directory of them) because DataFusion's
+/// table schema drops field metadata. `None` when the file has no
+/// `slot_backend` column (a run that predates it).
+pub fn slot_backend_none(cost_log: &std::path::Path) -> Result<Option<u8>> {
+    /// What runs written before the simulator published `none` used.
+    const UNPUBLISHED_NONE: u8 = 255;
+    let file = if cost_log.is_dir() {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(cost_log)
+            .with_context(|| format!("list {}", cost_log.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+            .collect();
+        files.sort();
+        files
+            .into_iter()
+            .next()
+            .with_context(|| format!("{} holds no parquet file", cost_log.display()))?
+    } else {
+        cost_log.to_path_buf()
+    };
+    let reader = std::fs::File::open(&file).with_context(|| format!("open {}", file.display()))?;
+    let builder =
+        datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(reader)
+            .with_context(|| format!("read parquet metadata of {}", file.display()))?;
+    let Ok(field) = builder.schema().field_with_name("slot_backend") else {
+        return Ok(None);
+    };
+    match field.metadata().get("none") {
+        None => Ok(Some(UNPUBLISHED_NONE)),
+        Some(none) => none.parse().map(Some).with_context(|| {
+            format!(
+                "{}: slot_backend `none` metadata {none:?} is not a u8",
+                file.display()
+            )
+        }),
+    }
+}
+
 /// Drift guard: fail with a clear message if any expected column is absent from
 /// a registered table, instead of letting a later extraction read NaN/null.
 pub async fn require_columns(ctx: &SessionContext, table: &str, columns: &[&str]) -> Result<()> {
@@ -258,7 +299,9 @@ pub struct GroupInput {
 /// inputs. Null row → empty vec. Struct field order is fixed by the sim writer
 /// (`simulator/src/log/rows.rs::build_groups_column`): 0 batch_tokens, 1
 /// prefill_tokens, 2 decode_request_count, 3 decode_kv_total, 4 prefill_prefix_lens
-/// (`List<UInt32>`), 5 prefill_append_lens (`List<UInt32>`).
+/// (`List<UInt32>`), 5 prefill_append_lens (`List<UInt32>`), 6 decode_query_rows.
+/// These indices are positional, so the writer appends new columns after the last
+/// one and never inserts. Field 6 is written but not read here yet.
 pub fn value_groups(array: &ArrayRef, row: usize) -> Result<Vec<GroupInput>> {
     let list = array
         .as_any()

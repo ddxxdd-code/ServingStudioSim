@@ -3,8 +3,8 @@
 This is an L1a-side, **cache-free** verb. Given one kernel spec it picks an idle
 GPU and spawns the profiling worker with a ``measure`` block, so the shared
 ``Timer.cupti`` seam runs a sustained per-launch duration trend + NVML telemetry
-(see ``profilers/trend.py``) and writes CSV / ``summary.json`` / two PNGs into
-``output_dir``. It never writes ``profile.db``.
+(see ``profilers/trend.py``) and writes CSV plus ``summary.json`` into
+``output_dir``. PNG rendering is optional. It never writes ``profile.db``.
 
 Only CUPTI-timed compute kernels are supported: comm kinds are rejected up front,
 and a compute runner that never reaches ``Timer.cupti`` is reported unsupported
@@ -27,12 +27,14 @@ from profiling.db.registry import (
     resolve_spec_backend,
 )
 from profiling.exec.env import (
+    ContainerProfileEnv,
     ProfileEnv,
     compose_library_path,
-    compose_pythonpath,
     resolve_profile_env,
+    set_worker_python_env,
 )
-from profiling.exec.local import find_idle_gpus
+from profiling.exec.local import _container_worker_command, find_idle_gpus
+from profiling.gpu_policy import require_gpu
 
 
 class MeasureError(RuntimeError):
@@ -50,6 +52,7 @@ def measure_kernel(
     telemetry_hz: float = 20.0,
     clear_l2: bool = True,
     telemetry: bool = True,
+    cuda_graph: bool = False,
 ) -> dict[str, Any]:
     """Run one trend+telemetry capture for ``spec`` and return the artifact summary."""
 
@@ -70,6 +73,7 @@ def measure_kernel(
     resolved_output_dir = Path(output_dir).resolve()
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
+    require_gpu(f"measuring {kernel_kind}:{resolved_backend}")
     idle_gpus = find_idle_gpus()
     if not idle_gpus:
         raise MeasureError("no idle GPU found for measure")
@@ -83,12 +87,15 @@ def measure_kernel(
         spec=spec,
         gpu_index=gpu_index,
         profiler_env=profiler_env,
+        worker_env=dict(profiler_spec.worker_env),
+        imex_channel=profiler_spec.imex_channel,
         measure_block={
             "output_dir": str(resolved_output_dir),
             "duration_s": duration_s,
             "telemetry_hz": telemetry_hz,
             "clear_l2": clear_l2,
             "telemetry": telemetry,
+            "cuda_graph": cuda_graph,
         },
     )
 
@@ -124,8 +131,10 @@ def _run_worker(
     kernel_kind: KernelKind,
     spec: dict[str, Any],
     gpu_index: int,
-    profiler_env: ProfileEnv,
+    profiler_env: ProfileEnv | ContainerProfileEnv,
     measure_block: dict[str, Any],
+    worker_env: dict[str, str] | None = None,
+    imex_channel: bool = False,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="vibesim-measure-") as tmp:
         input_path = Path(tmp) / "input.json"
@@ -140,32 +149,37 @@ def _run_worker(
             ),
             encoding="utf-8",
         )
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-        env["PYTHONPATH"] = compose_pythonpath(
-            profiler_env,
-            env.get("PYTHONPATH"),
-        )
-        if profiler_env.additional_library_paths:
-            env["LD_LIBRARY_PATH"] = compose_library_path(
+        if isinstance(profiler_env, ContainerProfileEnv):
+            output_dir = Path(measure_block["output_dir"]).resolve()
+            cmd, env = _container_worker_command(
                 profiler_env,
-                env.get("LD_LIBRARY_PATH"),
+                [gpu_index],
+                Path(tmp),
+                additional_volumes=((output_dir, output_dir),),
+                worker_env=worker_env,
+                imex_channel=imex_channel,
             )
-        cmd = [
-            str(profiler_env.python_executable),
-            "-m",
-            "profiling.exec.local_worker",
-            "--worker-input",
-            str(input_path),
-            "--worker-output",
-            str(worker_output),
-        ]
+        else:
+            env = os.environ.copy()
+            env.update(worker_env or {})
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+            set_worker_python_env(profiler_env, env)
+            if profiler_env.additional_library_paths:
+                env["LD_LIBRARY_PATH"] = compose_library_path(
+                    profiler_env,
+                    env.get("LD_LIBRARY_PATH"),
+                )
+            cmd = [
+                str(profiler_env.python_executable),
+                "-m",
+                "profiling.exec.local_worker",
+                "--worker-input",
+                str(input_path),
+                "--worker-output",
+                str(worker_output),
+            ]
         completed = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
         if completed.returncode != 0:
-            error = (
-                completed.stderr.strip()
-                or completed.stdout.strip()
-                or "measure worker failed"
-            )
+            error = completed.stderr.strip() or completed.stdout.strip() or "measure worker failed"
             raise MeasureError(error)
         return json.loads(worker_output.read_text(encoding="utf-8"))

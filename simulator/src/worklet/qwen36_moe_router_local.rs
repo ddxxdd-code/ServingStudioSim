@@ -88,7 +88,6 @@ impl Qwen36MoeRouterLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 num_experts: cfg.num_experts.clone(),
                 top_k: cfg.top_k,
-                block_size: cfg.block_size,
             },
             raw_cfg: cfg.clone(),
         }
@@ -145,9 +144,8 @@ impl Qwen36MoeRouterLocalWorklet {
     }
 
     pub fn eval(&self, input: &Qwen36MoeRouterLocalWorkletInput, ev: &mut Evaluator) {
-        let work = derive_work(input).unwrap_or_else(|reason| {
-            panic!("invalid Qwen36MoeRouterLocalWorkletInput: {reason}")
-        });
+        let work = derive_work(input)
+            .unwrap_or_else(|reason| panic!("invalid Qwen36MoeRouterLocalWorkletInput: {reason}"));
         self.router.eval(&work.router, ev);
         self.topk.eval(&work.topk, ev);
         eval_align_or_zero(&self.align, work.align, work.run_alignment, ev);
@@ -174,6 +172,7 @@ fn derive_work(input: &Qwen36MoeRouterLocalWorkletInput) -> Result<WorkInputs, S
         },
         align: MoeAlignBlockSizeKernelInput {
             num_tokens: input.batch_tokens,
+            block_size: BLOCK_SIZE,
         },
         run_alignment: input.batch_tokens >= ALIGNMENT_MIN_TOKENS,
     })
@@ -281,7 +280,6 @@ mod tests {
         assert_eq!(resolved.topk.backends, ["vllm_cuda"]);
         assert_eq!(resolved.align.num_experts.get(), 256);
         assert_eq!(resolved.align.top_k, 8);
-        assert_eq!(resolved.align.block_size, 16);
         assert_eq!(resolved.align.backends, ["vllm_cuda"]);
     }
 
@@ -303,10 +301,10 @@ mod tests {
         }
         let mut bad = cfg();
         bad.activation_dtype = DType::Fp16;
-        assert!(std::panic::catch_unwind(|| {
-            Qwen36MoeRouterLocalWorklet::resolve_config(&bad)
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| { Qwen36MoeRouterLocalWorklet::resolve_config(&bad) })
+                .is_err()
+        );
     }
 
     #[test]
@@ -407,7 +405,7 @@ mod tests {
             assert_eq!(metrics[0].coverage, CoverageFlags::EMPTY);
             assert_eq!(
                 serde_json::to_value(inputs).unwrap(),
-                serde_json::json!([{"num_tokens": tokens}])
+                serde_json::json!([{"num_tokens": tokens, "block_size": 16}])
             );
         }
     }
@@ -443,6 +441,7 @@ mod tests {
             assert_eq!(work.router.m, tokens);
             assert_eq!(work.topk.num_tokens, tokens);
             assert_eq!(work.align.num_tokens, tokens);
+            assert_eq!(work.align.block_size, 16);
             assert!(work.run_alignment);
             let mut metrics = [LeafMetrics::MISS];
             let mut inputs = Vec::new();
@@ -451,7 +450,7 @@ mod tests {
             assert_eq!(metrics[0].m.time_ms, tokens as f32);
             assert_eq!(
                 serde_json::to_value(inputs).unwrap(),
-                serde_json::json!([{"num_tokens": tokens}])
+                serde_json::json!([{"num_tokens": tokens, "block_size": 16}])
             );
         }
     }

@@ -850,6 +850,7 @@ mod tests {
             ..Default::default()
         };
         let model = Arc::new(FakeModel {
+            kv_layout: None,
             ms: 0.3,
             dp_groups: 2,
         });

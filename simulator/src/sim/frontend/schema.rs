@@ -1,11 +1,13 @@
-//! Adapt req-frontend's validated input rows into statically typed VibeSim requests.
+//! Adapt req-frontend's validated input rows into statically typed ServingStudioSim requests.
 //!
 //! The shared crate owns complete input-file formats, header matching, CSV
 //! decoding, tag decoding, and format-specific structural validation. This
-//! module starts after that boundary: it assigns VibeSim's dense ids and turns
-//! each shared row into one concrete [`RequestDefinition`].
+//! module starts after that boundary: it assigns ServingStudioSim's dense ids and turns
+//! each shared row into one concrete [`RequestDefinition`]. The one exception is
+//! `text-generation-independent`'s optional `prefix_len` column, which the shared
+//! crate does not declare yet; [`super::pinned_prefix`] reads it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -18,6 +20,7 @@ use req_frontend::schema::{RequestPriority, RequestSession, RequestSlo, RequestS
 use super::arrival::{
     ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
 };
+use super::pinned_prefix::{self, TextGenerationIndependentRow};
 use crate::common::{
     AudioExtent, AudioTextGenerationDefinition, DecodingStrategy, ImageExtent,
     ImageGenerationDefinition, ImageTextGenerationDefinition, ImageToVideoDefinition,
@@ -60,7 +63,7 @@ fn parse_independent_metadata(
     session_start_times: &mut HashMap<u32, Time>,
     source_identities: &mut SourceIdentities,
 ) -> Result<ParsedMetadata> {
-    let request_id = source_identities.intern_request(source_request_id)?;
+    let request_id = source_identities.intern_request(source_request_id);
     let (release_session, session_input) = match session.session_id.as_deref() {
         Some(source_session_id) if !source_session_id.is_empty() => {
             let session_id = source_identities.intern_session(source_session_id);
@@ -93,7 +96,7 @@ fn parse_independent_metadata(
         scheduling: SchedulingDeclaration {
             priority: i32::try_from(priority.priority_or_default()).with_context(|| {
                 format!(
-                    "request {source_request_id:?}: priority does not fit VibeSim's i32 contract"
+                    "request {source_request_id:?}: priority does not fit ServingStudioSim's i32 contract"
                 )
             })?,
         },
@@ -121,7 +124,16 @@ macro_rules! impl_independent_source_row {
     };
 }
 
-impl_independent_source_row!(text_generation::independent::TextGenerationRow);
+impl IndependentSourceRow for TextGenerationIndependentRow {
+    fn source_request_id(&self) -> &str {
+        &self.row.id
+    }
+
+    fn trace_arrival_time_ms(&self) -> f64 {
+        self.row.arrival_time
+    }
+}
+
 impl_independent_source_row!(image_to_text::Row);
 impl_independent_source_row!(video_to_text::Row);
 impl_independent_source_row!(audio_to_text::Row);
@@ -177,21 +189,27 @@ impl TraceDefinition for TextGenerationDefinition {
         let path = path_text(path)?;
         match input_file_schema.input_file_format {
             InputFileFormat::TextGenerationIndependent => append_independent(
-                text_generation::independent::load(path, input_file_schema)?,
+                pinned_prefix::load(path, input_file_schema)?,
                 session_start_times,
                 source_identities,
                 output,
-                |row, session, decoding| {
+                |TextGenerationIndependentRow {
+                     row,
+                     pinned_prefix_tokens,
+                 },
+                 session,
+                 decoding| {
                     Ok(Self {
                         prompt_tokens: usize_to_u32(row.input_len, "input_len")?,
                         target_output_tokens: usize_to_u32(row.output_len, "output_len")?,
-                        session,
+                        session: pin_prefix(session, pinned_prefix_tokens, &row.id)?,
                         decoding,
                     })
                 },
             ),
             InputFileFormat::TextGenerationSessionExecutionV2 => {
                 let sessions = text_generation::session::load(path, input_file_schema)?;
+                output.reserve(sessions.iter().map(|(_, rounds)| rounds.len()).sum());
                 for (source_session_id, rounds) in sessions {
                     let session_id = source_identities.intern_session(&source_session_id);
                     let declared_session_start_time = Time::from_ms(
@@ -204,7 +222,7 @@ impl TraceDefinition for TextGenerationDefinition {
                         .entry(session_id)
                         .or_insert(declared_session_start_time);
                     for round in rounds {
-                        let request_id = source_identities.intern_request(&round.request_id)?;
+                        let request_id = source_identities.intern_request(round.request_id);
                         let declared_prefix_tokens = usize_to_u32(round.prefix_len, "prefix_len")?;
                         output.push(ScheduledRequest {
                             release: ReleaseMetadata {
@@ -507,6 +525,28 @@ fn usize_to_u32(value: usize, column: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("{column}={value} exceeds u32"))
 }
 
+/// Attach a row's `prefix_len` to the session declaration its tags produced.
+/// Zero keeps the declaration unchanged, so a trace without pinned prefixes
+/// loads exactly as before the column existed.
+fn pin_prefix(
+    session: SessionInput,
+    pinned_prefix_tokens: u32,
+    source_request_id: &str,
+) -> Result<SessionInput> {
+    if pinned_prefix_tokens == 0 {
+        return Ok(session);
+    }
+    match session {
+        SessionInput::Standalone => Ok(SessionInput::PinnedPrefix {
+            prefix_tokens: pinned_prefix_tokens,
+        }),
+        SessionInput::Session { .. } | SessionInput::PinnedPrefix { .. } => bail!(
+            "request {source_request_id:?}: prefix_len pins a standalone request's prefix; \
+             a session row declares its reusable prefix with prefix_kv"
+        ),
+    }
+}
+
 fn slo_contract(slo: RequestSlo) -> SloContract {
     SloContract {
         ttft_slo: slo.ttft_slo_ms.map(Time::from_ms),
@@ -564,7 +604,6 @@ fn resolve_count(duration: f64, rate: f64, duration_name: &str, rate_name: &str)
 pub struct SourceIdentities {
     sessions: HashMap<String, u32>,
     session_order: Vec<String>,
-    request_ids: HashMap<String, RequestId>,
     requests: Vec<String>,
 }
 
@@ -579,14 +618,22 @@ impl SourceIdentities {
         dense
     }
 
-    fn intern_request(&mut self, source_id: &str) -> Result<RequestId> {
-        if self.request_ids.contains_key(source_id) {
-            bail!("duplicate request id {source_id:?} across input files");
+    /// Reject a request id seen twice, then free the session lookup map: after
+    /// loading only the dense-to-source vectors are read. Ids are checked once
+    /// here, borrowed, rather than copied into a map row by row.
+    pub(super) fn finish_loading(&mut self) -> Result<()> {
+        let mut seen = HashSet::with_capacity(self.requests.len());
+        if let Some(duplicate) = self.requests.iter().find(|id| !seen.insert(id.as_str())) {
+            bail!("duplicate request id {duplicate:?} across input files");
         }
+        self.sessions = HashMap::new();
+        Ok(())
+    }
+
+    fn intern_request(&mut self, source_id: impl Into<String>) -> RequestId {
         let dense = RequestId(self.requests.len() as u32);
-        self.request_ids.insert(source_id.to_string(), dense);
-        self.requests.push(source_id.to_string());
-        Ok(dense)
+        self.requests.push(source_id.into());
+        dense
     }
 
     pub fn session_source_ids(&self) -> &[String] {
@@ -596,6 +643,23 @@ impl SourceIdentities {
     pub fn request_source_ids(&self) -> &[String] {
         &self.requests
     }
+
+    /// Dense request `id` in the trace's own name (its ordinal if unnamed).
+    pub fn request_source_id(&self, id: RequestId) -> String {
+        source_or_ordinal(&self.requests, id.0)
+    }
+
+    /// Dense session `id` in the trace's own name (its ordinal if unnamed).
+    pub fn session_source_id(&self, id: u32) -> String {
+        source_or_ordinal(&self.session_order, id)
+    }
+}
+
+fn source_or_ordinal(source_ids: &[String], dense: u32) -> String {
+    source_ids
+        .get(dense as usize)
+        .cloned()
+        .unwrap_or_else(|| dense.to_string())
 }
 
 pub(super) fn load_file<Definition: TraceDefinition>(

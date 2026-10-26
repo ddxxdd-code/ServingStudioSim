@@ -129,16 +129,19 @@ def test_protocol_audit_rejects_corruption(fault, message):
         ("kv_snapshot/worker_decode_0.parquet", "missing compute KV snapshot stream"),
     ],
 )
-def test_completed_marker_cannot_hide_missing_required_streams(tmp_path, missing, message):
+@pytest.mark.parametrize("capacity_field", ["capacity_tokens", "capacity_units"])
+def test_completed_marker_cannot_hide_missing_required_streams(
+    tmp_path, missing, message, capacity_field
+):
     rows, requests, network, capacities = protocol()
     requests[0]["completed"] = True
     raw = tmp_path / "raw"
     (raw / "kv_snapshot").mkdir(parents=True)
     (tmp_path / ".complete").touch()
     (tmp_path / "summary.json").write_text(json.dumps(dict(sim_ms=4.0)))
-    workers = [dict(worker_id=0, pool_tag="decode", kv_pools=[dict(capacity_tokens=100)])]
+    workers = [dict(worker_id=0, pool_tag="decode", kv_pools=[{capacity_field: 100}])]
     workers += [
-        dict(worker_id=store, pool_tag="kv_store", kv_pools=[dict(capacity_tokens=capacity)])
+        dict(worker_id=store, pool_tag="kv_store", kv_pools=[{capacity_field: capacity}])
         for store, capacity in capacities.items()
     ]
     (raw / "run_meta.json").write_text(json.dumps(dict(workers=workers)))

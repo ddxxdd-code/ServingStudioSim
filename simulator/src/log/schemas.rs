@@ -1,4 +1,4 @@
-//! Arrow schema definitions for the VibeSim parquet streams.
+//! Arrow schema definitions for the ServingStudioSim parquet streams.
 //!
 //! Modeled on `ref/moesim-rs/src/logging/schemas.rs` — each stream gets a
 //! `pub fn xxx_schema() -> Arc<Schema>` returning a real
@@ -12,6 +12,8 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema};
+
+use crate::timing::{CoverageFlags, LeafMetrics};
 
 /// Remote storage receipts and router write-placement decisions.
 pub fn kv_store_event_schema() -> Arc<Schema> {
@@ -74,8 +76,10 @@ pub fn cost_log_envelope_schema() -> Arc<Schema> {
 /// kept at full per-request fidelity (the two parallel `prefill_*_lens` lists);
 /// decode is aggregated to two scalars (`decode_request_count` / `decode_kv_total`)
 /// — the per-decode-request KV-length list is the size driver (re-logged every
-/// step) and is intentionally dropped. `prefill_request_count` is the list length,
-/// so it is not a separate field.
+/// step) and is dropped unless the model opts in (`decode_kv_lens`). `prefill_request_count` is the list length,
+/// so it is not a separate field. `decode_query_rows` is the query-row count,
+/// which equals `decode_request_count` for an ordinary engine and exceeds it by
+/// the verify width under speculative decoding.
 pub(crate) fn group_input_fields() -> Fields {
     let u32_item = || Arc::new(Field::new("item", DataType::UInt32, false));
     Fields::from(vec![
@@ -85,6 +89,13 @@ pub(crate) fn group_input_fields() -> Fields {
         Field::new("decode_kv_total", DataType::UInt32, false),
         Field::new("prefill_prefix_lens", DataType::List(u32_item()), false),
         Field::new("prefill_append_lens", DataType::List(u32_item()), false),
+        // Appended, never inserted: `analyzer/rust/src/session.rs` reads the
+        // first five fields by position.
+        Field::new("decode_query_rows", DataType::UInt32, false),
+        Field::new("speculative_geometry", DataType::Utf8, true),
+        // Null unless the model opts in (`logs_decode_kv_lens`): per-request decode
+        // context for labelers whose necessary work is not linear in the KV total.
+        Field::new("decode_kv_lens", DataType::List(u32_item()), true),
     ])
 }
 
@@ -125,7 +136,10 @@ pub fn cost_log_schema() -> Arc<Schema> {
         Field::new("energy_j", DataType::Float64, false),
         Field::new("groups", DataType::List(group_item), false),
         Field::new("slot_time_ms", DataType::List(time_item), false),
-        Field::new("slot_coverage", DataType::List(cov_item), false),
+        // The metadata names the bits (`CoverageFlags::NAMES`, comma-separated,
+        // bit 0 first), so no reader keeps its own copy.
+        Field::new("slot_coverage", DataType::List(cov_item), false)
+            .with_metadata([("flags".to_string(), CoverageFlags::NAMES.join(","))].into()),
         // Per-slot input JSON (one string per leaf, slot-aligned to slot_time_ms).
         // Appended last: append-only, so old readers are unaffected.
         Field::new(
@@ -161,15 +175,17 @@ pub fn cost_log_schema() -> Arc<Schema> {
         ),
         // Per-slot selected backend (slot-aligned to `slot_time_ms`): the
         // position-local index into the leaf's candidate list (`backends` in the
-        // matching `cost_manifest` sidecar), or `255` when the leaf was not
-        // executed this iteration. Lets a consumer see which of a multi-backend
-        // position's candidates best-of-N picked. Appended last: append-only, so
-        // old readers are unaffected.
+        // matching `cost_manifest` sidecar), or `LeafMetrics::NO_BACKEND`
+        // (its `none` metadata) when the leaf was not executed this iteration.
+        // Lets a consumer see which of a multi-backend position's candidates
+        // best-of-N picked. Appended last: append-only, so old readers are
+        // unaffected.
         Field::new(
             "slot_backend",
             DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
             false,
-        ),
+        )
+        .with_metadata([("none".to_string(), LeafMetrics::NO_BACKEND.to_string())].into()),
     ]))
 }
 
@@ -225,6 +241,7 @@ pub fn prefix_cache_event_schema() -> Arc<Schema> {
         Field::new("cache_used_after", DataType::UInt64, false),
         Field::new("requested_tokens", DataType::UInt64, false),
         Field::new("hit_tokens", DataType::UInt64, false),
+        Field::new("full_hit_tokens", DataType::UInt64, false),
     ]))
 }
 
@@ -383,6 +400,33 @@ pub fn request_slo_schema() -> Arc<Schema> {
         Field::new("declared_ttft_slo_ms", DataType::Float32, true),
         Field::new("declared_tpot_slo_ms", DataType::Float32, true),
         Field::new("declared_e2e_slo_ms", DataType::Float32, true),
+        // Decode retraction and the resulting reprocessed-prefill episodes.
+        // The four list columns are parallel and preserve episode order.
+        Field::new("retraction_count", DataType::UInt32, false),
+        Field::new(
+            "reprocessed_prefill_output_tokens_before",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, false))),
+            false,
+        ),
+        Field::new(
+            "reprocessed_prefill_prefix_hit_tokens",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, false))),
+            false,
+        ),
+        Field::new(
+            "reprocessed_prefill_processed_tokens",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, false))),
+            false,
+        ),
+        Field::new(
+            "reprocessed_prefill_completed",
+            DataType::List(Arc::new(Field::new("item", DataType::Boolean, false))),
+            false,
+        ),
+        Field::new("speculative_progress", DataType::Utf8, true),
+        // The immutable output length the request asks for. Appended last to
+        // keep the schema append-only.
+        Field::new("target_output_tokens", DataType::UInt32, false),
     ]))
 }
 

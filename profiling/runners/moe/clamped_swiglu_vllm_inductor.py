@@ -1,0 +1,99 @@
+"""Profile vLLM Marlin's production clamped-SwiGLU callable."""
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from profiling.db.args import DType
+from profiling.profilers.energy import Energy
+from profiling.profilers.timer import Timer
+from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
+from profiling.runners.metrics import ComputeMetrics
+from profiling.runners.moe.clamped_swiglu_reference import (
+    CLAMP_LIMIT,
+    clamped_swiglu_reference,
+)
+
+_BACKEND = "clamped_swiglu:vllm_inductor"
+
+
+@dataclass(frozen=True)
+class _Launch:
+    callable: Callable[..., None]
+    output_tensor: Any
+    input_tensor: Any
+
+    def run(self) -> None:
+        self.callable(self.output_tensor, self.input_tensor, CLAMP_LIMIT)
+
+
+def _validate_args(num_rows: int, hidden_dim: int, dtype: DType | str) -> tuple[int, int]:
+    if type(num_rows) is not int or num_rows <= 0:
+        raise ValueError("num_rows must be a positive integer")
+    # vLLM's silu_and_mul_with_clamp takes any width: it vectorizes when
+    # hidden_dim is a whole number of vectors and runs a scalar loop otherwise.
+    if type(hidden_dim) is not int or hidden_dim <= 0:
+        raise ValueError("hidden_dim must be a positive integer")
+    if DType.from_value(dtype) is not DType.BF16:
+        raise ProfilerNotImplemented(f"{_BACKEND} requires dtype=bf16")
+    return num_rows, hidden_dim
+
+
+def _prepare(torch: Any, callable_: Callable[..., None], num_rows: int, hidden_dim: int) -> _Launch:
+    device = torch.device("cuda", torch.cuda.current_device())
+    generator = torch.Generator(device=device).manual_seed(0)
+    input_tensor = torch.randn(
+        (num_rows, 2 * hidden_dim),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    output_tensor = torch.empty((num_rows, hidden_dim), dtype=torch.bfloat16, device=device)
+    return _Launch(callable_, output_tensor, input_tensor)
+
+
+def _compile_and_check(torch: Any, launch: _Launch) -> None:
+    for _ in range(3):
+        launch.run()
+    torch.cuda.synchronize()
+    expected = clamped_swiglu_reference(torch, launch.input_tensor)
+    torch.testing.assert_close(launch.output_tensor, expected, atol=0.02, rtol=0.02)
+
+
+def profile_clamped_swiglu_vllm_inductor(
+    num_rows: int,
+    hidden_dim: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    num_rows, hidden_dim = _validate_args(num_rows, hidden_dim, dtype)
+    try:
+        import torch
+        from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
+    except ImportError as exc:
+        raise ProfilerNotImplemented(f"{_BACKEND} requires the pinned vLLM environment") from exc
+
+    try:
+        launch = _prepare(torch, swiglu_limit_func, num_rows, hidden_dim)
+        _compile_and_check(torch, launch)
+        time_ms = Timer.cupti(launch.run, kernel_name=None)
+        energy_j = Energy.perf(launch.run, warmup=5, per_iter_time_ms=time_ms)
+    except torch.OutOfMemoryError as exc:
+        raise OOMError(f"{_BACKEND} ran out of CUDA memory") from exc
+    except ProfilerNotImplemented:
+        raise
+    except Exception as exc:
+        raise KernelLaunchFailed(f"{_BACKEND} failed") from exc
+
+    elapsed_seconds = time_ms / 1000.0
+    logical_bytes = 6 * num_rows * hidden_dim
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        tflops=0.0,
+        memory_bandwidth_gbps=float(
+            logical_bytes / elapsed_seconds / 1e9 if elapsed_seconds else 0.0
+        ),
+        energy_j=float(energy_j),
+    )
+
+
+__all__ = ["profile_clamped_swiglu_vllm_inductor"]

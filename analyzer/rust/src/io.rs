@@ -5,9 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -20,6 +23,7 @@ const RAW_DIR: &str = "raw";
 const REPORTS_DIR: &str = "reports";
 const PAYLOADS_DIR: &str = "payloads";
 const PLOTS_DIR: &str = "plots";
+static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Find an input artifact, searching the run root then `raw/`/`reports/`/… (the
 /// sim writes parquet under `raw/`; older runs may have them at the root).
@@ -215,8 +219,10 @@ fn worker_pools_from_run_meta(json: &serde_json::Value) -> Option<Vec<(String, u
     (!worker_pool_rows.is_empty()).then_some(worker_pool_rows)
 }
 
-/// Per-worker × group KV-pool token capacities from `run_meta.json`'s `workers[]`
-/// (v3+), as `(pool_tag, worker_id, group_id, capacity_tokens)`. This is the static
+/// Per-worker × group KV-pool capacities from `run_meta.json`'s `workers[]`
+/// (v3+), as `(pool_tag, worker_id, group_id, capacity)`, in the KV units the
+/// `kv_snapshot` series counts: `capacity_units` from v6, `capacity_tokens`
+/// before (those runs counted tokens). This is the static
 /// denominator the `kv-occupancy` subject divides the `kv_snapshot` series by; the
 /// `pool_tag` matches the snapshot rows' key exactly (worker_id alone collides
 /// across pools). Read as bare JSON (no `simulator` dep), like [`read_worker_pools`].
@@ -242,7 +248,8 @@ pub fn read_kv_capacities(log_dir: &Path) -> Option<Vec<(String, u64, u64, u64)>
         for p in pools {
             let group_id = p.get("group_id").and_then(|v| v.as_u64()).unwrap_or(0);
             let capacity = p
-                .get("capacity_tokens")
+                .get("capacity_units")
+                .or_else(|| p.get("capacity_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             out.push((tag.to_owned(), worker_id, group_id, capacity));
@@ -289,10 +296,48 @@ pub fn payload_path(log_dir: &Path, name: &str) -> PathBuf {
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    let parent = path
+        .parent()
+        .with_context(|| format!("JSON output path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("invalid JSON output filename: {}", path.display()))?;
+    let (temp_path, mut file) = loop {
+        let sequence = JSON_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", candidate.display()))
+            }
+        }
+    };
+    let publish = (|| -> Result<()> {
+        file.write_all(&bytes)
+            .with_context(|| format!("write {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", temp_path.display()))?;
+        drop(file);
+        fs::rename(&temp_path, path)
+            .with_context(|| format!("publish {} as {}", temp_path.display(), path.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
-    fs::write(path, serde_json::to_vec_pretty(value)?)?;
     println!("wrote {}", path.display());
     Ok(())
 }
@@ -301,6 +346,23 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn json_publication_atomically_replaces_the_previous_document() {
+        let log_dir = tempfile::tempdir().expect("temp log dir");
+        let path = log_dir.path().join("payloads").join("index.json");
+
+        write_json(&path, &json!({"generation": "old"})).unwrap();
+        write_json(&path, &json!({"generation": "new", "rows": [1, 2]})).unwrap();
+
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value, json!({"generation": "new", "rows": [1, 2]}));
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [path.file_name().unwrap()]);
+    }
 
     /// A timing prediction carries the GPU identity the batch optimality subject
     /// needs, and a run directory must not be mistaken for one.

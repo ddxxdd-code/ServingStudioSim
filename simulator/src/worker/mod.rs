@@ -22,7 +22,10 @@ pub use admission::{
     PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub(crate) use config::resolve_prefix_cache_config;
-pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
+pub use config::{
+    AttnWorkerSel, BatchPolicy, DecodeRetractionPolicy, DpPlacement, FfnWorkerSel, IterWorkerSel,
+    KvAdmissionConfig, KvAdmissionPolicy, PrefillChunkAlignment,
+};
 pub use cost_buffers::CostBuffers;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};
 pub use iter_worker::{AfdAttnWorker, AfdFfnWorker, IterWorker};
@@ -30,16 +33,22 @@ pub use kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use types::{
     AttnWorkerEvent, AttnWorkerMsg, BatchFsmState, FfnPullSource, FfnTask, FfnTaskKind,
     FfnWorkerEvent, FfnWorkerMsg, IterCursor, IterEndState, PdDecodeEvent, PdDecodeMsg,
-    PdPrefillEvent, PdPrefillMsg, TransferPlan, WorkerConfig, WorkerEventCommon, WorkerFsmState,
-    WorkerMsgCommon, WorkerStatus,
+    PdPrefillEvent, PdPrefillMsg, PipelineHeadEvent, PipelineHeadMsg, PipelineMicrobatch,
+    PipelineStageEvent, PipelineStageMsg, TransferPlan, WorkerConfig, WorkerEventCommon,
+    WorkerFsmState, WorkerMsgCommon, WorkerStatus,
 };
 pub(crate) use workers::afd_attention::build_afd_attention_worker;
 pub use workers::afd_attention::DisaggAttnWorker;
 pub(crate) use workers::afd_ffn::build_afd_ffn_worker;
 pub use workers::afd_ffn::DisaggFfnWorker;
 pub(crate) use workers::iter::{
-    build_barebone_worker, build_hp_worker, build_pd_prefill_worker, build_qwen36_hybrid_worker,
+    build_barebone_worker, build_chunked_prefill_worker, build_hp_worker, build_pd_prefill_worker,
+    build_speculative_worker,
 };
-pub use workers::iter::{BareboneWorker, HpUnifiedWorker, PdPrefillWorker, Qwen36HybridWorker};
+pub use workers::iter::{
+    BareboneWorker, ChunkedPrefillWorker, HpUnifiedWorker, PdPrefillWorker, SpeculativeWorker,
+};
 pub(crate) use workers::pd_decode::build_pd_decode_worker;
 pub use workers::pd_decode::PdDecodeWorker;
+pub(crate) use workers::pipeline::{build_pipeline_head_worker, build_pipeline_stage_worker};
+pub use workers::pipeline::{PipelineHead, PipelineLayout, PipelineStage};

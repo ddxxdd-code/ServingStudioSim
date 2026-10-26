@@ -1,4 +1,4 @@
-"""Shared pytest gating + fixtures for the VibeSim test tiers.
+"""Shared pytest gating + fixtures for the ServingStudioSim test tiers.
 
 Tests declare a **capability tier** with a marker; this conftest auto-skips the
 ones the host can't run, so bare ``uv run pytest`` "just works" anywhere:
@@ -20,15 +20,14 @@ Run under ``uv`` so torch / the venv interpreter resolve (see
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import sys
 from pathlib import Path
 
 import pytest
 
 from launcher.exec import binary_path
+from launcher.golden import GOLDEN_ROOT, Golden
 
 #: Intra-op threads the CPU reference kernels are allowed. Torch otherwise sizes
 #: its pool from the core count, and on a many-core host the fan-out/join cost
@@ -64,7 +63,11 @@ _TIER_MARKERS = {
     "bench": "perf/timing, non-deterministic (opt-in: -m bench)",
 }
 
-GOLDEN_ROOT = Path(__file__).resolve().parent / "golden"
+# `GOLDEN_ROOT` / `Golden` are imported from `launcher.golden` (re-exported here
+# for tests that read the store directly): `alignment-campaign compare --record`
+# writes the same files from a production command, so the storage implementation
+# is shared rather than duplicated on either side.
+assert GOLDEN_ROOT == Path(__file__).resolve().parent / "golden"
 
 
 # ── registration + CLI options ───────────────────────────────────────────────
@@ -149,34 +152,43 @@ def sim_bin() -> Path:
     return path
 
 
-class Golden:
-    """Per-GPU golden file (`tests/golden/<metric>/<gpu_name>.json`). Reader by
-    default; under `--update-golden` it records and persists. The test owns the
-    skip/assert/record policy so the store stays metric-agnostic."""
-
-    def __init__(self, metric: str, gpu_name: str, update: bool) -> None:
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", gpu_name)
-        self.path = GOLDEN_ROOT / metric / f"{safe}.json"
-        self.gpu_name = gpu_name
-        self.update_enabled = update
-        self.data: dict[str, float] = (
-            json.loads(self.path.read_text()) if self.path.is_file() else {}
-        )
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.data
-
-    def get(self, key: str) -> float | None:
-        return self.data.get(key)
-
-    def record(self, key: str, value: float) -> None:
-        self.data[key] = value
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
-
-
 @pytest.fixture
 def golden(gpu_name: str, request: pytest.FixtureRequest):
     """Factory: `golden("throughput")` → a `Golden` for the detected GPU."""
     update = request.config.getoption("--update-golden")
     return lambda metric: Golden(metric, gpu_name, update)
+
+
+@pytest.fixture(autouse=True)
+def _restore_measurement_policy_env():
+    """Undo measurement-policy settings after every test.
+
+    ``set_energy_enabled`` settles the policy for the whole process, which is
+    what the 96 ``Energy.perf`` call sites need and what makes it leak between
+    tests. ``monkeypatch`` cannot catch it: the value is a module global set
+    several frames below the test, not something the test wrote. A CLI test that
+    turned energy off once left every following test running with the window
+    disabled, which is how ``test_energy_warns_multi_gpu`` began failing only
+    when run after it.
+
+    The environment variables are still restored because they remain the
+    user-facing knob that the module state falls back to.
+    """
+
+    from profiling.profilers import energy
+
+    names = (
+        energy.ENERGY_ENV,
+        energy.REQUIRE_ENERGY_ENV,
+        "VIBESIM_PROFILE_CUPTI_BUDGET_MS",
+        "VIBESIM_PROFILE_CUPTI_TRACE",
+    )
+    saved = {name: os.environ.get(name) for name in names}
+    saved_policy = (energy._energy_policy, energy._require_energy_policy)
+    yield
+    energy._energy_policy, energy._require_energy_policy = saved_policy
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value

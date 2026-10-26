@@ -91,17 +91,28 @@ Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet through
 | `llama3_dense_tp`, `llama3_dp_attn_tp_ffn` | `attn_block_tp`, `mlp_block_tp` |
 | `qwen3_moe_dp_attn_ep_ffn` (BF16) | `attn_block_tp`, `native_moe_router_local`, `native_moe_expert_compute_local` |
 | `qwen3_moe_fp8_dp_attn_ep_ffn` | `fp8_attn_block_tp`, `native_fp8_moe_router_local`, `native_moe_expert_compute_local` |
-| `qwen3_vllm_moe_dp_attn_ep_ffn` | `vllm_fp8_attn_block_tp`, `vllm_fp8_moe_router_local`, `vllm_fp8_moe_expert_compute_local` |
+| `qwen3_vllm_moe_dp_attn_ep_ffn` | `vllm_fp8_attn_block_tp`, `vllm_fp8_moe_router_local`, `moe_expert_compute_local` (TRT-LLM blockscale EP path) |
 | AFD `qwen3_attn_layerwise` | `attn_block_tp` |
 | AFD `qwen3_ffn_moe_layerwise` | `pre_attn_proj_tp`, `post_attn_router_tp`, `native_moe_router_local`, `native_moe_expert_compute_local` |
 | AFD `qwen3_fp8_ffn_moe_layerwise` | `fp8_pre_attn_proj_tp`, `fp8_post_attn_router_tp`, `native_fp8_moe_router_local`, `native_moe_expert_compute_local` |
-| `glm52_dsa_moe` | `glm52_dsa_attn_local`, `glm52_dense_ffn_local`, `glm52_moe_router_local`, `glm52_shared_expert_local`, `moe_expert_compute_local`, `glm52_mtp_prelude_local`, `glm52_mtp_head_local` |
-| `glm52_vllm_dsa_moe` | `vllm_glm52_dsa_attn_local`, `vllm_glm52_dense_ffn_local`, `vllm_glm52_shared_expert_local`, plus the four GLM sections it shares unchanged with the native arch |
+| `glm52_vllm_dsa_moe` | `vllm_glm52_dsa_attn_local`, `vllm_glm52_dense_ffn_local`, `vllm_glm52_shared_expert_local`, plus the shared GLM router, expert, and MTP sections |
+| `glm52_vllm_nvfp4_dsa_moe` | `vllm_glm52_dsa_attn_local`, neutral `glm52_dense_ffn_local`, `glm52_shared_expert_local`, `nvfp4_moe_local`, plus the unchanged GLM router and MTP sections |
+| `glm52_vllm_nvfp4_dsa_moe_speculative` | Same target sections; draft uses `bf16_moe_local`, MTP prelude/head, and first/recurrent attention sections |
+| `glm52_vllm_nvfp4_dp_attn_dsa_moe` | The `glm52_vllm_nvfp4_dsa_moe` sections at TP1 on every DP rank (router with its top-k select), plus `nvfp4_moe_local`'s quant and fused-MoE leaves split around the EP collectives |
+| `glm52_vllm_nvfp4_pp_dsa_moe` | The `glm52_vllm_nvfp4_dsa_moe` body sections at EP1, split into pipeline stages, without collectives or MTP |
+| `glm53_vllm_nvfp4_dsa_moe_dflash2` | Same target sections without the MTP layer; draft uses `dflash2_context_kv_local`, `dflash2_draft_layer_local` (attention and FFN halves), and `dflash2_selector_local` |
+| `glm52_sglang_nvfp4_tp_dsa_moe` | `sglang_glm52_dsa_attn_local`, `sglang_glm52_moe_router_local`, `sglang_moe_finalize_local`, neutral `glm52_dense_ffn_local`, `glm52_shared_expert_local`, `nvfp4_moe_local`, plus the unchanged GLM MTP sections |
+| `inkling_vllm_nvfp4_rel_attn_moe` | `inkling_attn_local`, `inkling_router_local`, `glm53_mlp_local` (dense FFN and sink experts), `nvfp4_moe_local`, `bf16_moe_local` |
+| `mimo_v2_vllm_fp8_swa_moe` | `mimo_v2_attn_local`, `glm53_mlp_local` (layer-0 dense FFN), `nvfp4_moe_local` (weight-only: `activation_format` set, no quant leaf) |
+| `qwen35_vllm_nvfp4_gdn_dense` | `vllm_qwen35_gdn_local`, `vllm_qwen35_gated_gqa_local`, `vllm_nvfp4_swiglu_mlp_local` (siblings of the `qwen36_*` and `glm53_mlp_local` sections: the ModelOpt mixed-precision recipe launches different kinds, so the op graph differs); the arch owns the multi-addend RMSNorms |
+| `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative` | `hc_mix_local`, `ple_local`, `vllm_bf16_gdn_spec_local`, `vllm_qsa_attn_local`, `vllm_nvfp4_moe_shared_stream_local` (NVFP4 routed + `bf16_gated_shared_expert_local`); draft: `mtp_fc_prelude_local`, `vllm_fp8_moe_shared_stream_local` (FP8-block MTP experts) and the same HC / QSA sections; `spec_head_local`, `spec_sample_local`, `engine_prep_local` |
 
-A `vllm_*` module is the **same sync section** as its sibling, cut into the leaves
-vLLM actually launches (quantize split out from its GEMM, dispatch/combine split
-into exchange and index/fill), so a measured nsys timeline can be reconciled leaf
-by leaf. It is a second granularity, not a second model.
+When a provider-prefixed module has a neutral sibling, it is the **same sync
+section** cut into the leaves that provider actually launches (for example,
+quantize split out from a vLLM GEMM). A provider may also own an extra sync
+section, such as SGLang's deferred-MoE finalize. Provider-neutral worklets remain
+shared when the launch boundary is identical; provider-specific modules describe
+measured graph differences, not a second model.
 
 ## Authoring
 

@@ -112,33 +112,51 @@ categories:
 | `alignment-workload` | one scheduler iteration by recorded iteration id | full-run vLLM structured iteration metrics (NSYS window anchors the replay segment) + sim `cost_log` |
 
 For a symmetric tensor-parallel alignment, one measured iteration contains one
-range set per rank. The analyzer reduces each measured occurrence across its
-ranks into one replica critical-path contribution, then sums those — so the
-per-kernel segments and per-operation rows add up to the headline `measured_ms`,
-which is compared to the simulator's Sum/Max cost tree. The reduction depends on
-the mapping table's per-kernel `cross_rank` class, never on a category or name:
+range set per rank. The analyzer reduces it with the **barrier model**
+(`alignment_iteration/barrier.rs`). A synchronizing collective is a barrier:
+every rank must arrive before any rank leaves. An iteration is therefore a chain
+of short races separated by barriers, and a different rank can win each one.
 
-- **independent** (compute, point-to-point): the occurrence costs `max` over
-  ranks of `(end - start)`. Cross-rank compute imbalance stays real work on the
-  path — exactly what the single-rank sim cost under-models if it assumes balance.
-- **synchronizing** (all-reduce / all-gather / all-to-all / fused all-reduce+norm):
-  a barrier whose per-rank kernel duration includes waiting for the slowest rank
-  to arrive. The occurrence costs `max(end) - max(start)` — from "last rank
-  arrived" to "collective done" — which drops the arrival wait while keeping a
-  self-imbalanced collective's bottleneck rank. For a symmetric all-reduce this
-  equals `min(duration)`; for an imbalanced all-to-all it does not.
+- A **barrier** is a maximal run of consecutive synchronizing positions
+  (all-reduce / all-gather / all-to-all / fused all-reduce+norm, per the mapping
+  table's `cross_rank`). Its cost on the path is `max(end) - max(start)` over
+  ranks: from the last arrival to the last exit. The earlier arrivals' waiting,
+  `collective_skew_ms`, is reported but not on the path, because it coincides
+  with the slow rank's busy time, which is already counted.
+- A **segment** is the window between two barriers. Each rank's busy time in it
+  is the union of its non-collective launches across its streams, clipped to the
+  window. The rank with the largest union wins the segment. The window is shared,
+  so that is also the rank with the least idle time. The last rank to arrive at
+  the closing barrier is reported beside it as the gating rank, with its own gap.
 
-The dropped arrival wait is not attributed to any kernel; it surfaces only in the
-wall-clock `measured_gpu_cycle_ms`. The kernel-align pass's derived duty-cycle
-multiplier `recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ
-measured_ms` spans exactly this gap, so its denominator shares the per-occurrence
-`measured_ms` reduction above. The pool excludes iterations whose duty-cycle
+The windows and barriers tile the iteration over every rank, exactly:
+
+```text
+wall_ms       = measured_ms + idle_internal_ms + idle_boundary_ms
+measured_ms   = critical_busy_ms + collective_ms
+critical_busy = measured_kernel_sum_ms - hidden_same_stream_ms - hidden_cross_stream_ms
+```
+
+Per-kernel and per-operation rows are each position's share of that path. Within
+a segment, the winner's busy union is split by one sweep: sort by start, let the
+wider launch win a tie, and give each launch only what no earlier launch covered.
+A barrier's net goes to its positions by their own last-arrival-to-last-exit
+extent. The rows therefore add up to `measured_ms`. A barrier over only part of
+the ranks (a collective inside one data-parallel group) is rejected until a
+group-aware barrier is needed.
+
+Idle, collective skew, and the gap between iterations surface only in the
+wall-clock `measured_gpu_cycle_ms` (`measured_gpu_cycle_ms - wall_ms` is the
+inter-iteration gap, which is negative when iterations overlap). The kernel-align
+pass's duty-cycle multiplier `recommended_gpu_time_multiplier = Σ
+measured_gpu_cycle_ms / Σ measured_ms` uses the barrier path that timing-predict
+models. The pool excludes iterations whose duty-cycle
 factor is both above 2.0 and an MAD outlier within its own stage — one host stall
 would otherwise reach every simulated iteration through this single constant —
 and reports them in `meta.multiplier_excluded_iterations`; see
 `alignment/README.md` for why both halves of that test are needed. GPU durations from different ranks are never
-summed. `measured_busy_union_ms`
-retains the old cross-rank interval union for audit. The analyzer keeps per-device
+summed. `measured_busy_union_ms` remains physical audit evidence and is not the
+duty-cycle denominator. The analyzer keeps per-device
 populations so rank skew is auditable, and distinguishes raw `rank_launches` from
 `replica_calls` (symmetric launches divided by the captured device count). A shared
 folded label program is valid only when the parser has proved the exact ordered
@@ -147,9 +165,16 @@ kernel sequence is identical across all participating devices.
 Schema-v4 inventories may instead assign different folded sequences to disjoint
 rank subsets in the same iteration. A row ID then identifies a sequence shape,
 not a logical occurrence. For mapped work, the analyzer joins matching
-`(phase, operation, per-device ordinal)` rows across those subsets before the
-cross-rank reduction. It retains the original rows for mapping and unmapped-work
-audits; unmapped rows are never guessed into a logical occurrence.
+`(phase, operation, physical category, per-device category-local ordinal)` rows
+across those subsets before the cross-rank reduction. The category-local ordinal
+prevents a rank-specific auxiliary kernel from shifting all later work onto the
+wrong occurrence. It retains the original rows for mapping and unmapped-work
+audits; unmapped rows are never guessed into a logical occurrence. The joined
+rows may carry different tuned physical kernel names when uneven rank-local
+shapes select different specializations. Their `cross_rank` semantics must still
+agree. The joined breakdown exposes all source row IDs and
+physical kernel names instead of treating one rank's specialization as the
+logical identity.
 
 ### Concurrent CUDA streams
 
@@ -161,36 +186,48 @@ carries each stream as its own **track**: kernels are serialized track-major
 track, and both the labeling walk's ordered-neighbour evidence and the analyzer's
 positional validation stop at a track edge.
 
-Adding per-occurrence durations across tracks would count their overlap twice, so
-the analyzer subtracts exactly that overlap: per device,
-`measured_concurrent_hidden_ms = Σ per-track busy union − union across tracks`,
-and `measured_ms = measured_kernel_sum_ms − measured_concurrent_hidden_ms`. Both
-terms are reported, because `measured_kernel_sum_ms` is the like-for-like partner
-of a CostTree that composes those operations with `Sum`. Within one track kernels
-never overlap, so a single-stream capture has zero hidden time and every number
-above is unchanged; the cross-rank reductions are untouched either way.
+Adding literal kernel durations would count overlap twice. The segment winner's
+busy time is a union, and what the union removed is split by who covered it.
+Each covered stretch is charged to the launch holding the running maximum end,
+which started no later and so covers the whole stretch alone.
+`hidden_same_stream_ms` is coverage by an earlier launch on the same stream
+(PDL, which may include `griddepcontrol.wait` residency, i.e. hidden launch
+latency). `hidden_cross_stream_ms` is coverage from another stream.
+`hidden_under_collective_{same,cross}_stream_ms` is non-collective work that ran
+inside a barrier window on the last rank to leave. That time is already inside
+`collective_ms` and is not subtracted again.
 
-Per operation and per measured kernel, `concurrent_hidden_ms` says how much of it
-the framework managed to hide. One overlap is one shared stretch of wall clock,
-so it is charged to the later-starting track only — the side stream that joined a
-device already busy. That is what makes these rows sum back to the iteration's
-`measured_concurrent_hidden_ms` instead of twice it, and it is why the breakdown
-plot can hatch the hidden share inside the operations that actually overlapped.
-This is **evidence about the measured schedule, not an instruction to the cost
+Independently of the path, every measured kernel row carries `overlap`: its
+launches' duration and how much of it overlapped any other launch on the same
+device, only same-stream launches, or only other-stream launches. The timeline
+payload goes further and names each overlapping partner position per launch
+(`measured.kernels[].ov`). A shared stretch appears on both sides of a pair, so
+these are diagnostics, not a decomposition.
+
+The sampled breakdown draws the streams of the rank that owns the most critical
+busy time. Material tracks get their own compact row; small tracks are preserved
+in one explicit aggregate row rather than creating hundreds of mostly empty
+labels. This is **evidence about the measured schedule, not an instruction to the cost
 model** — and specifically it must not become a `CostNode::Max`. Every
 `Max` in the simulator is a cross-rank fan-out of interchangeable replicas: the
 attribution below forwards only its critical child, and the `optimality` ladder's
 R2 rung folds `Max → mean` and calls the residue *imbalance*. Two different
-computations sharing one GPU are neither interchangeable nor balanceable, and
-same-device contention puts wall time at ≥ max(children) rather than ≤, so
-modelling that overlap needs a new node kind rather than a reused one.
+computations sharing one GPU are neither interchangeable nor balanceable, so the
+cost model writes them as `CostNode::Parallel`. It aggregates like `Max`
+(`max(children) / overlap`, work summed; `overlap < 1` when same-device
+contention puts wall time above the slower stream), but `optimality` keeps it at
+`max / overlap` on every rung, so stream overlap never reads as imbalance.
+
+`deepseek_v4_vllm_serial_streams` keeps the same leaves and cross-rank DP4/EP4
+`Max` nodes as `deepseek_v4_vllm`, but lowers every same-device source fan-out
+to `Sum`. It is the serialized-stream counterfactual for timing comparison.
 
 The alignment trio is separate not by deployment but by **source scope** (see
 below): it reads an alignment manifest instead of a plain run directory.
 
 The simulated side of `alignment-iteration` uses the same CostTree semantics as
 the headline prediction. `Sum` forwards attribution to every child, `Scale`
-multiplies its child, and `Max` forwards only the critical child; an exact tie
+multiplies its child, and `Max` or `Parallel` forwards only the critical child; an exact tie
 deterministically selects the first child. Per-kernel and per-operation
 simulated contributions therefore sum to `total_time_ms`, not to the raw sum of
 every parallel leaf. The latter remains only as a mapping-coverage audit value.
@@ -229,6 +266,11 @@ any specific constant:
   millions of rows into Rust to loop.
 - **Downsample distributions.** Emit a CDF as a bounded, evenly-spaced curve, not a
   per-sample array — visually identical, tiny JSON.
+- **Shard interactive detail.** A page bootstrap artifact contains bounded
+  summaries and byte-range indexes. Per-iteration rows and folded alignment
+  programs live in JSONL shards and are fetched only after the user selects
+  them; HTTP compression is supplementary and never a substitute for avoiding
+  a hundreds-of-megabytes browser parse.
 - **Stride-sample slot-scale data.** When even the aggregation spans hundreds of
   millions of slots, sample a subset of iterations (a temporal stride) and compute
   the distribution exactly over that sample; log what was sampled, never silently
@@ -290,7 +332,7 @@ If copied experiment directories retain the same launcher-issued
 identity rather than publishing an invalid duplicate route. It keeps the first
 entry under the normal catalog priority (newer experiment date, then newer
 artifact update time), with stable workspace/name/path tie-breakers. Catalog
-discovery and `GET /api/v1/sweeps/{sweep_id}/payload` resolve through this same
+discovery and `GET /api/analyzer/v1/sweeps/{sweep_id}/subjects/sweep/payload` resolve through this same
 canonical entry. The directories are not merged and their members are not
 combined.
 
@@ -341,12 +383,12 @@ agent state are not sweep-analysis inputs.
 The read-only UI service publishes sweep analysis as a separate protocol-v1
 resource family:
 
-- `GET /api/v1/sweeps` discovers experiment envelopes containing
+- `GET /api/analyzer/v1/sweeps` discovers experiment envelopes containing
   `sweep_manifest.json` plus unclaimed singleton runs below the configured logs
   roots. Each catalog entry has an opaque `sweep_id`, `kind` (`sweep` or
   `singleton`), display name, ordered axes, member count, aggregate status,
   experiment date, deployment/trace filter values, and payload href.
-- `GET /api/v1/sweeps/{sweep_id}/payload` projects the existing
+- `GET /api/analyzer/v1/sweeps/{sweep_id}/subjects/sweep/payload` projects the existing
   `sweep_metrics_grid.json` for a manifest sweep. For a singleton it projects
   the same bounded scalars directly from that run's existing summary and
   analyzer reports; neither path rescans parquet.
@@ -412,13 +454,23 @@ must not be used to publish a prediction pool or worker hierarchy.
 
 The read-only protocol is:
 
-- `GET /api/v1/predictions` lists bounded prediction descriptors by opaque id.
-- `GET /api/v1/predictions/{prediction_id}/descriptor` returns selector,
+- `GET /api/analyzer/v1/predictions` lists bounded prediction descriptors by opaque id.
+- `GET /api/analyzer/v1/predictions/{prediction_id}/descriptor` returns selector,
   architecture/GPU provenance, lifecycle, and detail hrefs.
-- `GET /api/v1/predictions/{prediction_id}/cases?offset=&limit=` pages the
+- `GET /api/analyzer/v1/predictions/{prediction_id}/subjects/cases/payload?offset=&limit=` pages the
   snapshotted case inputs together with their exact operation summaries.
-- `GET /api/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/cost-tree`
-  reconstructs one exact tree.
+- `GET /api/analyzer/v1/predictions/{prediction_id}/subjects/{subject}/{report,payload}` returns any
+  other subject's report or payload as `analyze run` wrote it into the
+  prediction's directory, named by the subject registry: `available: false`
+  for a subject that does not apply to a prediction, 404 for one that did not run.
+- `GET /api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/subjects/cost-tree/payload`
+  reconstructs one exact tree, with `time_share`: the operation's critical-path
+  composition (`kernel_time_ms`, `segments`, `kinds`), attributed as
+  `kernel-time-share` attributes each row. A leaf carries its slot time
+  (`base`); every container carries its own wall time (`ms`), and a `max` or
+  `parallel` its critical child's index (`critical`), both from the Analyzer's
+  fold (`node_time`, `critical_child`), so the UI never re-derives them. The run
+  route below returns the same tree.
 - Kernel-throughput and exact-iteration optimality routes hang below the same
   selected case/operation identity. Prediction-level kernel-input-distribution
   remains a bounded Analyzer subject.
@@ -433,15 +485,15 @@ wall-clock timeline.
 
 Agent consumers reuse this same read-only protocol rather than receiving a
 second metric API. A generic Analyzer MCP adapter may expose GET access below
-`/api/v1/`, but it must accept only relative Analyzer paths, reject traversal
+`/api/analyzer/v1/`, but it must accept only relative Analyzer paths, reject traversal
 and arbitrary origins, and bound response size and request time. It never
 recomputes metrics. An Agent uses an explicit UI or managed-workflow resource ID
 when available. Otherwise it may inspect the newest-first discovery catalog:
 
-- `GET /api/v1/sweeps?status=ready&limit=5` returns bounded candidates;
-- `GET /api/v1/sweeps/latest` returns the same catalog envelope with the newest
+- `GET /api/analyzer/v1/sweeps?status=ready&limit=5` returns bounded candidates;
+- `GET /api/analyzer/v1/sweeps/latest` returns the same catalog envelope with the newest
   ready candidate, if any; and
-- `GET /api/v1/sweeps/{sweep_id}/payload` reads the selected exact result.
+- `GET /api/analyzer/v1/sweeps/{sweep_id}/subjects/sweep/payload` reads the selected exact result.
 
 `status` accepts `ready` or `pending`; `limit` accepts `1..=100`. Catalog order
 is experiment date descending, then artifact update time descending. The Agent
@@ -469,6 +521,9 @@ logs roots. The service reloads it for discovery, scans only active workspaces,
 and publishes `workspace_id` on every run/sweep catalog entry and payload.
 Opaque `run_id` and `sweep_id` are therefore interpreted only together with
 their workspace id; clients must not resolve an id against another workspace.
+Static `--logs-root` roots are named `w_root_0`, `w_root_1`, ... in flag order,
+the same `w_*` form a registry id must take, so a client addresses either kind
+of workspace the same way.
 
 A managed Launcher run writes `experiment.meta.json` at the experiment root:
 
@@ -509,26 +564,29 @@ service must not assume that every launcher trace is under one root-level
 L1 kernel profiling and trend measurements are first-class Analyzer resources,
 peer to runs, sweeps, and timing predictions. The read-only protocol is:
 
-- `GET /api/v1/kernel-profiles` discovers `kernel_profile` artifacts by opaque
+- `GET /api/analyzer/v1/kernel-profiles` discovers `kernel_profile` artifacts by opaque
   id (`kp_<uuid>`), workspace-aware, ignoring `old-logs`, rejecting duplicate or
   invalid ids.
-- `GET /api/v1/kernel-profiles/{profile_id}/descriptor` returns kernel
+- `GET /api/analyzer/v1/kernel-profiles/{profile_id}/descriptor` returns kernel
   kind/table/backend/metric family, explicit GPU provenance (requested DB cache
   key, worker-observed physical GPU, `measurement` vs `cache_key` source),
   lifecycle, and the curve href.
-- `GET /api/v1/kernel-profiles/{profile_id}/curve` serves the immutable
+- `GET /api/analyzer/v1/kernel-profiles/{profile_id}/curve` serves the immutable
   `curve.json` enriched with per-row hardware ceilings (see below); the artifact
   file is never rewritten.
-- `GET /api/v1/kernel-measurements` discovers `kernel_measurement` artifacts
+- `GET /api/analyzer/v1/kernel-measurements` discovers `kernel_measurement` artifacts
   (`km_<uuid>`), workspace-aware with the same id hygiene.
-- `GET /api/v1/kernel-measurements/{measurement_id}/descriptor` exposes the
+- `GET /api/analyzer/v1/kernel-measurements/{measurement_id}/descriptor` exposes the
   declared shape, duration, telemetry, GPU provenance, and summary/plot hrefs.
-- `GET /api/v1/kernel-measurements/{measurement_id}/summary` serves the existing
+- `GET /api/analyzer/v1/kernel-measurements/{measurement_id}/summary` serves the existing
   `summary.json` artifact (`schema_version` 1, passthrough).
-- `GET /api/v1/kernel-measurements/{measurement_id}/plots/{plot_name}` serves a
+- `GET /api/analyzer/v1/kernel-measurements/{measurement_id}/plots/{plot_name}` serves a
   declared image. The plot path accepts exactly one normal component and only a name
   the resource declares, so traversal and undeclared files are impossible.
-- `GET /api/v1/hardware/gpus?name=<gpu_name>` resolves the GPU spec catalog.
+- `GET /api/analyzer/v1/hardware/gpus?name=<gpu_name>` resolves the GPU spec catalog.
+- `GET /api/analyzer/v1/kernel-kinds` serves each kernel kind's `title` and `category`
+  from its DOC (`profiling.db.doc.kind_vocabulary`) and the categories in order. The UI
+  names and groups kernels by it and keeps no kind table of its own.
 
 The Python profiling artifact path owns the metadata and never depends on a
 conversation backend (direct development runs also write resource identity).
@@ -554,8 +612,9 @@ without fabricating an observed GPU.
 
 `gpu/spec.json` is the only source, matched by exact case-insensitive `name` /
 `aliases` — no fuzzy lookup, no web fallback, and unknown GPUs are explicitly
-`unmatched`/`unavailable`, never defaulted to a SKU. It is NOT on the timing
-path. Bandwidths are bytes/s and `interconnect_bandwidth_gbps` is
+`unmatched`/`unavailable`, never defaulted to a SKU. Only its
+`compute_capability` reaches the timing path (capability-keyed rules such as
+vLLM's FlashInfer all-reduce budget); kernel times come from `profile.db`. Bandwidths are bytes/s and `interconnect_bandwidth_gbps` is
 BIDIRECTIONAL; the derived one-way rate is exactly half. TFLOPS are DENSE (no
 2:4 sparsity). H200 BF16 resolves to dense 990 TFLOP/s, HBM 4800 GB/s, NVLink
 4.0 900 GB/s bidirectional and 450 GB/s one-way.
@@ -586,9 +645,7 @@ inferred.
 
 ## Relationship to other docs
 
-This document supersedes the archived `old-doc/analyzer.md` (kept only as design
-history in a separate repo; it is not maintained). For the code-matching module
-reference and the canonical per-subject catalog, see
+For the code-matching module reference and the canonical per-subject catalog, see
 [`analyzer/README.md`](../analyzer/README.md); for where the analyzer sits in the
 layer stack, see [architecture.md](architecture.md); for the step-by-step of adding
 a metric, use the `add-analyzer-subject` skill.

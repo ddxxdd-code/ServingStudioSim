@@ -3,27 +3,28 @@
 use crate::common::{SharedRequests, Time};
 use crate::worker::kv::{IterWorkerKv, PrefixKv, SlotPipelineKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
+use crate::worker::types::IterBatchPlan;
 
 mod attention_layer_execution;
 mod ffn_task_execution;
+mod speculative_iter_execution;
 mod unified_iter_execution;
 
 pub use attention_layer_execution::AttentionLayerExecutionAdapter;
 pub use ffn_task_execution::FfnSectionExecutionAdapter;
+pub use speculative_iter_execution::SpeculativeIterExecution;
 pub use unified_iter_execution::UnifiedIterExecution;
-
-/// Model-owned facts used to size a worker's KV store and transfer payloads.
-#[derive(Clone, Copy)]
-pub struct ModelKvLayout {
-    pub total_kv_bytes_per_token: u64,
-    pub num_attn_shards: u16,
-}
 
 pub trait IterModelExecution<K: IterWorkerKv> {
     type Input: Default;
 
-    fn model_kv_layout(&self) -> ModelKvLayout;
-    fn build_iteration_input(&self, kv_store: &K, requests: &SharedRequests, out: &mut Self::Input);
+    fn build_iteration_input(
+        &self,
+        kv_store: &K,
+        requests: &SharedRequests,
+        batch_plan: &IterBatchPlan,
+        out: &mut Self::Input,
+    );
     fn evaluate_iteration(&mut self, input: &Self::Input, iteration: u64, now: Time) -> Time;
 }
 
@@ -31,7 +32,6 @@ pub trait AttentionLayerExecution {
     type Input: Default;
 
     fn num_layers(&self) -> u16;
-    fn model_kv_layout(&self) -> ModelKvLayout;
     fn attn_to_ffn_bytes_per_token(&self) -> u64;
     fn build_slot_input<K: SlotPipelineKv + PrefixKv>(
         &self,
@@ -61,6 +61,19 @@ pub trait FfnTaskExecution {
         slot: u8,
         iteration: u64,
         input: &Self::Input,
+        start: Time,
+    ) -> Time;
+}
+
+/// Costs one pipeline stage on a microbatch the head stage already lowered.
+///
+/// A follower stage owns no KV and forms no batch, so it cannot build its own
+/// input; it evaluates its layers on the carried one.
+pub trait PipelineStageExecution {
+    fn evaluate_stage(
+        &mut self,
+        input: &crate::arch::contract::UnifiedArchInput,
+        microbatch: u64,
         start: Time,
     ) -> Time;
 }

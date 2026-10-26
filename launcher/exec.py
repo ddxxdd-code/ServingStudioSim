@@ -13,6 +13,8 @@ Per design §1.2.3 / §1.2.7:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shutil
 import sys
@@ -20,9 +22,11 @@ import sysconfig
 import time
 from pathlib import Path
 
+from .binaries import PrebuiltBinaryError, build_output_dir, check_prebuilt, prebuilt_dir
 from .process import ProcessResult, ProcessSpec, ProcessSupervisor
 from .process.artifacts import (
     ArtifactValidationError,
+    validate_alignment_analysis_artifacts,
     validate_json_outputs,
     validate_render_artifacts,
     validate_trace_artifacts,
@@ -34,18 +38,42 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARALLELISM = 200
 _PROCESS_SUPERVISOR = ProcessSupervisor()
 _LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
+# A failed run's error (`simulator --error-json`), in its `raw/`.
+ERROR_JSON = "error.json"
 
 
 def binary_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "simulator"
+    return build_output_dir(build_type) / "simulator"
+
+
+def _error_document(path: Path) -> dict:
+    """What the simulator's ``--error-json`` wrote to ``path``; empty when it
+    wrote nothing (it succeeded or panicked)."""
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def binary_error(path: Path) -> str | None:
+    """The simulator's error as its ``--error-json`` wrote it to ``path``: the
+    cause chain on one line. None when it wrote none (it succeeded or panicked)."""
+    return _error_document(path).get("error")
+
+
+def binary_too_long(path: Path) -> dict | None:
+    """The limit and counts of a request too long for its pool or arch, as the
+    simulator's ``--error-json`` wrote them to ``path`` (``max_model_len``, and
+    for a trace ``requests`` too long of ``total``). None for any other error."""
+    return _error_document(path).get("too_long")
 
 
 def analyzer_binary_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "analyze"
+    return build_output_dir(build_type) / "analyze"
 
 
 def schema_json_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "deployment_schema.json"
+    return build_output_dir(build_type) / "deployment_schema.json"
 
 
 def _build_subprocess_env() -> dict[str, str]:
@@ -56,8 +84,23 @@ def _build_subprocess_env() -> dict[str, str]:
     (so `import profiling...` resolves the repo-local perf_api package, which is
     not installed into site-packages) and the venv site-packages (torch / the
     profiler stack).
+
+    It also carries the measurement policy the launcher resolved. That child is
+    a separate process running its own Python, so a policy settled in this one
+    does not reach it; the environment is how a spawn configures a child, and
+    writing it here -- at the spawn, from the resolved value -- keeps it visible
+    rather than a side effect of whoever last called ``set_energy_enabled``.
     """
+    from profiling.profilers.energy import (
+        ENERGY_ENV,
+        REQUIRE_ENERGY_ENV,
+        energy_enabled,
+        require_measured_energy,
+    )
+
     env = os.environ.copy()
+    env[ENERGY_ENV] = "1" if energy_enabled() else "0"
+    env[REQUIRE_ENERGY_ENV] = "1" if require_measured_energy() else "0"
     env["PYTHON"] = sys.executable
     env["PYO3_PYTHON"] = sys.executable
     env.pop("PYTHONHOME", None)
@@ -98,11 +141,33 @@ def _cargo_build_env() -> dict[str, str]:
     """
 
     env = os.environ.copy()
-    env["PYTHON"] = sys.executable
-    env["PYO3_PYTHON"] = sys.executable
+    python = _launcher_python()
+    env["PYTHON"] = python
+    env["PYO3_PYTHON"] = python
     env.pop("PYTHONHOME", None)
     env.pop("PYTHONPATH", None)
     return env
+
+
+def _launcher_python() -> str:
+    """The launcher's interpreter under one stable spelling.
+
+    A venv's ``python``, ``python3`` and ``python3.12`` are one interpreter behind
+    links, but PyO3's and ``build.rs``'s build scripts fingerprint ``PYO3_PYTHON``
+    as a string. ``uv run python`` reports ``.venv/bin/python3`` while pytest's
+    workers report ``.venv/bin/python``, so alternating between them recompiled
+    pyo3 and everything above it (~40 s) on the next launch. Follow only links
+    that stay in the executable's directory: that collapses the spellings
+    without leaving the venv for the base interpreter it links to.
+    """
+
+    path = Path(sys.executable)
+    while path.is_symlink():
+        target = path.parent / os.readlink(path)
+        if target.parent.resolve() != path.parent.resolve():
+            break
+        path = target
+    return str(path)
 
 
 # ── perf profiling (skill `operate-profile-sim-speed`) ──────────────────────────────
@@ -144,10 +209,31 @@ def _profile_env() -> dict[str, str]:
     return env
 
 
+def _report_build_failure(stage: str, result: ProcessResult) -> None:
+    reason = result.termination_reason or (
+        "live descendants remained after root exit"
+        if result.leaked_descendants
+        else "nonzero exit status"
+    )
+    sys.stderr.write(
+        f"{stage} failed: {reason}; exit_code={result.exit_code}, "
+        f"pid={result.pid}, process_group_id={result.process_group_id}\n"
+    )
+    for text in (result.output, result.stderr):
+        if text:
+            sys.stderr.write(text + "\n")
+
+
 def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
     """Build the simulator crate, then run schema discovery (INV-8). Returns
     True on success; on failure no schema is written (design §1.2.7 bootstrap
-    edge — `load_schema` then raises `SchemaNotFound`)."""
+    edge — `load_schema` then raises `SchemaNotFound`).
+
+    With ``VIBESIM_BIN_DIR`` set (`launcher/binaries.py`) nothing is compiled:
+    the prebuilt set is checked instead, including that its schema is the one
+    its simulator reports."""
+    if prebuilt_dir() is not None:
+        return _check_prebuilt_build(build_type, build_analyzer)
     cmd = ["cargo", "build"]
     if build_type == "release":
         cmd.append("--release")
@@ -159,6 +245,7 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
             ProcessSpec(argv=cmd, cwd=REPO_ROOT, env=build_env, name="build-simulator")
         )
         if not build_result.succeeded:
+            _report_build_failure("simulator compilation", build_result)
             return False
 
         # Schema discovery: list-params → deployment_schema.json.
@@ -169,16 +256,16 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
                 cwd=REPO_ROOT,
                 env=_build_subprocess_env(),
                 capture_output=True,
+                # stdout becomes deployment_schema.json verbatim.
+                separate_stderr=True,
                 name="discover-schema",
             )
         )
         if not schema_result.succeeded:
-            sys.stderr.write(f"schema discovery failed:\n{schema_result.output}")
+            _report_build_failure("schema discovery", schema_result)
             return False
         schema_path = schema_json_path(build_type)
-        temporary_schema = schema_path.with_name(
-            f".{schema_path.name}.{os.getpid()}.tmp"
-        )
+        temporary_schema = schema_path.with_name(f".{schema_path.name}.{os.getpid()}.tmp")
         try:
             temporary_schema.write_text(schema_result.output)
             os.replace(temporary_schema, schema_path)
@@ -200,8 +287,39 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
             )
         )
         if not analyzer_result.succeeded:
+            _report_build_failure("analyzer compilation", analyzer_result)
             sys.stderr.write("[warn] analyzer build failed; runs will skip post-run analysis\n")
         return True
+
+
+def _check_prebuilt_build(build_type: str, build_analyzer: bool) -> bool:
+    try:
+        directory = build_output_dir(build_type)
+        check_prebuilt(directory)
+    except PrebuiltBinaryError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return False
+    schema_result = _PROCESS_SUPERVISOR.run_sync(
+        ProcessSpec(
+            argv=[str(directory / "simulator"), "list-params"],
+            cwd=REPO_ROOT,
+            env=_build_subprocess_env(),
+            capture_output=True,
+            separate_stderr=True,
+            name="discover-schema",
+        )
+    )
+    if not schema_result.succeeded:
+        _report_build_failure("schema discovery", schema_result)
+        return False
+    if schema_result.output != (directory / "deployment_schema.json").read_text():
+        sys.stderr.write(
+            f"{directory}: deployment_schema.json is not the schema its simulator reports\n"
+        )
+        return False
+    if build_analyzer and not analyzer_binary_path(build_type).is_file():
+        sys.stderr.write("[warn] no prebuilt analyzer; runs will skip post-run analysis\n")
+    return True
 
 
 def cargo_build_analyzer(build_type: str = "debug") -> bool:
@@ -212,6 +330,8 @@ def cargo_build_analyzer(build_type: str = "debug") -> bool:
     boundary separate means `alignment analyze` cannot be blocked by unrelated
     simulator source drift.
     """
+    if prebuilt_dir() is not None:
+        return analyzer_binary_path(build_type).is_file()
     analyzer_cmd = _analyzer_build_command(build_type)
 
     with _LAUNCHER_LEASES.build(build_type):
@@ -282,11 +402,22 @@ async def run_logged_process(
 
 
 async def run_analysis(
-    log_dir: Path, build_type: str = "debug", subjects: list[str] | None = None
+    log_dir: Path,
+    build_type: str = "debug",
+    subjects: list[str] | None = None,
+    *,
+    render: bool = True,
+    render_only: bool = False,
 ) -> None:
     """Best-effort post-run analysis: Rust `analyze run` (parquet → report+payload
     JSON) then the Python renderer (payload JSON → PNGs). Failures warn and return
     — analysis must never fail an otherwise-successful run.
+
+    `render=False` (`--no-plot`) skips the PNGs and keeps the reports, payloads
+    and trace that the Analyzer UI reads. On a 640-run grid the renderer was 73%
+    of all CPU, more than the simulations themselves. `render_only=True` draws
+    the PNGs of a run whose compute and trace already exist — a run finished
+    with `--no-plot` and resumed without it.
 
     Async: across a sweep, many runs' analyze+render overlap under the existing
     semaphore instead of serializing on a blocking call that stalls the event loop.
@@ -372,6 +503,25 @@ async def run_analysis(
         print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
         return
     subjects = subjects or []
+
+    def render_step():
+        return _timed_step(
+            "render",
+            "analyze render",
+            [
+                sys.executable,
+                str(REPO_ROOT / "analyzer" / "python"),
+                "render",
+                str(log_dir),
+                *subjects,
+            ],
+            lambda: validate_render_artifacts(log_dir),
+        )
+
+    if render_only:
+        if await render_step() != 0:
+            print(f"[analyze] render failed for {log_dir}")
+        return
     # The analyzer owns variant completeness: a normal invocation generates both
     # unlocked and batch-locked optimality in one timing/report transaction.
     if (
@@ -385,36 +535,35 @@ async def run_analysis(
     ):
         print(f"[analyze] compute failed for {log_dir}")
         return
-    if (
-        await _timed_step(
-            "render",
-            "analyze render",
-            [
-                sys.executable,
-                str(REPO_ROOT / "analyzer" / "python"),
-                "render",
-                str(log_dir),
-                *subjects,
-            ],
-            lambda: validate_render_artifacts(log_dir),
-        )
-        != 0
-    ):
-        print(f"[analyze] render failed for {log_dir}")
-
+    # Render and trace both read only compute's outputs and the raw logs, and the
+    # workflow plan gives them no edge between them, so they run concurrently.
     # Always emit the per-kernel Perfetto timeline (traces/<prefix>.pftrace.gz).
     # A standalone verb, not a subject (different output contract: a binary trace
     # for ui.perfetto.dev, not report/payload JSON), so it runs here with CLI
     # defaults rather than through the subject catalog. Best-effort like the rest.
-    if (
-        await _timed_step(
+    def trace_step():
+        return _timed_step(
             "trace",
             "analyze trace",
             [str(analyzer), "trace", str(log_dir)],
             lambda: validate_trace_artifacts(log_dir),
         )
-        != 0
-    ):
+
+    if not render:
+        if await trace_step() != 0:
+            print(f"[analyze] trace failed for {log_dir}")
+        return
+    # Both finish before either's exception propagates, so a render that fails
+    # to spawn cannot leave the trace running with nobody awaiting it.
+    render_rc, trace_rc = await asyncio.gather(
+        render_step(), trace_step(), return_exceptions=True
+    )
+    for outcome in (render_rc, trace_rc):
+        if isinstance(outcome, BaseException):
+            raise outcome
+    if render_rc != 0:
+        print(f"[analyze] render failed for {log_dir}")
+    if trace_rc != 0:
         print(f"[analyze] trace failed for {log_dir}")
 
 
@@ -422,7 +571,7 @@ def run_alignment_analysis(
     log_dir: Path,
     build_type: str = "debug",
     subjects: list[str] | None = None,
-) -> None:
+) -> bool:
     """Synchronously compute and render selected alignment subjects.
 
     This explicit alignment command has no sweep-level parallelism to preserve;
@@ -431,7 +580,7 @@ def run_alignment_analysis(
     analyzer = analyzer_binary_path(build_type)
     if not analyzer.exists():
         print(f"[analyze] {analyzer} not built; skipping alignment analysis for {log_dir}")
-        return
+        return False
 
     stdout_log = log_dir / "stdout.log"
 
@@ -452,13 +601,25 @@ def run_alignment_analysis(
         "alignment-workload",
         "alignment-e2e",
     ]
+    # The analyzer records subject failures even when the process exits zero.
+    # Remove the prior outcome so a crashed recomputation cannot reuse it.
+    (log_dir / "reports" / "analyzer_timing.json").unlink(missing_ok=True)
     rc = run_step(
         "analyze alignment compute",
         [str(analyzer), "alignment", str(log_dir), *selected],
     )
     if rc != 0:
         print(f"[analyze] alignment compute failed for {log_dir}")
-        return
+        return False
+    try:
+        validate_alignment_analysis_artifacts(log_dir, selected)
+    except ArtifactValidationError as error:
+        print(f"[analyze] alignment compute failed for {log_dir}: {error}")
+        return False
+    # Timeline is an interactive payload served by the UI, with no PNG renderer.
+    render_subjects = [subject for subject in selected if subject != "alignment-timeline"]
+    if not render_subjects:
+        return True
     if (
         run_step(
             "analyze alignment render",
@@ -467,20 +628,25 @@ def run_alignment_analysis(
                 str(REPO_ROOT / "analyzer" / "python"),
                 "render",
                 str(log_dir),
-                *selected,
+                *render_subjects,
             ],
         )
         != 0
     ):
         print(f"[analyze] alignment render failed for {log_dir}")
+        return False
+    return True
 
 
-def run_sweep_analysis(experiment_dir: Path, build_type: str = "debug") -> None:
+def run_sweep_analysis(
+    experiment_dir: Path, build_type: str = "debug", *, render: bool = True
+) -> None:
     """Synchronously collect and render one explicit launcher sweep.
 
     The simulation tasks and their per-run analyzers have already completed at
     this boundary. Rust reads `sweep_manifest.json` plus their small JSON reports;
-    Python only renders the resulting experiment-level payload.
+    Python only renders the resulting experiment-level payload, and not at all
+    when `render=False` (`--no-plot`).
     """
     analyzer = analyzer_binary_path(build_type)
     if not analyzer.exists():
@@ -509,6 +675,8 @@ def run_sweep_analysis(experiment_dir: Path, build_type: str = "debug") -> None:
     ):
         print(f"[aggregate] sweep compute failed for {experiment_dir}")
         return
+    if not render:
+        return
     if (
         run_step(
             "analyze sweep render",
@@ -533,16 +701,37 @@ async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:
     cases. The verb itself is general (`analyze gen-iter-breakdown <dir>` works on
     any artifact dir); only the *automatic* emission is predict-scoped. Failures
     warn and return (analysis never fails an otherwise-successful run)."""
+    # Every row: a predict dir holds one per case and section, and its readers
+    # take each case's tree from the JSON twin.
+    await _run_analyzer_step(log_dir, build_type, "gen-iter-breakdown", "--max-iters", str(2**31))
+
+
+# What a timing prediction's reader needs and nothing more: the cost tree with
+# each node's time (`run_iter_breakdown`) and the kernels ranked by their share
+# of it (`kernel-time-share`). Milliseconds, against the ~1 s full analysis.
+ESSENTIAL_SUBJECTS = ("kernel-time-share",)
+
+
+async def run_essential_analysis(log_dir: Path, build_type: str = "debug") -> None:
+    """Best-effort: the iteration breakdown plus `analyze run` of only the
+    ESSENTIAL_SUBJECTS, no trace and no plots."""
+    await run_iter_breakdown(log_dir, build_type)
+    await _run_analyzer_step(log_dir, build_type, "run", *ESSENTIAL_SUBJECTS)
+
+
+async def _run_analyzer_step(log_dir: Path, build_type: str, verb: str, *args: str) -> None:
+    """`analyze <verb> <log_dir> <args>`, its output appended to the run's
+    `stdout.log`. Failures warn and return (analysis never fails an
+    otherwise-successful run)."""
     analyzer = analyzer_binary_path(build_type)
     if not analyzer.exists():
-        print(f"[analyze] {analyzer} not built; skipping iter-breakdown for {log_dir}")
+        print(f"[analyze] {analyzer} not built; skipping {verb} for {log_dir}")
         return
-    rc, out = await _run_capture([str(analyzer), "gen-iter-breakdown", str(log_dir)])
-    stdout_log = log_dir / "stdout.log"
+    rc, out = await _run_capture([str(analyzer), verb, str(log_dir), *args])
     if out:
-        with stdout_log.open("a") as fh:
-            fh.write(f"\n=== analyze gen-iter-breakdown ===\n{out}")
+        with (log_dir / "stdout.log").open("a") as fh:
+            fh.write(f"\n=== analyze {verb} ===\n{out}")
             if not out.endswith("\n"):
                 fh.write("\n")
     if rc != 0:
-        print(f"[analyze] gen-iter-breakdown failed for {log_dir}:\n{out}")
+        print(f"[analyze] {verb} failed for {log_dir}:\n{out}")

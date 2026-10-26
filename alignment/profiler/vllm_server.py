@@ -7,7 +7,7 @@ vLLM), records launch metadata, and offers ready/idle polling over the
 OpenAI-compatible endpoints. The actual spawn is wrapped by `nsys_capture.py` and
 orchestrated in `__main__.py`.
 
-The fork (`alignment/profiler/vllm`, branch `moesim-profile`) adds the
+The fork (`alignment/profiler/vllm`, branch `servingstudio-alignment`) adds the
 `vllm_iteration(N): <phase>` NVTX scopes (gated by `VLLM_NVTX_SCOPES_FOR_PROFILING`)
 and a versioned `VibeSimAlignmentIteration {json}` record containing the exact
 model input shape consumed by the typed predictor adapter. Per-request
@@ -34,6 +34,17 @@ VLLM_SOURCE_ROOT = Path(__file__).resolve().parent / "vllm"
 
 HEALTH_ENDPOINTS = ("/health", "/v1/models")
 
+# HTTP API processes when a preset does not choose. One process serialized a
+# 256-request burst at ~0.75 ms per request on GLM-5.3-Flash TP4, starting
+# EngineCore's TTFT clock up to ~240 ms after the client sent the request.
+DEFAULT_API_SERVER_COUNT = 4
+
+# `APIServerProcessManager` announces the processes it actually spawned. The
+# deprecated `vllm.entrypoints.openai.api_server` module accepts
+# `--api-server-count` but always runs one server, so only this line proves
+# the setting took effect.
+_API_SERVERS_STARTED_RE = re.compile(r"Started (\d+) API server processes")
+
 # Enables the /start_profile and /stop_profile routes. Those routes fan CUDA
 # profiler control into the actual GPU worker, which is the reliable
 # targeted-capture boundary for the spawned EngineCore.
@@ -49,6 +60,16 @@ NSYS_CAPTURE_SERVER_ARGS: tuple[str, ...] = ()
 # timing records, so a pass launched with it produces neither.
 TIMING_INSTRUMENTATION_OFF_ENV = {"VLLM_NVTX_SCOPES_FOR_PROFILING": "0"}
 
+
+def validate_nsys_capture_environment(
+    _fork_python: str,
+    *,
+    env: dict[str, str],
+    cwd: Path,
+) -> None:
+    """vLLM's instrumented fork has no optional NSYS marker dependency."""
+
+
 # vLLM's parallel-state banner, emitted once per worker process at startup. It
 # is the only place the worker pid ↔ global rank identity is stated; nsys knows
 # pid ↔ CUDA device, so the two together give rank ↔ device.
@@ -57,14 +78,35 @@ _WORKER_RANK_RE = re.compile(
 )
 
 
+def api_server_count(cfg: ServerConfig) -> int:
+    """The HTTP API process count this server launches with."""
+    count = DEFAULT_API_SERVER_COUNT if cfg.api_server_count is None else cfg.api_server_count
+    if type(count) is not int or count < 1:
+        raise ValueError(f"server.api_server_count must be a positive integer, got {count!r}")
+    return count
+
+
 def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
-    """The `python -m vllm.entrypoints.openai.api_server ...` argv."""
+    """The `python -m vllm.entrypoints.cli.main serve <model> ...` argv.
+
+    The CLI `serve` entry is the only one that honors `--api-server-count`.
+    """
+    if any(
+        argument == "--api-server-count" or argument.startswith("--api-server-count=")
+        for argument in cfg.extra_args
+    ):
+        raise ValueError(
+            "set the vLLM API process count with server.api_server_count, not "
+            "--api-server-count in server.extra_args"
+        )
     argv = [
         fork_python,
         "-m",
-        "vllm.entrypoints.openai.api_server",
-        "--model",
+        "vllm.entrypoints.cli.main",
+        "serve",
         cfg.model_path,
+        "--api-server-count",
+        str(api_server_count(cfg)),
         "--host",
         cfg.host,
         "--port",
@@ -183,6 +225,7 @@ def write_launch_metadata(
     cfg: ProfileConfig,
     fork_python: str,
     profiler_provenance: dict[str, str] | None,
+    runtime_provenance: dict | None,
 ) -> None:
     """Persist argv + selected env + fork git state next to the server log.
 
@@ -192,23 +235,72 @@ def write_launch_metadata(
     keep = (
         "CUDA_VISIBLE_DEVICES",
         "VLLM_NVTX_SCOPES_FOR_PROFILING",
+        "VLLM_SERVER_DEV_MODE",
         "PYTHONPATH",
         "PATH",
         "LD_LIBRARY_PATH",
     )
+    runtime_env = cfg.python_runtime.environment if cfg.python_runtime is not None else {}
     metadata = {
         "schema_version": 1,
         "name": cfg.name,
         "argv": launch_argv,
         "server_argv": server_argv,
-        "env": {k: env[k] for k in keep if k in env},
+        "env": {key: env[key] for key in (*keep, *runtime_env) if key in env},
         "server_config": cfg.server.__dict__,
         "nsys_config": cfg.nsys.__dict__,
         "nsys_profiler": profiler_provenance,
+        "python_runtime": runtime_provenance,
         "fork_python": fork_python,
         "fork_git": _git_info(VLLM_SOURCE_ROOT),
     }
     Path(path).write_text(json.dumps(metadata, indent=2))
+
+
+def speculative_decode_enabled(cfg: ServerConfig) -> bool:
+    return any(arg.split("=", 1)[0] == "--speculative-config" for arg in cfg.extra_args)
+
+
+def _parse_spec_decode_metrics(text: str) -> dict:
+    from prometheus_client.parser import text_string_to_metric_families
+
+    names = {
+        f"vllm:spec_decode_{name}_total": name
+        for name in ("num_drafts", "num_draft_tokens", "num_accepted_tokens")
+    }
+    position_name = "vllm:spec_decode_num_accepted_tokens_per_pos_total"
+    totals: dict[str, int] = {}
+    positions: dict[str, int] = {}
+    seen: set[tuple] = set()
+    for family in text_string_to_metric_families(text):
+        for sample in family.samples:
+            if sample.name not in names and sample.name != position_name:
+                continue
+            identity = (sample.name, tuple(sorted(sample.labels.items())))
+            if identity in seen:
+                raise ValueError(f"duplicate spec-decode counter: {identity}")
+            seen.add(identity)
+            value = sample.value
+            if not value.is_integer() or value < 0:
+                raise ValueError(f"invalid spec-decode counter: {sample.name}={value}")
+            if sample.name == position_name:
+                position = sample.labels.get("position", "")
+                if not position.isdecimal() or str(int(position)) != position:
+                    raise ValueError(f"invalid spec-decode position: {position!r}")
+                positions[position] = positions.get(position, 0) + int(value)
+            else:
+                name = names[sample.name]
+                totals[name] = totals.get(name, 0) + int(value)
+    if set(totals) != set(names.values()) or not positions:
+        raise ValueError("missing required spec-decode Prometheus counters")
+    return {**totals, "accepted_per_position": positions}
+
+
+def fetch_spec_decode_metrics(base_url: str) -> dict:
+    status, body = _get(f"{base_url}/metrics")
+    if status != 200 or body is None:
+        raise RuntimeError("cannot fetch vLLM spec-decode Prometheus counters")
+    return _parse_spec_decode_metrics(body.decode())
 
 
 def _get(url: str, timeout: float = 5.0):
@@ -219,7 +311,7 @@ def _get(url: str, timeout: float = 5.0):
         return None, None
 
 
-def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 120.0) -> None:
+def set_cuda_profile(base_url: str, *, active: bool, timeout: float | None = None) -> None:
     """Start or stop vLLM's worker-owned CUDA profiler through its HTTP API.
 
     Stopping can block while Nsight finalizes a large report inside the worker;
@@ -227,6 +319,11 @@ def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 120.0) -> 
     timeout. The launcher still owns process shutdown if this bound is exceeded.
     """
     action = "start_profile" if active else "stop_profile"
+    # Starting only arms CUPTI and should return promptly. Stopping also makes
+    # NSYS finalize the report in the worker, which can take several minutes
+    # for CUDA-graph-node traces with tens of millions of events.
+    if timeout is None:
+        timeout = 120.0 if active else 600.0
     request = urllib.request.Request(f"{base_url}/{action}", data=b"", method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -280,16 +377,47 @@ def extract_worker_device_ranks(server_log: Path) -> dict[int, int]:
     return ranks
 
 
-def wait_for_idle(base_url: str, idle: IdleWaitConfig) -> bool:
+def verify_server_started(server_log: Path, cfg: ServerConfig) -> None:
+    """Fail unless the log shows the requested number of API processes.
+
+    One process logs no announcement, so only a multi-process request is checked.
+    """
+    expected = api_server_count(cfg)
+    if expected == 1:
+        return
+    started = [
+        int(match.group(1))
+        for match in _API_SERVERS_STARTED_RE.finditer(Path(server_log).read_text(errors="replace"))
+    ]
+    if started != [expected]:
+        raise RuntimeError(
+            f"requested {expected} vLLM API server processes, but the server log "
+            f"announces {started or 'none'}"
+        )
+
+
+# Each API process counts only its own in-flight requests, and a fresh
+# connection reaches an arbitrary one. Require this many consecutive zero reads
+# per process before calling the server idle.
+_IDLE_ZERO_READS_PER_API_SERVER = 4
+
+
+def wait_for_idle(base_url: str, idle: IdleWaitConfig, cfg: ServerConfig | None = None) -> bool:
     """Poll /load until in-flight requests drain to zero (server_load == 0).
 
     Stock vLLM (no `--enable-server-load-tracking`) has no /load endpoint; there
     the caller has already awaited request completion, so a 404 just returns True.
+    With several API processes /load is per process, so idle requires a run of
+    consecutive zero reads; the check is probabilistic, and it backs up the
+    caller's own completion wait rather than replacing it.
     """
     if not idle.enabled:
         return True
+    servers = 1 if cfg is None else api_server_count(cfg)
+    zero_reads_needed = 1 if servers == 1 else servers * _IDLE_ZERO_READS_PER_API_SERVER
     deadline = time.time() + idle.timeout
     saw_endpoint = False
+    zero_reads = 0
     while time.time() < deadline:
         status, body = _get(f"{base_url}/load")
         if status == 404:
@@ -297,9 +425,13 @@ def wait_for_idle(base_url: str, idle: IdleWaitConfig) -> bool:
         if status == 200 and body is not None:
             saw_endpoint = True
             try:
-                if json.loads(body).get("server_load", -1) == 0:
-                    return True
+                load = json.loads(body).get("server_load", -1)
             except json.JSONDecodeError:
-                pass
+                load = -1
+            zero_reads = zero_reads + 1 if load == 0 else 0
+            if zero_reads >= zero_reads_needed:
+                return True
+            if zero_reads:
+                continue  # poll the next process now; the wait is for load, not time
         time.sleep(idle.poll_interval)
     return not saw_endpoint

@@ -1,0 +1,391 @@
+//! Device-local NVFP4 routed-MoE callable section on B200.
+//!
+//! The input activation quantization precedes one whole-callable fused-MoE L1
+//! leaf, except on a weight-only backend (`activation_format` set), whose GEMMs
+//! take the activations as they are, so it has no quant leaf. The fused leaf
+//! owns routing, both expert GEMMs, SwiGLU, and whatever finalize boundary the
+//! selected backend actually measures. A deferred-finalize backend deliberately
+//! stops before reduction; its provider-specific consumer composes a separate
+//! finalize worklet after this neutral callable.
+//!
+//! With `tp_size > 1` this callable produces one rank's partial hidden output.
+//! The L4 consumer owns the later TP all-reduce; this local worklet does not
+//! claim that synchronization boundary.
+
+use std::sync::Arc;
+
+use crate::op::Op;
+use crate::timing::bridge::DType;
+use crate::timing::expert_demand::ExpertDemand;
+use crate::timing::kernels::{
+    Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelConfig, Nvfp4FusedMoeKernelInput, Nvfp4QuantKernel,
+    Nvfp4QuantKernelConfig, Nvfp4QuantKernelInput,
+};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
+
+use super::glm53_common::push_or_zero;
+
+#[derive(Clone, Debug)]
+pub struct Nvfp4MoeLocalWorkletConfig {
+    pub hidden: Dim,
+    pub moe_intermediate: Dim,
+    pub num_experts: Dim,
+    pub ep_size: u16,
+    /// TP shards each expert's intermediate width; EP instead shards the
+    /// expert axis. A pure-EP deployment sets this to one.
+    pub tp_size: u16,
+    pub top_k: u32,
+    pub activation_dtype: DType,
+    pub gpu_name: String,
+    pub quant_backends: Vec<&'static str>,
+    pub moe_backends: Vec<&'static str>,
+    pub weight_format: DType,
+    /// The precision the activations reach the expert GEMMs in when the
+    /// backend does not quantize them to `weight_format` (the MXFP4 x BF16
+    /// backend: `activation_dtype`). Set, the input quant is not built; unset,
+    /// the activations are quantized first. Forwarded to the fused-MoE config.
+    pub activation_format: Option<DType>,
+    pub group_size: u32,
+    pub routing_method: String,
+    pub n_group: u32,
+    pub topk_group: u32,
+    pub routed_scaling_numerator: u32,
+    pub routed_scaling_denominator: u32,
+    /// Where the routed demand for a profiled shape comes from.
+    pub expert_demand: ExpertDemand,
+    /// Position in the active-count-ranked EP workload list produced by the
+    /// shared complete-layer fold. It is not a physical rank identity.
+    pub folded_rank_position: u32,
+}
+
+impl Nvfp4MoeLocalWorkletConfig {
+    /// Build one local config per ranked EP workload from the same global
+    /// layerwise routing evidence. Sampling and folding remain inside L1 so all
+    /// children share one deterministic routing law.
+    pub fn split_for_ep(mut template: Self, demand: ExpertDemand) -> Vec<Self> {
+        let ep = usize::from(template.ep_size);
+        assert!(ep > 0, "ep_size must be non-zero");
+        let num_experts = template.num_experts.get() as usize;
+        assert_eq!(num_experts % ep, 0, "experts must evenly partition EP");
+        assert_eq!(
+            demand.num_experts(),
+            num_experts,
+            "demand source width must match num_experts"
+        );
+        template.expert_demand = demand;
+
+        (0..ep)
+            .map(|position| {
+                let mut rank_config = template.clone();
+                rank_config.folded_rank_position = position as u32;
+                rank_config
+            })
+            .collect()
+    }
+
+    /// Build the one rank-symmetric config for pure tensor parallelism.
+    pub fn replicated_for_tp(mut template: Self, demand: ExpertDemand) -> Self {
+        assert_eq!(
+            template.ep_size, 1,
+            "pure tensor parallelism leaves no expert parallelism"
+        );
+        assert!(template.tp_size > 0, "tp_size must be non-zero");
+        assert_eq!(
+            demand.num_experts(),
+            template.num_experts.get() as usize,
+            "demand source width must match num_experts"
+        );
+        template.expert_demand = demand;
+        template.folded_rank_position = 0;
+        template
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Nvfp4MoeLocalWorkletResolved {
+    pub raw_cfg: Nvfp4MoeLocalWorkletConfig,
+    /// `None` on a weight-only backend.
+    pub quant: Option<Nvfp4QuantKernelConfig>,
+    pub fused_moe: Nvfp4FusedMoeKernelConfig,
+    pub experts_per_device: Dim,
+    pub intermediate_per_rank: Dim,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Nvfp4MoeLocalWorkletInput {
+    pub num_tokens: u32,
+}
+
+pub struct Nvfp4MoeLocalWorklet {
+    pub name: String,
+    pub quant: Option<Op<Nvfp4QuantKernel>>,
+    pub fused_moe: Op<Nvfp4FusedMoeKernel>,
+    resolved: Nvfp4MoeLocalWorkletResolved,
+}
+
+impl Nvfp4MoeLocalWorklet {
+    pub fn resolve_config(cfg: &Nvfp4MoeLocalWorkletConfig) -> Nvfp4MoeLocalWorkletResolved {
+        assert_eq!(
+            cfg.activation_dtype,
+            DType::Bf16,
+            "NVFP4 activation input must be BF16"
+        );
+        assert!(cfg.ep_size > 0, "ep_size must be non-zero");
+        assert!(cfg.top_k > 0 && cfg.top_k <= cfg.num_experts.get());
+        assert_eq!(
+            cfg.num_experts.get() % u32::from(cfg.ep_size),
+            0,
+            "experts must evenly partition EP"
+        );
+        assert!(cfg.tp_size > 0, "tp_size must be non-zero");
+        assert_eq!(
+            cfg.moe_intermediate.get() % u32::from(cfg.tp_size),
+            0,
+            "moe_intermediate must evenly partition TP"
+        );
+        assert!(
+            cfg.folded_rank_position < u32::from(cfg.ep_size),
+            "folded rank position must select an EP workload"
+        );
+        assert_eq!(
+            cfg.expert_demand.num_experts(),
+            cfg.num_experts.get() as usize,
+            "demand source width must match num_experts"
+        );
+
+        let experts_per_device = cfg.num_experts.clone() / Dim::param("ep", u32::from(cfg.ep_size));
+        let intermediate_per_rank =
+            cfg.moe_intermediate.clone() / Dim::param("moe_tp", u32::from(cfg.tp_size));
+        if let Some(format) = cfg.activation_format {
+            assert_eq!(
+                format, cfg.activation_dtype,
+                "unquantized activations reach the expert GEMMs in their own precision"
+            );
+        }
+        Nvfp4MoeLocalWorkletResolved {
+            quant: cfg
+                .activation_format
+                .is_none()
+                .then(|| Nvfp4QuantKernelConfig {
+                    backends: cfg.quant_backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    hidden_size: cfg.hidden.clone(),
+                    group_size: cfg.group_size,
+                    input_dtype: cfg.activation_dtype,
+                    scale_format: "linear_e4m3".to_string(),
+                }),
+            fused_moe: Nvfp4FusedMoeKernelConfig {
+                backends: cfg.moe_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size: cfg.hidden.clone(),
+                intermediate_size: intermediate_per_rank.clone(),
+                num_experts: cfg.num_experts.clone(),
+                num_local_experts: experts_per_device.clone(),
+                top_k: cfg.top_k,
+                input_dtype: cfg.activation_dtype,
+                weight_format: cfg.weight_format,
+                activation_format: cfg.activation_format,
+                group_size: cfg.group_size,
+                routing_method: cfg.routing_method.clone(),
+                n_group: cfg.n_group,
+                topk_group: cfg.topk_group,
+                routed_scaling_numerator: cfg.routed_scaling_numerator,
+                routed_scaling_denominator: cfg.routed_scaling_denominator,
+                expert_demand: cfg.expert_demand.clone(),
+                folded_rank_position: cfg.folded_rank_position,
+            },
+            experts_per_device,
+            intermediate_per_rank,
+            raw_cfg: cfg.clone(),
+        }
+    }
+
+    pub fn build(
+        name: String,
+        resolved: Nvfp4MoeLocalWorkletResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let quant = resolved
+            .quant
+            .clone()
+            .map(|config| -> Result<_, BuildError> {
+                let quant_name = format!("{name}.input_quant");
+                Ok(Op::new(
+                    quant_name.clone(),
+                    Arc::new(Nvfp4QuantKernel::build(quant_name, config, bridge)?),
+                ))
+            })
+            .transpose()?;
+        let fused_moe_name = format!("{name}.fused_moe");
+        let fused_moe = Op::new(
+            fused_moe_name.clone(),
+            Arc::new(Nvfp4FusedMoeKernel::build(
+                fused_moe_name,
+                resolved.fused_moe.clone(),
+                bridge,
+            )?),
+        );
+        Ok(Self {
+            name,
+            quant,
+            fused_moe,
+            resolved,
+        })
+    }
+
+    pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        CostNode::Labeled {
+            label: format!(
+                "{} (Nvfp4MoeLocalWorklet) [ep={}; tp={}; experts={:?}; intermediate={:?}]",
+                self.name,
+                self.resolved.raw_cfg.ep_size,
+                self.resolved.raw_cfg.tp_size,
+                self.resolved.experts_per_device,
+                self.resolved.intermediate_per_rank,
+            ),
+            child: Box::new(CostNode::Sum({
+                let mut children: Vec<CostNode> = self
+                    .quant
+                    .iter()
+                    .map(|quant| quant.compile(builder))
+                    .collect();
+                children.push(self.fused_moe.compile(builder));
+                children
+            })),
+        }
+    }
+
+    pub fn eval(&self, input: &Nvfp4MoeLocalWorkletInput, ev: &mut Evaluator) {
+        self.eval_or_zero(input, false, ev);
+    }
+
+    /// Push zeros instead when this copy of the call does not run (a consumer
+    /// that compiles a concurrent and a serial copy, of which one runs).
+    pub fn eval_or_zero(&self, input: &Nvfp4MoeLocalWorkletInput, zero: bool, ev: &mut Evaluator) {
+        let num_tokens = input.num_tokens;
+        if let Some(quant) = &self.quant {
+            push_or_zero(quant, Nvfp4QuantKernelInput { num_tokens }, zero, ev);
+        }
+        push_or_zero(
+            &self.fused_moe,
+            Nvfp4FusedMoeKernelInput { num_tokens },
+            zero,
+            ev,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timing::routing::RoutingDistribution;
+
+    fn template(ep_size: u16, tp_size: u16) -> Nvfp4MoeLocalWorkletConfig {
+        Nvfp4MoeLocalWorkletConfig {
+            hidden: 6144.into(),
+            moe_intermediate: 2048.into(),
+            num_experts: 256.into(),
+            ep_size,
+            tp_size,
+            top_k: 8,
+            activation_dtype: DType::Bf16,
+            gpu_name: "NVIDIA B200".to_string(),
+            quant_backends: vec!["vllm_cuda"],
+            moe_backends: vec!["flashinfer_trtllm_sm100"],
+            weight_format: DType::Nvfp4E2m1,
+            activation_format: None,
+            group_size: 16,
+            routing_method: "minimax2".to_string(),
+            n_group: 1,
+            topk_group: 1,
+            routed_scaling_numerator: 5,
+            routed_scaling_denominator: 2,
+            expert_demand: ExpertDemand::Popularity {
+                layerwise_global_ppm: Vec::new(),
+            },
+            folded_rank_position: 0,
+        }
+    }
+
+    #[test]
+    fn ep_split_preserves_one_global_routing_sample_and_partitions_experts() {
+        let popularity = RoutingDistribution::from_profile(
+            &(0..256)
+                .map(|expert| (expert + 1) as f32)
+                .collect::<Vec<_>>(),
+        );
+        let configs = Nvfp4MoeLocalWorkletConfig::split_for_ep(
+            template(4, 1),
+            ExpertDemand::popularity(&popularity, 2),
+        );
+
+        assert_eq!(configs.len(), 4);
+        assert_eq!(
+            configs
+                .iter()
+                .map(|config| config.folded_rank_position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert!(configs
+            .windows(2)
+            .all(|pair| pair[0].expert_demand == pair[1].expert_demand));
+
+        let resolved = Nvfp4MoeLocalWorklet::resolve_config(&configs[3]);
+        assert_eq!(resolved.experts_per_device, 64);
+        assert_eq!(resolved.quant.unwrap().scale_format, "linear_e4m3");
+        assert_eq!(resolved.fused_moe.folded_rank_position, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "demand source width must match num_experts")]
+    fn ep_split_rejects_wrong_routing_width() {
+        let _ = Nvfp4MoeLocalWorkletConfig::split_for_ep(
+            template(4, 1),
+            ExpertDemand::popularity(&RoutingDistribution::uniform(128), 2),
+        );
+    }
+
+    #[test]
+    fn ep_deployment_leaves_the_intermediate_dimension_whole() {
+        let configs = Nvfp4MoeLocalWorkletConfig::split_for_ep(
+            template(4, 1),
+            ExpertDemand::popularity(&RoutingDistribution::uniform(256), 2),
+        );
+        let resolved = Nvfp4MoeLocalWorklet::resolve_config(&configs[0]);
+
+        assert_eq!(resolved.intermediate_per_rank, 2048);
+        assert_eq!(resolved.fused_moe.intermediate_size, 2048);
+        assert_eq!(resolved.fused_moe.num_local_experts, 64);
+    }
+
+    #[test]
+    fn pure_tp_shards_intermediate_and_keeps_every_expert() {
+        let config = Nvfp4MoeLocalWorkletConfig::replicated_for_tp(
+            template(1, 4),
+            ExpertDemand::popularity(&RoutingDistribution::uniform(256), 2),
+        );
+        let resolved = Nvfp4MoeLocalWorklet::resolve_config(&config);
+
+        assert_eq!(resolved.intermediate_per_rank, 512);
+        assert_eq!(resolved.fused_moe.intermediate_size, 512);
+        assert_eq!(resolved.experts_per_device, 256);
+        assert_eq!(resolved.fused_moe.num_local_experts, 256);
+        assert_eq!(resolved.fused_moe.folded_rank_position, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pure tensor parallelism leaves no expert parallelism")]
+    fn replicated_for_tp_rejects_expert_parallelism() {
+        let _ = Nvfp4MoeLocalWorkletConfig::replicated_for_tp(
+            template(4, 4),
+            ExpertDemand::popularity(&RoutingDistribution::uniform(256), 2),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "moe_intermediate must evenly partition TP")]
+    fn resolve_rejects_an_indivisible_tp_degree() {
+        let _ = Nvfp4MoeLocalWorklet::resolve_config(&template(1, 3));
+    }
+}

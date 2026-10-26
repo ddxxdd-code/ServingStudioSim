@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{ensure, Context};
 
 use crate::arch::build as arch_build;
 use crate::arch::{AttnArchSel, FfnArchSel};
@@ -92,7 +92,7 @@ impl Deployment for AfdDeployment {
             attn_prefix_cache_max_gpu_memory_gb(&ag.worker),
             attn_gpu_memory_gb,
         )?;
-        let attn_wc = worker_config(
+        let mut attn_wc = worker_config(
             attn_gpu_memory_gb,
             attn_gpu_time_multiplier(&ag.worker),
             prefix_cache,
@@ -100,6 +100,9 @@ impl Deployment for AfdDeployment {
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
         );
+        attn_wc.max_model_len = ag.arch.max_model_len().ok();
+        let AttnWorkerSel::DisaggAttn { kv_accounting, .. } = &ag.worker;
+        kv_accounting.apply("afd attention", &mut attn_wc)?;
         let ffn_wc = worker_config(
             80.0, // ffn has no KV
             ffn_gpu_time_multiplier(&fg.worker),
@@ -252,10 +255,6 @@ impl Deployment for AfdDeployment {
                     Some(cfg.io.log_dir.clone()),
                 ))
             }
-            (a, f) => bail!(
-                "afd: unsupported attn/ffn arch pairing (got attn={a:?}, ffn={f:?}); \
-                 wired pairs: qwen3_attn→qwen3_ffn_moe or qwen3_fp8_ffn_moe"
-            ),
         }
     }
 }

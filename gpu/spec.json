@@ -10,6 +10,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Volta",
+      "compute_capability": "7.0",
       "year": 2017,
       "mem_size_gb": 32,
       "mem_type": "HBM2",
@@ -32,6 +33,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
+      "compute_capability": "8.0",
       "year": 2020,
       "mem_size_gb": 40,
       "mem_type": "HBM2e",
@@ -58,6 +60,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
+      "compute_capability": "8.0",
       "year": 2020,
       "mem_size_gb": 80,
       "mem_type": "HBM2e",
@@ -80,6 +83,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
+      "compute_capability": "8.0",
       "year": 2020,
       "mem_size_gb": 40,
       "mem_type": "HBM2",
@@ -100,6 +104,7 @@
       "aliases": [],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
+      "compute_capability": "8.0",
       "year": 2020,
       "mem_size_gb": 80,
       "mem_type": "HBM2e",
@@ -119,12 +124,14 @@
       "name": "H100-SXM5-80GB",
       "aliases": [
         "NVIDIA H100",
+        "NVIDIA H100 80GB HBM3",
         "H100",
         "H100-SXM",
         "H100-SXM5"
       ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
+      "compute_capability": "9.0",
       "year": 2022,
       "mem_size_gb": 80,
       "mem_type": "HBM3",
@@ -143,10 +150,12 @@
     {
       "name": "H100-PCIe-80GB",
       "aliases": [
+        "NVIDIA H100 PCIe",
         "H100-PCIe"
       ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
+      "compute_capability": "9.0",
       "year": 2022,
       "mem_size_gb": 80,
       "mem_type": "HBM3",
@@ -171,6 +180,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
+      "compute_capability": "9.0",
       "year": 2024,
       "mem_size_gb": 141,
       "mem_type": "HBM3e",
@@ -184,7 +194,15 @@
       "interconnect": "NVLink 4.0",
       "interconnect_bandwidth_gbps": 900,
       "nvl_domain_size": 8,
-      "dollar_per_hour": 4.33
+      "dollar_per_hour": 4.33,
+      "sustained": {
+        "tflops": {
+          "bf16": 694,
+          "fp16": 104,
+          "fp8_e4m3": 1090
+        },
+        "copy_gbps": 4307
+      }
     },
     {
       "name": "B200-SXM-180GB",
@@ -195,6 +213,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Blackwell",
+      "compute_capability": "10.0",
       "year": 2024,
       "mem_size_gb": 180,
       "mem_type": "HBM3e",
@@ -209,7 +228,15 @@
       "interconnect": "NVLink 5.0",
       "interconnect_bandwidth_gbps": 1800,
       "nvl_domain_size": 8,
-      "dollar_per_hour": 6.73
+      "dollar_per_hour": 6.73,
+      "sustained": {
+        "tflops": {
+          "bf16": 1403,
+          "fp8_e4m3": 2526,
+          "nvfp4_e2m1": 5395
+        },
+        "copy_gbps": 6943
+      }
     },
     {
       "name": "B300-SXM-288GB",
@@ -220,6 +247,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Blackwell",
+      "compute_capability": "10.3",
       "year": 2025,
       "mem_size_gb": 288,
       "mem_type": "HBM3e",
@@ -246,6 +274,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Blackwell",
+      "compute_capability": "10.0",
       "year": 2024,
       "mem_size_gb": 384,
       "mem_type": "HBM3e",
@@ -273,6 +302,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
+      "compute_capability": "9.0",
       "year": 2022,
       "mem_size_gb": 80,
       "mem_type": "HBM3",
@@ -298,6 +328,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
+      "compute_capability": "9.0",
       "year": 2024,
       "mem_size_gb": 96,
       "mem_type": "HBM3",
@@ -321,6 +352,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
+      "compute_capability": "8.6",
       "year": 2020,
       "mem_size_gb": 48,
       "mem_type": "GDDR6",
@@ -343,6 +375,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Ada Lovelace",
+      "compute_capability": "8.9",
       "year": 2022,
       "mem_size_gb": 48,
       "mem_type": "GDDR6",
@@ -365,6 +398,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Ada Lovelace",
+      "compute_capability": "8.9",
       "year": 2023,
       "mem_size_gb": 48,
       "mem_type": "GDDR6",
@@ -387,6 +421,7 @@
       ],
       "vendor": "NVIDIA",
       "architecture": "Ada Lovelace",
+      "compute_capability": "8.9",
       "year": 2023,
       "mem_size_gb": 24,
       "mem_type": "GDDR6",
@@ -410,6 +445,7 @@
       ],
       "vendor": "AMD",
       "architecture": "CDNA3",
+      "compute_capability": null,
       "year": 2023,
       "mem_size_gb": 192,
       "mem_type": "HBM3",
@@ -433,6 +469,7 @@
       ],
       "vendor": "AMD",
       "architecture": "CDNA3",
+      "compute_capability": null,
       "year": 2024,
       "mem_size_gb": 256,
       "mem_type": "HBM3e",
@@ -456,6 +493,7 @@
       ],
       "vendor": "Intel",
       "architecture": "Gaudi",
+      "compute_capability": null,
       "year": 2022,
       "mem_size_gb": 96,
       "mem_type": "HBM2e",
@@ -478,6 +516,7 @@
       ],
       "vendor": "Intel",
       "architecture": "Gaudi",
+      "compute_capability": null,
       "year": 2024,
       "mem_size_gb": 128,
       "mem_type": "HBM2e",

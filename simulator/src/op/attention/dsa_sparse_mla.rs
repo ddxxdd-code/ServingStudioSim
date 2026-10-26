@@ -1,28 +1,28 @@
 //! GLM-5.2 sparse MLA attention compound op.
 //!
-//! One logical attention call is a fixed sequential pipeline:
-//! query concat, MLA cache append, request-local index remap, sparse prefill,
-//! then sparse decode. Query concat and index remap deliberately use the
-//! measured `elementwise` placeholder until their dedicated L1 boundaries are
-//! wired into this op.
+//! One logical attention call contains MLA cache append, sparse prefill, and
+//! sparse decode. Providers with separate launch boundaries additionally emit
+//! query concat and request-local index remap; SGLang fuses those operations
+//! into adjacent launches and therefore has no synthetic slots for them. The
+//! production B200 variant uses one exact-varlen sparse-prefill launch; the
+//! inherited H200 variant keeps its accepted per-request prefill fallback.
 //!
-//! **v1 normalization.** As in [`super::FlashInferAttentionOp`], prefill
-//! `(Q, S)` cells are evaluated per request and summed into one fixed slot;
-//! decode is one optional cell already collapsed by L3. Mixed batches therefore
-//! sum prefill and decode leaves even when production can combine them in one
-//! FlashMLA launch. This intentionally approximates that shared launch overhead
-//! while preserving a request-count-independent CostTree.
+//! Backend-specific L1 selection and launch-graph identity are build-time
+//! config; runtime request topology remains inside this compound op and never
+//! leaks into L3.
 
 use std::sync::Arc;
 
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
+    DsaSparseIndexRemapKernel, DsaSparseIndexRemapKernelConfig, DsaSparseIndexRemapKernelInput,
     DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionKernelConfig,
-    DsaSparseMlaAttentionKernelInput, ElementwiseKernel, ElementwiseKernelConfig,
+    DsaSparseMlaAttentionKernelInput, DsaSparseMlaPrefillKernel, DsaSparseMlaPrefillKernelConfig,
+    DsaSparseMlaPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig,
     ElementwiseKernelInput, MlaCacheAppendKernel, MlaCacheAppendKernelConfig,
-    MlaCacheAppendKernelInput,
+    MlaCacheAppendKernelInput, ValidCountsPattern,
 };
-use crate::timing::slot_input::DsaSparseMlaPrefillLog;
+use crate::timing::slot_input::{DsaSparseMlaDecodeLog, DsaSparseMlaPrefillLog};
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
 };
@@ -52,12 +52,47 @@ pub struct DsaSparseMlaAttentionConfig {
     pub value_dim: Dim,
     pub softmax_scale_denominator: u32,
     pub dtype: DType,
+    pub attention_q_dtype: DType,
+    pub attention_cache_dtype: DType,
+    pub attention_output_dtype: DType,
     pub index_dtype: String,
     pub index_distribution: String,
     pub sparse_cache_layout: String,
     pub mla_cache_block_size: u32,
     pub mla_cache_format: String,
     pub decode_next_n: u32,
+    pub launch_graph: DsaSparseMlaLaunchGraph,
+    /// `Some` selects the production B200 remap + exact-varlen prefill leaves.
+    /// `None` retains the accepted H200 fallback without changing its profile
+    /// identities or request aggregation.
+    pub exact_varlen: Option<DsaSparseMlaExactVarlenConfig>,
+}
+
+/// Measured launch boundary around sparse MLA. Provider worklets select one
+/// graph; this is not a runtime/user tuning mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DsaSparseMlaLaunchGraph {
+    Separate {
+        index_remap_backends: Vec<&'static str>,
+    },
+    /// SGLang's upstream fused RoPE produces the concatenated FP8 query and
+    /// its sparse-attention preparation consumes local indices directly.
+    FusedQueryConcatAndIndexRemap,
+}
+
+#[derive(Clone, Debug)]
+pub struct DsaSparseMlaExactVarlenConfig {
+    pub prefill_backends: Vec<&'static str>,
+    pub max_model_len: u32,
+    /// Production prefill indices are request-local and have a different
+    /// locality identity from decode's page selection. Keep the two cache axes
+    /// explicit instead of leaking `DsaSparseMlaAttentionConfig`'s decode
+    /// distribution into the prefill lookup.
+    pub prefill_index_distribution: String,
+    /// Required only by a separate production index-remap launch. A fused
+    /// provider graph must leave it absent rather than carrying an ignored
+    /// remap identity.
+    pub page_table_mapping: Option<String>,
 }
 
 /// Per-rank inputs for one logical sparse MLA attention call.
@@ -69,16 +104,65 @@ pub struct DsaSparseMlaAttentionInput {
     pub prefill_query_cache_pairs: Vec<(u32, u32)>,
     /// Optional decode cell, already collapsed by the future L3 worklet.
     pub decode_query_cache: Option<(u32, u32)>,
+    /// Exact request-local decode KV lengths when production metadata is
+    /// available. The cache still uses one uniform-equivalent coordinate, but
+    /// derives it as `mean + mean absolute deviation` instead of the batch
+    /// maximum. Across 24 real-capture held-out batches this kept 21/24 points
+    /// within 5 us while avoiding the mean projection's 17.2 us worst miss.
+    pub decode_context_lens: Option<Vec<u32>>,
 }
 
 pub struct DsaSparseMlaAttentionOp {
     pub name: String,
-    pub query_concat: Arc<ElementwiseKernel>,
+    pub query_concat: Option<Arc<ElementwiseKernel>>,
     pub mla_cache_append: Arc<MlaCacheAppendKernel>,
-    pub index_remap: Arc<ElementwiseKernel>,
-    pub prefill: Arc<DsaSparseMlaAttentionKernel>,
+    index_remap: Option<IndexRemapLeaf>,
+    prefill: PrefillLeaf,
     pub decode: Arc<DsaSparseMlaAttentionKernel>,
     decode_next_n: u32,
+    selected_k: u32,
+}
+
+enum IndexRemapLeaf {
+    Legacy(Arc<ElementwiseKernel>),
+    Production(Arc<DsaSparseIndexRemapKernel>),
+}
+
+impl IndexRemapLeaf {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Legacy(kernel) => kernel.kind(),
+            Self::Production(kernel) => kernel.kind(),
+        }
+    }
+
+    fn describe_config(&self) -> serde_json::Value {
+        match self {
+            Self::Legacy(kernel) => kernel.describe_config(),
+            Self::Production(kernel) => kernel.describe_config(),
+        }
+    }
+}
+
+enum PrefillLeaf {
+    Legacy(Arc<DsaSparseMlaAttentionKernel>),
+    Production(Arc<DsaSparseMlaPrefillKernel>),
+}
+
+impl PrefillLeaf {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Legacy(kernel) => kernel.kind(),
+            Self::Production(kernel) => kernel.kind(),
+        }
+    }
+
+    fn describe_config(&self) -> serde_json::Value {
+        match self {
+            Self::Legacy(kernel) => kernel.describe_config(),
+            Self::Production(kernel) => kernel.describe_config(),
+        }
+    }
 }
 
 impl DsaSparseMlaAttentionOp {
@@ -88,26 +172,47 @@ impl DsaSparseMlaAttentionOp {
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
         let subcfg = subkernel_configs(&cfg)?;
-        let query_concat = Arc::new(ElementwiseKernel::build(
-            format!("{name}.{}", SLOT_SUFFIXES[0]),
-            subcfg.query_concat,
-            bridge,
-        )?);
+        let query_concat = subcfg
+            .query_concat
+            .map(|config| {
+                ElementwiseKernel::build(format!("{name}.{}", SLOT_SUFFIXES[0]), config, bridge)
+                    .map(Arc::new)
+            })
+            .transpose()?;
         let mla_cache_append = Arc::new(MlaCacheAppendKernel::build(
             format!("{name}.{}", SLOT_SUFFIXES[1]),
             subcfg.mla_cache_append,
             bridge,
         )?);
-        let index_remap = Arc::new(ElementwiseKernel::build(
-            format!("{name}.{}", SLOT_SUFFIXES[2]),
-            subcfg.index_remap,
-            bridge,
-        )?);
-        let prefill = Arc::new(DsaSparseMlaAttentionKernel::build(
-            format!("{name}.{}", SLOT_SUFFIXES[3]),
-            subcfg.prefill,
-            bridge,
-        )?);
+        let index_remap = match subcfg.index_remap {
+            Some(IndexRemapConfig::Legacy(config)) => Some(IndexRemapLeaf::Legacy(Arc::new(
+                ElementwiseKernel::build(format!("{name}.{}", SLOT_SUFFIXES[2]), config, bridge)?,
+            ))),
+            Some(IndexRemapConfig::Production(config)) => Some(IndexRemapLeaf::Production(
+                Arc::new(DsaSparseIndexRemapKernel::build(
+                    format!("{name}.{}", SLOT_SUFFIXES[2]),
+                    config,
+                    bridge,
+                )?),
+            )),
+            None => None,
+        };
+        let prefill = match subcfg.prefill {
+            PrefillConfig::Legacy(config) => {
+                PrefillLeaf::Legacy(Arc::new(DsaSparseMlaAttentionKernel::build(
+                    format!("{name}.{}", SLOT_SUFFIXES[3]),
+                    config,
+                    bridge,
+                )?))
+            }
+            PrefillConfig::Production(config) => {
+                PrefillLeaf::Production(Arc::new(DsaSparseMlaPrefillKernel::build(
+                    format!("{name}.{}", SLOT_SUFFIXES[3]),
+                    config,
+                    bridge,
+                )?))
+            }
+        };
         let decode = Arc::new(DsaSparseMlaAttentionKernel::build(
             format!("{name}.{}", SLOT_SUFFIXES[4]),
             subcfg.decode,
@@ -121,27 +226,33 @@ impl DsaSparseMlaAttentionOp {
             prefill,
             decode,
             decode_next_n: cfg.decode_next_n,
+            selected_k: cfg.selected_k,
         })
     }
 
-    /// Five fixed serial leaves, independent of request count (INV-1).
+    /// Emit only physical provider launches, independent of request count.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        CostNode::Sum(vec![
-            builder.leaf(
+        let mut slots = Vec::with_capacity(5);
+        if let Some(query_concat) = &self.query_concat {
+            slots.push(builder.leaf(
                 format!("{}.{}", self.name, SLOT_SUFFIXES[0]),
-                self.query_concat.kind(),
-                self.query_concat.describe_config(),
-            ),
-            builder.leaf(
-                format!("{}.{}", self.name, SLOT_SUFFIXES[1]),
-                self.mla_cache_append.kind(),
-                self.mla_cache_append.describe_config(),
-            ),
-            builder.leaf(
+                query_concat.kind(),
+                query_concat.describe_config(),
+            ));
+        }
+        slots.push(builder.leaf(
+            format!("{}.{}", self.name, SLOT_SUFFIXES[1]),
+            self.mla_cache_append.kind(),
+            self.mla_cache_append.describe_config(),
+        ));
+        if let Some(index_remap) = &self.index_remap {
+            slots.push(builder.leaf(
                 format!("{}.{}", self.name, SLOT_SUFFIXES[2]),
-                self.index_remap.kind(),
-                self.index_remap.describe_config(),
-            ),
+                index_remap.kind(),
+                index_remap.describe_config(),
+            ));
+        }
+        slots.extend([
             builder.leaf(
                 format!("{}.{}", self.name, SLOT_SUFFIXES[3]),
                 self.prefill.kind(),
@@ -152,19 +263,22 @@ impl DsaSparseMlaAttentionOp {
                 self.decode.kind(),
                 self.decode.describe_config(),
             ),
-        ])
+        ]);
+        CostNode::Sum(slots)
     }
 
-    /// Push the same five slots in compile order (INV-2).
+    /// Push the same provider-specific slots in compile order (INV-2).
     pub fn eval(&self, input: &DsaSparseMlaAttentionInput, ev: &mut Evaluator) {
         let normalized = normalize_input(input, self.decode_next_n)
             .unwrap_or_else(|reason| panic!("invalid DsaSparseMlaAttentionInput: {reason}"));
 
-        let query_concat = ElementwiseKernelInput {
-            num_tokens: normalized.query_rows,
-        };
-        let query_concat_metrics = eval_or_zero(&self.query_concat, &query_concat);
-        ev.push(query_concat_metrics, || query_concat.clone().into());
+        if let Some(query_concat_kernel) = &self.query_concat {
+            let query_concat = ElementwiseKernelInput {
+                num_tokens: normalized.query_rows,
+            };
+            let query_concat_metrics = eval_or_zero(query_concat_kernel, &query_concat);
+            ev.push(query_concat_metrics, || query_concat.clone().into());
+        }
 
         let cache_append = MlaCacheAppendKernelInput {
             num_tokens: input.num_new_tokens,
@@ -176,54 +290,111 @@ impl DsaSparseMlaAttentionOp {
         };
         ev.push(cache_append_metrics, || cache_append.clone().into());
 
-        let index_remap = ElementwiseKernelInput {
-            num_tokens: normalized.query_rows,
-        };
-        let index_remap_metrics = eval_or_zero(&self.index_remap, &index_remap);
-        ev.push(index_remap_metrics, || index_remap.clone().into());
-
-        let mut prefill_metrics = LeafMetrics::ZERO;
-        for &(num_queries, num_cache_tokens) in &input.prefill_query_cache_pairs {
-            prefill_metrics.add_fanin(self.prefill.eval(&DsaSparseMlaAttentionKernelInput {
-                num_queries,
-                num_cache_tokens,
-            }));
-        }
-        ev.push(prefill_metrics, || {
-            DsaSparseMlaPrefillLog {
-                prefill_query_cache_pairs: input.prefill_query_cache_pairs.clone(),
+        match &self.index_remap {
+            None => {}
+            Some(IndexRemapLeaf::Legacy(kernel)) => {
+                let shape = ElementwiseKernelInput {
+                    num_tokens: normalized.query_rows,
+                };
+                let metrics = eval_or_zero(kernel, &shape);
+                ev.push(metrics, || shape.clone().into());
             }
-            .into()
-        });
+            Some(IndexRemapLeaf::Production(kernel)) => {
+                let shape =
+                    production_index_remap_input(input, self.decode_next_n, self.selected_k)
+                        .unwrap_or_else(|reason| {
+                            panic!("invalid production index-remap input: {reason}")
+                        });
+                let metrics = shape
+                    .as_ref()
+                    .map_or(LeafMetrics::ZERO, |shape| kernel.eval(shape));
+                ev.push(metrics, || {
+                    shape
+                        .unwrap_or(DsaSparseIndexRemapKernelInput {
+                            num_queries: 0,
+                            total_valid_count: 0,
+                            workspace_query_rows: 0,
+                        })
+                        .into()
+                });
+            }
+        }
+
+        match &self.prefill {
+            PrefillLeaf::Legacy(kernel) => {
+                let mut metrics = LeafMetrics::ZERO;
+                for &(num_queries, num_cache_tokens) in &input.prefill_query_cache_pairs {
+                    metrics.add_fanin(kernel.eval(&DsaSparseMlaAttentionKernelInput {
+                        num_queries,
+                        num_cache_tokens,
+                    }));
+                }
+                ev.push(metrics, || {
+                    DsaSparseMlaPrefillLog {
+                        prefill_query_cache_pairs: input.prefill_query_cache_pairs.clone(),
+                    }
+                    .into()
+                });
+            }
+            PrefillLeaf::Production(kernel) => {
+                let shape = (!input.prefill_query_cache_pairs.is_empty()).then(|| {
+                    DsaSparseMlaPrefillKernelInput {
+                        query_context_pairs: input.prefill_query_cache_pairs.clone(),
+                    }
+                });
+                let metrics = shape
+                    .as_ref()
+                    .map_or(LeafMetrics::ZERO, |shape| kernel.eval(shape));
+                ev.push(metrics, || {
+                    shape
+                        .unwrap_or(DsaSparseMlaPrefillKernelInput {
+                            query_context_pairs: Vec::new(),
+                        })
+                        .into()
+                });
+            }
+        }
 
         let decode_metrics = normalized
             .decode
             .as_ref()
             .map_or(LeafMetrics::ZERO, |shape| self.decode.eval(shape));
         ev.push(decode_metrics, || {
-            normalized
-                .decode
-                .clone()
-                .unwrap_or(DsaSparseMlaAttentionKernelInput {
-                    num_queries: 0,
-                    num_cache_tokens: 0,
-                })
-                .into()
+            DsaSparseMlaDecodeLog {
+                context_lens: normalized.decode_context_lens.clone(),
+                decode_next_n: self.decode_next_n,
+                projected_context: normalized
+                    .decode
+                    .as_ref()
+                    .map_or(0, |shape| shape.num_cache_tokens),
+            }
+            .into()
         });
     }
 }
 
 struct SubkernelConfigs {
-    query_concat: ElementwiseKernelConfig,
+    query_concat: Option<ElementwiseKernelConfig>,
     mla_cache_append: MlaCacheAppendKernelConfig,
-    index_remap: ElementwiseKernelConfig,
-    prefill: DsaSparseMlaAttentionKernelConfig,
+    index_remap: Option<IndexRemapConfig>,
+    prefill: PrefillConfig,
     decode: DsaSparseMlaAttentionKernelConfig,
+}
+
+enum IndexRemapConfig {
+    Legacy(ElementwiseKernelConfig),
+    Production(DsaSparseIndexRemapKernelConfig),
+}
+
+enum PrefillConfig {
+    Legacy(DsaSparseMlaAttentionKernelConfig),
+    Production(DsaSparseMlaPrefillKernelConfig),
 }
 
 struct NormalizedInput {
     query_rows: u32,
     decode: Option<DsaSparseMlaAttentionKernelInput>,
+    decode_context_lens: Vec<u32>,
 }
 
 fn fit_failed(reason: impl Into<String>) -> BuildError {
@@ -234,24 +405,110 @@ fn fit_failed(reason: impl Into<String>) -> BuildError {
 }
 
 fn subkernel_configs(cfg: &DsaSparseMlaAttentionConfig) -> Result<SubkernelConfigs, BuildError> {
-    let decode_pattern = match cfg.decode_next_n {
-        1 => "uniform_full",
-        2 => "speculative_pairs",
-        value => {
-            return Err(fit_failed(format!(
-                "decode_next_n must be 1 or 2, got {value}"
-            )))
-        }
-    };
+    let decode_pattern = ValidCountsPattern::for_decode(cfg.decode_next_n)
+        .ok_or_else(|| fit_failed("decode_next_n must be positive"))?;
     if cfg.softmax_scale_denominator == 0 {
         return Err(fit_failed("softmax_scale_denominator must be positive"));
     }
 
+    let (max_blocks_per_request, prefill) = match &cfg.exact_varlen {
+        None => (
+            None,
+            PrefillConfig::Legacy(sparse_attention_config(cfg, ValidCountsPattern::CausalTail)),
+        ),
+        Some(exact) => {
+            if exact.max_model_len == 0 {
+                return Err(fit_failed("exact varlen max_model_len must be positive"));
+            }
+            if cfg.selected_k != 2048 {
+                return Err(fit_failed(format!(
+                    "exact varlen selected_k must be 2048, got {}",
+                    cfg.selected_k
+                )));
+            }
+            if cfg.mla_cache_block_size != 64 {
+                return Err(fit_failed(format!(
+                    "exact varlen cache block size must be 64, got {}",
+                    cfg.mla_cache_block_size
+                )));
+            }
+            let max_blocks_per_request = exact.max_model_len.div_ceil(cfg.mla_cache_block_size);
+            if max_blocks_per_request > 16_384 {
+                return Err(fit_failed(format!(
+                    "exact varlen max_model_len requires {max_blocks_per_request} cache blocks; maximum is 16384"
+                )));
+            }
+            (
+                Some(max_blocks_per_request),
+                PrefillConfig::Production(production_prefill_config(cfg, exact)),
+            )
+        }
+    };
+
+    let (query_concat, index_remap) = match &cfg.launch_graph {
+        DsaSparseMlaLaunchGraph::Separate {
+            index_remap_backends,
+        } => {
+            let remap = match (&cfg.exact_varlen, max_blocks_per_request) {
+                (Some(exact), Some(max_blocks)) => {
+                    if index_remap_backends.is_empty() {
+                        return Err(fit_failed(
+                            "exact-varlen separate graph requires an index-remap backend",
+                        ));
+                    }
+                    if exact.page_table_mapping.is_none() {
+                        return Err(fit_failed(
+                            "exact-varlen separate graph requires page-table mapping",
+                        ));
+                    }
+                    IndexRemapConfig::Production(production_index_remap_config(
+                        cfg,
+                        exact,
+                        max_blocks,
+                        index_remap_backends,
+                    ))
+                }
+                (None, None) => {
+                    if !index_remap_backends.is_empty() {
+                        return Err(fit_failed(
+                            "legacy separate graph must not configure a production index-remap backend",
+                        ));
+                    }
+                    IndexRemapConfig::Legacy(legacy_index_remap_config(cfg)?)
+                }
+                _ => unreachable!("exact-varlen validation returns paired state"),
+            };
+            (Some(query_concat_config(cfg)?), Some(remap))
+        }
+        DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap => {
+            if cfg.exact_varlen.is_none() {
+                return Err(fit_failed(
+                    "fused sparse graph requires the production exact-varlen prefill",
+                ));
+            }
+            if !cfg.elementwise_backends.is_empty() {
+                return Err(fit_failed(
+                    "fused sparse graph must not configure elementwise concat/remap backends",
+                ));
+            }
+            if cfg
+                .exact_varlen
+                .as_ref()
+                .is_some_and(|exact| exact.page_table_mapping.is_some())
+            {
+                return Err(fit_failed(
+                    "fused sparse graph must not configure page-table remapping",
+                ));
+            }
+            (None, None)
+        }
+    };
+
     Ok(SubkernelConfigs {
-        query_concat: query_concat_config(cfg)?,
+        query_concat,
         mla_cache_append: mla_cache_append_config(cfg),
-        index_remap: index_remap_config(cfg)?,
-        prefill: sparse_attention_config(cfg, "causal_tail"),
+        index_remap,
+        prefill,
         decode: sparse_attention_config(cfg, decode_pattern),
     })
 }
@@ -290,13 +547,16 @@ fn mla_cache_append_config(cfg: &DsaSparseMlaAttentionConfig) -> MlaCacheAppendK
         kv_lora_rank: cfg.latent_dim.clone(),
         rope_dim: cfg.rope_dim.clone(),
         block_size: cfg.mla_cache_block_size,
-        input_dtype: cfg.dtype,
-        kv_dtype: cfg.dtype,
+        input_dtype: match &cfg.launch_graph {
+            DsaSparseMlaLaunchGraph::Separate { .. } => cfg.dtype,
+            DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap => cfg.attention_cache_dtype,
+        },
+        kv_dtype: cfg.attention_cache_dtype,
         cache_format: cfg.mla_cache_format.clone(),
     }
 }
 
-fn index_remap_config(
+fn legacy_index_remap_config(
     cfg: &DsaSparseMlaAttentionConfig,
 ) -> Result<ElementwiseKernelConfig, BuildError> {
     if cfg.selected_k == 0 || cfg.selected_k % REMAP_TILE_SIZE != 0 {
@@ -324,9 +584,60 @@ fn index_remap_config(
     })
 }
 
+fn production_index_remap_config(
+    cfg: &DsaSparseMlaAttentionConfig,
+    exact: &DsaSparseMlaExactVarlenConfig,
+    max_blocks_per_request: u32,
+    backends: &[&'static str],
+) -> DsaSparseIndexRemapKernelConfig {
+    let index_distribution = match cfg.index_distribution.as_str() {
+        "unique_scattered_pages" => "unique_scattered_blocks",
+        "clustered_pages" => "clustered_blocks",
+        other => other,
+    };
+    DsaSparseIndexRemapKernelConfig {
+        backends: backends.to_vec(),
+        gpu_name: cfg.gpu_name.clone(),
+        selected_k: cfg.selected_k,
+        block_size: cfg.mla_cache_block_size,
+        max_blocks_per_request,
+        index_distribution: index_distribution.to_string(),
+        page_table_mapping: exact
+            .page_table_mapping
+            .clone()
+            .expect("separate exact-varlen graph validates page-table mapping"),
+        return_valid_counts: true,
+        index_dtype: cfg.index_dtype.clone(),
+    }
+}
+
+fn production_prefill_config(
+    cfg: &DsaSparseMlaAttentionConfig,
+    exact: &DsaSparseMlaExactVarlenConfig,
+) -> DsaSparseMlaPrefillKernelConfig {
+    DsaSparseMlaPrefillKernelConfig {
+        backends: exact.prefill_backends.clone(),
+        gpu_name: cfg.gpu_name.clone(),
+        max_model_len: exact.max_model_len,
+        num_heads: cfg.num_heads.clone(),
+        num_kv_heads: cfg.num_kv_heads.clone(),
+        selected_k: cfg.selected_k,
+        latent_dim: cfg.latent_dim.clone(),
+        rope_dim: cfg.rope_dim.clone(),
+        value_dim: cfg.value_dim.clone(),
+        softmax_scale_denominator: cfg.softmax_scale_denominator,
+        q_dtype: cfg.attention_q_dtype,
+        cache_dtype: cfg.attention_cache_dtype,
+        index_dtype: cfg.index_dtype.clone(),
+        output_dtype: cfg.attention_output_dtype,
+        index_distribution: exact.prefill_index_distribution.clone(),
+        cache_layout: cfg.sparse_cache_layout.clone(),
+    }
+}
+
 fn sparse_attention_config(
     cfg: &DsaSparseMlaAttentionConfig,
-    valid_counts_pattern: &str,
+    valid_counts_pattern: ValidCountsPattern,
 ) -> DsaSparseMlaAttentionKernelConfig {
     DsaSparseMlaAttentionKernelConfig {
         backends: cfg.sparse_attention_backends.clone(),
@@ -338,11 +649,11 @@ fn sparse_attention_config(
         rope_dim: cfg.rope_dim.clone(),
         value_dim: cfg.value_dim.clone(),
         softmax_scale_denominator: cfg.softmax_scale_denominator,
-        q_dtype: cfg.dtype,
-        cache_dtype: cfg.dtype,
+        q_dtype: cfg.attention_q_dtype,
+        cache_dtype: cfg.attention_cache_dtype,
         index_dtype: cfg.index_dtype.clone(),
-        output_dtype: cfg.dtype,
-        valid_counts_pattern: valid_counts_pattern.to_string(),
+        output_dtype: cfg.attention_output_dtype,
+        valid_counts_pattern,
         index_distribution: cfg.index_distribution.clone(),
         cache_layout: cfg.sparse_cache_layout.clone(),
     }
@@ -352,8 +663,8 @@ fn normalize_input(
     input: &DsaSparseMlaAttentionInput,
     decode_next_n: u32,
 ) -> Result<NormalizedInput, String> {
-    if !matches!(decode_next_n, 1 | 2) {
-        return Err(format!("decode_next_n must be 1 or 2, got {decode_next_n}"));
+    if decode_next_n == 0 {
+        return Err("decode_next_n must be positive".to_string());
     }
 
     let mut query_rows = 0_u32;
@@ -375,6 +686,7 @@ fn normalize_input(
             .ok_or_else(|| "total query-row count overflows u32".to_string())?;
     }
 
+    let mut normalized_decode_context_lens = Vec::new();
     let decode = match input.decode_query_cache {
         Some((num_queries, num_cache_tokens)) => {
             if num_queries == 0 || num_cache_tokens == 0 {
@@ -382,23 +694,140 @@ fn normalize_input(
                     "decode cell must have nonzero Q and S, got ({num_queries}, {num_cache_tokens})"
                 ));
             }
-            if decode_next_n == 2 && num_queries % 2 != 0 {
+            // Same rule, same words, as `production_index_remap_input`. The two
+            // normalization paths bill the same physical rows, so a batch either
+            // path rejects must be rejected by both.
+            if num_queries % decode_next_n != 0 {
                 return Err(format!(
-                    "speculative decode requires even Q, got {num_queries}"
+                    "decode query rows {num_queries} must be divisible by decode_next_n {decode_next_n}"
                 ));
             }
+            let projected_context = if let Some(context_lens) = &input.decode_context_lens {
+                let expected_requests = num_queries / decode_next_n;
+                if context_lens.len() != expected_requests as usize {
+                    return Err(format!(
+                        "decode_context_lens has {} entries, expected {expected_requests}",
+                        context_lens.len()
+                    ));
+                }
+                let mut total = 0_u64;
+                for (request, &context) in context_lens.iter().enumerate() {
+                    if context < decode_next_n {
+                        return Err(format!(
+                            "decode request {request} context {context} must be at least decode_next_n {decode_next_n}"
+                        ));
+                    }
+                    total = total
+                        .checked_add(u64::from(context))
+                        .ok_or_else(|| "decode context sum overflows u64".to_string())?;
+                }
+                let request_count = u64::from(expected_requests);
+                let mean_context = total as f64 / request_count as f64;
+                let mean_absolute_deviation = context_lens
+                    .iter()
+                    .map(|&context| (f64::from(context) - mean_context).abs())
+                    .sum::<f64>()
+                    / request_count as f64;
+                normalized_decode_context_lens = context_lens.clone();
+                u32::try_from((mean_context + mean_absolute_deviation).round() as u64)
+                    .map_err(|_| "rounded decode context does not fit u32".to_string())?
+            } else {
+                normalized_decode_context_lens =
+                    vec![num_cache_tokens; (num_queries / decode_next_n) as usize];
+                num_cache_tokens
+            };
             query_rows = query_rows
                 .checked_add(num_queries)
                 .ok_or_else(|| "total query-row count overflows u32".to_string())?;
             Some(DsaSparseMlaAttentionKernelInput {
                 num_queries,
-                num_cache_tokens,
+                num_cache_tokens: projected_context,
             })
         }
-        None => None,
+        None => {
+            if input.decode_context_lens.is_some() {
+                return Err("decode_context_lens requires decode_query_cache".to_string());
+            }
+            None
+        }
     };
 
-    Ok(NormalizedInput { query_rows, decode })
+    Ok(NormalizedInput {
+        query_rows,
+        decode,
+        decode_context_lens: normalized_decode_context_lens,
+    })
+}
+
+/// The rows vLLM's remap wrapper scans, as totals. Decode rows precede prefill
+/// rows, matching vLLM's mixed-batch metadata layout. Every row's local span is
+/// its causal position within that request; valid slots are the same span capped
+/// by top-k. FlashInfer uses global cache slots, so this path has no prefill
+/// workspace partition.
+fn production_index_remap_input(
+    input: &DsaSparseMlaAttentionInput,
+    decode_next_n: u32,
+    selected_k: u32,
+) -> Result<Option<DsaSparseIndexRemapKernelInput>, String> {
+    let mut num_queries: u64 = 0;
+    let mut total_valid_count: u64 = 0;
+
+    if let Some((decode_rows, uniform_context)) = input.decode_query_cache {
+        if decode_rows % decode_next_n != 0 {
+            return Err(format!(
+                "decode query rows {decode_rows} must be divisible by decode_next_n {decode_next_n}"
+            ));
+        }
+        let num_requests = decode_rows / decode_next_n;
+        let uniform = [uniform_context];
+        let (contexts, repeat) = match &input.decode_context_lens {
+            Some(contexts) if contexts.len() != num_requests as usize => {
+                return Err(format!(
+                    "decode_context_lens has {} entries, expected {num_requests}",
+                    contexts.len()
+                ));
+            }
+            Some(contexts) => (contexts.as_slice(), 1),
+            None => (uniform.as_slice(), u64::from(num_requests)),
+        };
+        for &context in contexts {
+            if context < decode_next_n {
+                return Err(format!(
+                    "decode context {context} must be at least decode_next_n {decode_next_n}"
+                ));
+            }
+            num_queries += repeat * u64::from(decode_next_n);
+            total_valid_count +=
+                repeat * capped_span_total(context - decode_next_n + 1, context, selected_k);
+        }
+    }
+
+    for &(rows, context) in &input.prefill_query_cache_pairs {
+        num_queries += u64::from(rows);
+        total_valid_count += capped_span_total(context - rows + 1, context, selected_k);
+    }
+
+    if num_queries == 0 {
+        return Ok(None);
+    }
+    Ok(Some(DsaSparseIndexRemapKernelInput {
+        num_queries: u32::try_from(num_queries)
+            .map_err(|_| "remap query-row count overflows u32".to_string())?,
+        total_valid_count,
+        workspace_query_rows: 0,
+    }))
+}
+
+/// `min(span, cap)` summed over the spans `first..=last`.
+fn capped_span_total(first: u32, last: u32, cap: u32) -> u64 {
+    let (first, last, cap) = (u64::from(first), u64::from(last), u64::from(cap));
+    let ramp_last = last.min(cap);
+    let ramp = if first <= ramp_last {
+        (first + ramp_last) * (ramp_last - first + 1) / 2
+    } else {
+        0
+    };
+    ramp + (last - ramp_last.max(first - 1)) * cap
 }
 
 fn eval_or_zero(kernel: &ElementwiseKernel, input: &ElementwiseKernelInput) -> LeafMetrics {
@@ -412,10 +841,14 @@ fn eval_or_zero(kernel: &ElementwiseKernel, input: &ElementwiseKernelInput) -> L
 #[cfg(test)]
 mod tests {
     use super::{
-        index_remap_config, normalize_input, query_concat_config, subkernel_configs,
-        DsaSparseMlaAttentionConfig, DsaSparseMlaAttentionInput, SLOT_SUFFIXES,
+        capped_span_total, legacy_index_remap_config, normalize_input,
+        production_index_remap_input, query_concat_config, subkernel_configs,
+        DsaSparseMlaAttentionConfig, DsaSparseMlaAttentionInput, DsaSparseMlaExactVarlenConfig,
+        DsaSparseMlaLaunchGraph, IndexRemapConfig, PrefillConfig, SLOT_SUFFIXES,
     };
     use crate::timing::bridge::DType;
+    use crate::timing::kernels::engine::KernelSpec;
+    use crate::timing::kernels::{DsaSparseMlaAttentionSpec, ValidCountsPattern};
     use crate::timing::slot_input::DsaSparseMlaPrefillLog;
     use crate::timing::{BuildError, Dim, SlotInput};
 
@@ -433,22 +866,53 @@ mod tests {
             value_dim: Dim::param("kv_lora_rank", 512),
             softmax_scale_denominator: 16,
             dtype: DType::Bf16,
+            attention_q_dtype: DType::Bf16,
+            attention_cache_dtype: DType::Bf16,
+            attention_output_dtype: DType::Bf16,
             index_dtype: "int32".to_string(),
             index_distribution: "recent_contiguous".to_string(),
             sparse_cache_layout: "token_major_mqa_bf16_latent_rope".to_string(),
             mla_cache_block_size: 64,
             mla_cache_format: "plain".to_string(),
             decode_next_n,
+            launch_graph: DsaSparseMlaLaunchGraph::Separate {
+                index_remap_backends: Vec::new(),
+            },
+            exact_varlen: None,
         }
+    }
+
+    fn exact_cfg(decode_next_n: u32) -> DsaSparseMlaAttentionConfig {
+        let mut config = cfg(decode_next_n);
+        config.sparse_attention_backends = vec!["flashinfer_trtllm_fp8"];
+        config.gpu_name = "NVIDIA B200".to_string();
+        config.num_heads = Dim::param("num_attention_heads", 16);
+        config.attention_q_dtype = DType::Fp8E4m3;
+        config.attention_cache_dtype = DType::Fp8E4m3;
+        config.attention_output_dtype = DType::Bf16;
+        config.index_distribution = "unique_scattered_pages".to_string();
+        config.sparse_cache_layout = "hnd_paged_mqa_fp8_latent_rope".to_string();
+        config.mla_cache_format = "plain".to_string();
+        config.launch_graph = DsaSparseMlaLaunchGraph::Separate {
+            index_remap_backends: vec!["vllm_triton"],
+        };
+        config.exact_varlen = Some(DsaSparseMlaExactVarlenConfig {
+            prefill_backends: vec!["flashinfer_trtllm_fp8"],
+            max_model_len: 8192,
+            prefill_index_distribution: "recent_contiguous".to_string(),
+            page_table_mapping: Some("request_contiguous".to_string()),
+        });
+        config
     }
 
     #[test]
     fn config_expands_into_the_frozen_five_subkernel_identities() {
         let configs = subkernel_configs(&cfg(1)).unwrap();
 
-        assert_eq!(configs.query_concat.backends, vec!["triton"]);
-        assert_eq!(configs.query_concat.input_bytes_per_token, 73_728);
-        assert_eq!(configs.query_concat.output_bytes_per_token, 73_728);
+        let query_concat = configs.query_concat.as_ref().unwrap();
+        assert_eq!(query_concat.backends, vec!["triton"]);
+        assert_eq!(query_concat.input_bytes_per_token, 73_728);
+        assert_eq!(query_concat.output_bytes_per_token, 73_728);
 
         assert_eq!(configs.mla_cache_append.backends, vec!["vllm_cuda"]);
         assert_eq!(configs.mla_cache_append.kv_lora_rank, 512);
@@ -458,14 +922,23 @@ mod tests {
         assert_eq!(configs.mla_cache_append.kv_dtype, DType::Bf16);
         assert_eq!(configs.mla_cache_append.cache_format, "plain");
 
-        assert_eq!(configs.index_remap.backends, vec!["triton"]);
-        assert_eq!(configs.index_remap.input_bytes_per_token, 16_448);
-        assert_eq!(configs.index_remap.output_bytes_per_token, 8_192);
+        let Some(IndexRemapConfig::Legacy(index_remap)) = &configs.index_remap else {
+            panic!("legacy config must retain the elementwise remap")
+        };
+        assert_eq!(index_remap.backends, vec!["triton"]);
+        assert_eq!(index_remap.input_bytes_per_token, 16_448);
+        assert_eq!(index_remap.output_bytes_per_token, 8_192);
 
-        assert_eq!(configs.prefill.backends, vec!["vllm_flashmla_bf16"]);
-        assert_eq!(configs.prefill.valid_counts_pattern, "causal_tail");
-        assert_eq!(configs.decode.valid_counts_pattern, "uniform_full");
-        for sparse in [&configs.prefill, &configs.decode] {
+        let PrefillConfig::Legacy(prefill) = &configs.prefill else {
+            panic!("legacy config must retain per-request sparse attention")
+        };
+        assert_eq!(prefill.backends, vec!["vllm_flashmla_bf16"]);
+        assert_eq!(prefill.valid_counts_pattern, ValidCountsPattern::CausalTail);
+        assert_eq!(
+            configs.decode.valid_counts_pattern,
+            ValidCountsPattern::UniformFull
+        );
+        for sparse in [prefill, &configs.decode] {
             assert_eq!(sparse.gpu_name, "NVIDIA H200");
             assert_eq!(sparse.num_heads, 64);
             assert_eq!(sparse.num_kv_heads, 1);
@@ -484,23 +957,117 @@ mod tests {
     }
 
     #[test]
-    fn decode_next_n_two_selects_speculative_pairs() {
+    fn decode_next_n_two_keeps_prefill_causal_and_makes_decode_a_verify_group() {
         let configs = subkernel_configs(&cfg(2)).unwrap();
-        assert_eq!(configs.prefill.valid_counts_pattern, "causal_tail");
-        assert_eq!(configs.decode.valid_counts_pattern, "speculative_pairs");
+        let PrefillConfig::Legacy(prefill) = &configs.prefill else {
+            panic!("legacy config must retain per-request sparse attention")
+        };
+        assert_eq!(prefill.valid_counts_pattern, ValidCountsPattern::CausalTail);
+        assert_eq!(
+            configs.decode.valid_counts_pattern,
+            ValidCountsPattern::SpeculativeGroups { group_size: 2 }
+        );
+    }
+
+    #[test]
+    fn exact_varlen_expands_into_production_remap_and_prefill_configs() {
+        let configs = subkernel_configs(&exact_cfg(1)).unwrap();
+
+        let Some(IndexRemapConfig::Production(remap)) = &configs.index_remap else {
+            panic!("exact varlen config must select the dedicated remap")
+        };
+        assert_eq!(remap.backends, vec!["vllm_triton"]);
+        assert_eq!(remap.gpu_name, "NVIDIA B200");
+        assert_eq!(remap.max_blocks_per_request, 128);
+        assert_eq!(remap.index_distribution, "unique_scattered_blocks");
+        assert_eq!(remap.page_table_mapping, "request_contiguous");
+        assert!(remap.return_valid_counts);
+
+        let PrefillConfig::Production(prefill) = &configs.prefill else {
+            panic!("exact varlen config must select the one-launch prefill kernel")
+        };
+        assert_eq!(prefill.backends, vec!["flashinfer_trtllm_fp8"]);
+        assert_eq!(prefill.max_model_len, 8192);
+        assert_eq!(prefill.num_heads, 16);
+        assert_eq!(prefill.q_dtype, DType::Fp8E4m3);
+        assert_eq!(prefill.cache_dtype, DType::Fp8E4m3);
+        assert_eq!(prefill.output_dtype, DType::Bf16);
+        assert_eq!(prefill.index_distribution, "recent_contiguous");
+        assert_eq!(prefill.cache_layout, "hnd_paged_mqa_fp8_latent_rope");
+
+        assert_eq!(configs.mla_cache_append.kv_dtype, DType::Fp8E4m3);
+        assert_eq!(configs.decode.backends, vec!["flashinfer_trtllm_fp8"]);
+        assert_eq!(
+            configs.decode.valid_counts_pattern,
+            ValidCountsPattern::UniformFull
+        );
+        assert_eq!(configs.decode.q_dtype, DType::Fp8E4m3);
+        assert_eq!(configs.decode.cache_dtype, DType::Fp8E4m3);
+        assert_eq!(configs.decode.output_dtype, DType::Bf16);
+        assert_eq!(configs.decode.index_distribution, "unique_scattered_pages");
+    }
+
+    #[test]
+    fn fused_sglang_graph_omits_concat_and_remap_and_appends_fp8_input() {
+        let mut config = exact_cfg(1);
+        config.launch_graph = DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap;
+        config.elementwise_backends.clear();
+        config.exact_varlen.as_mut().unwrap().page_table_mapping = None;
+
+        let configs = subkernel_configs(&config).unwrap();
+        assert!(configs.query_concat.is_none());
+        assert!(configs.index_remap.is_none());
+        assert_eq!(configs.mla_cache_append.input_dtype, DType::Fp8E4m3);
+        assert!(matches!(configs.prefill, PrefillConfig::Production(_)));
+    }
+
+    #[test]
+    fn fused_graph_rejects_ignored_separate_launch_identity() {
+        let mut missing_exact = cfg(1);
+        missing_exact.launch_graph = DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap;
+        missing_exact.elementwise_backends.clear();
+        assert!(subkernel_configs(&missing_exact).is_err());
+
+        let mut config = exact_cfg(1);
+        config.launch_graph = DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap;
+        assert!(subkernel_configs(&config).is_err());
+
+        config.elementwise_backends.clear();
+        assert!(subkernel_configs(&config).is_err());
+
+        config.exact_varlen.as_mut().unwrap().page_table_mapping = None;
+        assert!(subkernel_configs(&config).is_ok());
     }
 
     #[test]
     fn invalid_decode_next_n_and_scale_fail_at_config_expansion() {
-        for decode_next_n in [0, 3] {
-            let error = subkernel_configs(&cfg(decode_next_n))
-                .err()
-                .expect("invalid decode_next_n must fail");
-            assert!(matches!(
-                error,
-                BuildError::FitFailed { reason, .. }
-                    if reason.contains("decode_next_n must be 1 or 2")
-            ));
+        let error = subkernel_configs(&cfg(0))
+            .err()
+            .expect("a zero-row decode step must fail");
+        assert!(matches!(
+            error,
+            BuildError::FitFailed { reason, .. }
+                if reason.contains("decode_next_n must be positive")
+        ));
+
+        // Every positive width resolves to a pattern L1 can profile, and the
+        // grid it selects anchors on request count, so its query axis is always
+        // a whole number of verify groups.
+        for (decode_next_n, expected) in [
+            (1, ValidCountsPattern::UniformFull),
+            (2, ValidCountsPattern::SpeculativeGroups { group_size: 2 }),
+            (3, ValidCountsPattern::SpeculativeGroups { group_size: 3 }),
+            (6, ValidCountsPattern::SpeculativeGroups { group_size: 6 }),
+        ] {
+            let configs = subkernel_configs(&cfg(decode_next_n)).expect("width must expand");
+            assert_eq!(configs.decode.valid_counts_pattern, expected);
+            let grid = DsaSparseMlaAttentionSpec::sweep_grid(&configs.decode);
+            assert!(
+                grid.axes()[0]
+                    .iter()
+                    .all(|rows| *rows as u32 % decode_next_n == 0),
+                "every query anchor must be a whole number of {decode_next_n}-row groups"
+            );
         }
 
         let mut config = cfg(1);
@@ -513,10 +1080,10 @@ mod tests {
     }
 
     #[test]
-    fn production_byte_formulas_and_selected_k_tile_guard_are_exact() {
+    fn legacy_byte_formulas_and_selected_k_tile_guard_are_exact() {
         let config = cfg(1);
         let query = query_concat_config(&config).unwrap();
-        let remap = index_remap_config(&config).unwrap();
+        let remap = legacy_index_remap_config(&config).unwrap();
         assert_eq!(query.input_bytes_per_token, 73_728);
         assert_eq!(query.output_bytes_per_token, 73_728);
         assert_eq!(remap.input_bytes_per_token, 16_448);
@@ -525,9 +1092,87 @@ mod tests {
         let mut invalid = config;
         invalid.selected_k = 2050;
         assert!(matches!(
-            index_remap_config(&invalid),
+            legacy_index_remap_config(&invalid),
             Err(BuildError::FitFailed { reason, .. }) if reason.contains("divisible by 128")
         ));
+    }
+
+    #[test]
+    fn production_remap_preserves_decode_first_request_and_row_topology() {
+        let input = DsaSparseMlaAttentionInput {
+            num_new_tokens: 28,
+            prefill_query_cache_pairs: vec![(8, 128), (16, 256)],
+            decode_query_cache: Some((4, 600)),
+            decode_context_lens: None,
+        };
+        let remap = production_index_remap_input(&input, 2, 2048)
+            .unwrap()
+            .expect("nonempty input must produce remap work");
+
+        assert_eq!(remap.num_queries, 2 + 2 + 8 + 16);
+        let spans = (599_u32..=600)
+            .chain(599..=600)
+            .chain(121..=128)
+            .chain(241..=256);
+        assert_eq!(remap.total_valid_count, spans.map(u64::from).sum::<u64>());
+        assert_eq!(remap.workspace_query_rows, 0);
+    }
+
+    #[test]
+    fn capped_span_total_matches_the_row_by_row_sum() {
+        for cap in [1_u32, 64, 2048] {
+            for first in [1, 2, 63, 64, 65, 2047, 2048, 2049, 5000] {
+                for len in [1, 2, 3, 100, 4096] {
+                    let last = first + len - 1;
+                    let rows: u64 = (first..=last).map(|span| u64::from(span.min(cap))).sum();
+                    assert_eq!(
+                        capped_span_total(first, last, cap),
+                        rows,
+                        "{first}..={last} @ {cap}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_remap_handles_empty_and_has_no_launch_caps() {
+        assert!(
+            production_index_remap_input(&DsaSparseMlaAttentionInput::default(), 1, 2048)
+                .unwrap()
+                .is_none()
+        );
+
+        // vLLM's wrapper sizes its grid by rows; request count and the
+        // profiled row range bound neither the launch nor the cost coords.
+        let many_requests = DsaSparseMlaAttentionInput {
+            prefill_query_cache_pairs: vec![(1, 1); 257],
+            decode_query_cache: Some((1024, 4096)),
+            ..Default::default()
+        };
+        let remap = production_index_remap_input(&many_requests, 1, 2048)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remap.num_queries, 1024 + 257);
+        assert_eq!(remap.total_valid_count, 1024 * 2048 + 257);
+
+        let past_profiled_rows = DsaSparseMlaAttentionInput {
+            prefill_query_cache_pairs: vec![(16384, 16384), (1, 1)],
+            ..Default::default()
+        };
+        let remap = production_index_remap_input(&past_profiled_rows, 1, 2048)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remap.num_queries, 16385);
+
+        let rounded_spec5_prefill = DsaSparseMlaAttentionInput {
+            prefill_query_cache_pairs: vec![(8196, 8196)],
+            ..Default::default()
+        };
+        let remap = production_index_remap_input(&rounded_spec5_prefill, 6, 2048)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remap.num_queries, 8196);
     }
 
     #[test]
@@ -540,6 +1185,7 @@ mod tests {
             num_new_tokens: 37,
             prefill_query_cache_pairs: vec![(8, 128), (16, 256)],
             decode_query_cache: Some((32, 8192)),
+            decode_context_lens: None,
         };
         let normalized = normalize_input(&input, 1).unwrap();
         assert_eq!(normalized.query_rows, 56);
@@ -547,6 +1193,27 @@ mod tests {
         assert_eq!(decode.num_queries, 32);
         assert_eq!(decode.num_cache_tokens, 8192);
         assert_eq!(input.num_new_tokens, 37);
+    }
+
+    #[test]
+    fn exact_decode_lengths_project_to_mean_plus_mad_and_remain_in_remap() {
+        let input = DsaSparseMlaAttentionInput {
+            num_new_tokens: 4,
+            prefill_query_cache_pairs: Vec::new(),
+            decode_query_cache: Some((4, 190)),
+            decode_context_lens: Some(vec![12, 190, 12, 190]),
+        };
+        let normalized = normalize_input(&input, 1).unwrap();
+        let decode = normalized.decode.unwrap();
+        assert_eq!(decode.num_queries, 4);
+        assert_eq!(decode.num_cache_tokens, 190);
+        assert_eq!(normalized.decode_context_lens, vec![12, 190, 12, 190]);
+
+        let remap = production_index_remap_input(&input, 1, 2048)
+            .unwrap()
+            .expect("decode rows must produce remap work");
+        assert_eq!(remap.num_queries, 4);
+        assert_eq!(remap.total_valid_count, 12 + 190 + 12 + 190);
     }
 
     #[test]
@@ -565,14 +1232,26 @@ mod tests {
         };
         assert!(normalize_input(&zero_decode, 1).is_err());
 
-        let odd_speculative = DsaSparseMlaAttentionInput {
-            decode_query_cache: Some((3, 2048)),
-            ..Default::default()
-        };
-        assert!(normalize_input(&odd_speculative, 2)
-            .err()
-            .expect("odd speculative Q must fail")
-            .contains("even Q"));
+        // Query rows must be a whole number of verify groups at every width, and
+        // both normalization paths must say so in the same words.
+        for (num_queries, decode_next_n) in [(3, 2), (7, 6), (13, 6)] {
+            let ragged = DsaSparseMlaAttentionInput {
+                decode_query_cache: Some((num_queries, 2048)),
+                ..Default::default()
+            };
+            let message = normalize_input(&ragged, decode_next_n)
+                .err()
+                .expect("query rows that do not fill whole verify groups must fail");
+            assert!(
+                message.contains("must be divisible by decode_next_n"),
+                "unexpected message for ({num_queries}, {decode_next_n}): {message}"
+            );
+            assert_eq!(
+                message,
+                production_index_remap_input(&ragged, decode_next_n, 2048).unwrap_err(),
+                "the two normalization paths must reject identically"
+            );
+        }
 
         let overflowing = DsaSparseMlaAttentionInput {
             prefill_query_cache_pairs: vec![(u32::MAX, u32::MAX), (1, 1)],

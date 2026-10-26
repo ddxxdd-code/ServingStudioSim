@@ -50,6 +50,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::common::Fabric;
 use crate::op::gemm::{
@@ -71,10 +72,10 @@ use crate::timing::{
     FlatCostNode, LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
+    MoeExpertComputeLocalWorklet, MoeExpertComputeLocalWorkletConfig,
+    MoeExpertComputeLocalWorkletInput, MoeExpertComputeLocalWorkletResolved,
     VllmFp8AttnBlockTpWorklet, VllmFp8AttnBlockTpWorkletConfig, VllmFp8AttnBlockTpWorkletInput,
-    VllmFp8AttnBlockTpWorkletResolved, VllmFp8MoeExpertComputeLocalWorklet,
-    VllmFp8MoeExpertComputeLocalWorkletConfig, VllmFp8MoeExpertComputeLocalWorkletInput,
-    VllmFp8MoeExpertComputeLocalWorkletResolved, VllmFp8MoeRouterLocalWorklet,
+    VllmFp8AttnBlockTpWorkletResolved, VllmFp8MoeRouterLocalWorklet,
     VllmFp8MoeRouterLocalWorkletConfig, VllmFp8MoeRouterLocalWorkletInput,
     VllmFp8MoeRouterLocalWorkletResolved,
 };
@@ -84,8 +85,8 @@ const NORM_BACKENDS: &[&str] = &["flashinfer"];
 // dense GEMMs compare both Torch weight layouts while grouped experts stay on
 // their one registered Torch implementation.
 const ACT_BACKENDS: &[&str] = &["triton"];
-const FP8_QUANT_BACKENDS: &[&str] = &["flashinfer_trtllm"];
-const FP8_GROUPED_GEMM_BACKENDS: &[&str] = &["flashinfer_trtllm"];
+const ROUTED_FP8_QUANT_BACKENDS: &[&str] = &["flashinfer_trtllm"];
+const ROUTED_FP8_GROUPED_GEMM_BACKENDS: &[&str] = &["flashinfer_trtllm"];
 const DENSE_FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 // See llama3_dense: FlashInfer impls registered under fa2/fa3, not "flashinfer".
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
@@ -127,7 +128,7 @@ pub struct Qwen3VllmMoeDpAttnEpFfnConfigs {
     /// One distribution-sensitive expert worklet per EP rank. Keeping the
     /// vector at L4 makes the rank `Max` explicit and preserves each rank's
     /// raw `local_ppm` cache identity.
-    pub moe_expert_compute: Vec<VllmFp8MoeExpertComputeLocalWorkletConfig>,
+    pub moe_expert_compute: Vec<MoeExpertComputeLocalWorkletConfig>,
     pub moe_finalize: Vec<MoeFinalizeRoutingKernelConfig>,
     pub moe_combine_allreduce: AllReduceKernelConfig,
     pub moe_combine_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
@@ -152,7 +153,7 @@ pub struct Qwen3VllmMoeDpAttnEpFfnResolved {
     pub attn_block: VllmFp8AttnBlockTpWorkletResolved,
     pub moe_router: VllmFp8MoeRouterLocalWorkletResolved,
     pub moe_dispatch: MoeNetConfig,
-    pub moe_expert_compute: Vec<VllmFp8MoeExpertComputeLocalWorkletResolved>,
+    pub moe_expert_compute: Vec<MoeExpertComputeLocalWorkletResolved>,
     pub moe_finalize: Vec<MoeFinalizeRoutingKernelConfig>,
     pub moe_combine_allreduce: AllReduceKernelConfig,
     pub moe_combine_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
@@ -181,12 +182,12 @@ pub struct Qwen3VllmMoeDpAttnEpFfnModel {
     pub nvl_num_gpu: u16,
     pub top_k: u32,
     pub num_experts: u32,
-    /// Symbolic KV footprint per token (folds to bytes at the worker seam).
-    pub total_kv_bytes_per_token: Dim,
+    /// Per-token KV bytes over one KV partition, for the KV cache layout.
+    pub kv_bytes_per_token: u64,
     pub attn_block: VllmFp8AttnBlockTpWorklet,
     pub moe_router: VllmFp8MoeRouterLocalWorklet,
     pub moe_dispatch: MoeDispatchOp,
-    pub moe_expert_compute: Vec<VllmFp8MoeExpertComputeLocalWorklet>,
+    pub moe_expert_compute: Vec<MoeExpertComputeLocalWorklet>,
     pub moe_finalize: Vec<Op<MoeFinalizeRoutingKernel>>,
     pub moe_combine_allreduce: Op<AllReduceKernel>,
     pub moe_combine_allreduce_fused: Op<AllReduceResidualRmsNormKernel>,
@@ -317,18 +318,26 @@ pub fn build_configs(
         parallel.hp_size, 1,
         "vLLM no-DP EP alignment requires hp_size=1"
     );
-    let moe_expert_compute = VllmFp8MoeExpertComputeLocalWorkletConfig::split_for_ep(
-        VllmFp8MoeExpertComputeLocalWorkletConfig {
+    // This EP path receives expert-partitioned rows between dispatch and
+    // finalize, so keep the production FlashInfer/TRT-LLM block-quant +
+    // blockscale-grouped-GEMM realization. The vLLM sibling worklet models the
+    // distinct EP1 local path measured for Qwen3.6; it must not silently change
+    // this arch's routed gate/up or down GEMMs.
+    let moe_expert_compute = MoeExpertComputeLocalWorkletConfig::split_for_ep(
+        MoeExpertComputeLocalWorkletConfig {
             hidden: model.hidden.clone(),
             moe_intermediate: model.moe_intermediate.clone(),
             num_experts: model.num_experts.clone(),
             ep_size: parallel.ep_size,
             top_k: model.top_k,
+            dtype: DType::Fp8E4m3,
             activation_dtype: model.dtype,
             gpu_name: gpu.clone(),
             act_backends: ACT_BACKENDS.to_vec(),
-            fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
-            fp8_grouped_gemm_backends: FP8_GROUPED_GEMM_BACKENDS.to_vec(),
+            fp8_quant_backends: ROUTED_FP8_QUANT_BACKENDS.to_vec(),
+            grouped_gemm_backends: model.grouped_gemm_backends(),
+            fp8_grouped_gemm_backends: ROUTED_FP8_GROUPED_GEMM_BACKENDS.to_vec(),
+            use_fp8_blockscale_grouped_gemm: true,
             local_ppm: Vec::new(),
         },
         routing.ppm(),
@@ -338,7 +347,7 @@ pub fn build_configs(
         moe_expert_compute
             .iter()
             .map(|expert_config| MoeFinalizeRoutingKernelConfig {
-                backends: FP8_GROUPED_GEMM_BACKENDS.to_vec(),
+                backends: ROUTED_FP8_GROUPED_GEMM_BACKENDS.to_vec(),
                 gpu_name: gpu.clone(),
                 hidden_size: model.hidden.clone(),
                 top_k: model.top_k,
@@ -358,6 +367,7 @@ pub fn build_configs(
         strategy: "auto".to_string(),
         launch_with_pdl: true,
         fp32_acc: true,
+        fused_token_limit: None,
     };
     Qwen3VllmMoeDpAttnEpFfnConfigs {
         attn_block: attn_block_config(model, parallel.attn_tp_size, gpu),
@@ -424,16 +434,20 @@ pub fn build_configs(
     }
 }
 
-/// **Total** KV-cache bytes one token occupies — summed across all
-/// `attn_tp_size` ranks of one DP shard, all layers, all KV heads. Same
-/// definition as `llama3_dp_attn_tp_ffn`: the wire size of a token's KV for a
-/// PD handoff (each DP shard owns one full copy of every KV head).
-fn total_kv_bytes_per_token(resolved: &Qwen3VllmMoeDpAttnEpFfnResolved) -> Dim {
-    let raw = &resolved.attn_block.raw_cfg;
-    2 * raw.num_kv_heads.clone()
-        * raw.head_dim.clone()
-        * Dim::param("bytes", raw.kv_dtype().size_bytes())
-        * Dim::param("num_layers", resolved.num_layers)
+/// Per-token KV bytes of every GQA layer over one attention TP group
+/// (`2 × KV heads × head_dim × kv dtype × layers`, heads replicated when the TP
+/// degree exceeds them). Arch-specific: MLA's compressed latent or cross-layer
+/// sharing would compute it differently, so it lives in the model_arch.
+fn kv_bytes_per_token(resolved: &Qwen3VllmMoeDpAttnEpFfnResolved) -> u64 {
+    let attn = &resolved.attn_block.raw_cfg;
+    gqa_kv_bytes_per_token(
+        u64::from(resolved.num_layers),
+        u64::from(attn.num_kv_heads.get()),
+        u64::from(attn.head_dim.get()),
+        u64::from(attn.head_dim.get()),
+        u64::from(attn.kv_dtype().size_bytes()),
+        u64::from(resolved.attn_tp_size),
+    )
 }
 
 pub fn resolve_configs(cfgs: &Qwen3VllmMoeDpAttnEpFfnConfigs) -> Qwen3VllmMoeDpAttnEpFfnResolved {
@@ -444,7 +458,7 @@ pub fn resolve_configs(cfgs: &Qwen3VllmMoeDpAttnEpFfnConfigs) -> Qwen3VllmMoeDpA
         moe_expert_compute: cfgs
             .moe_expert_compute
             .iter()
-            .map(VllmFp8MoeExpertComputeLocalWorklet::resolve_config)
+            .map(MoeExpertComputeLocalWorklet::resolve_config)
             .collect(),
         moe_finalize: cfgs.moe_finalize.clone(),
         moe_combine_allreduce: cfgs.moe_combine_allreduce.clone(),
@@ -479,7 +493,7 @@ pub fn build(
     let nvl_num_gpu = resolved.nvl_num_gpu;
     let top_k = resolved.top_k;
     let num_experts = resolved.num_experts;
-    let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
+    let kv_bytes_per_token = kv_bytes_per_token(&resolved);
     let moe_combine_message_bytes_per_token =
         u64::from(resolved.final_norm.hidden.get()) * u64::from(DType::Bf16.size_bytes());
     let moe_combine_max_fused_tokens = resolved.moe_combine_max_fused_tokens;
@@ -523,7 +537,7 @@ pub fn build(
             // slots are the EP fan-out positions in the CostTree and existing
             // analyzer label mappings intentionally identify them by operation
             // name rather than synthetic rank suffixes.
-            VllmFp8MoeExpertComputeLocalWorklet::build(
+            MoeExpertComputeLocalWorklet::build(
                 format!("{model_name}.moe_expert_compute"),
                 expert_compute,
                 bridge,
@@ -580,7 +594,7 @@ pub fn build(
         nvl_num_gpu,
         top_k,
         num_experts,
-        total_kv_bytes_per_token,
+        kv_bytes_per_token,
         attn_block,
         moe_router,
         moe_dispatch,
@@ -769,7 +783,7 @@ impl Qwen3VllmMoeDpAttnEpFfnModel {
         // derives its local routed count from its own `local_ppm` shard.
         for expert_compute in &self.moe_expert_compute {
             expert_compute.eval(
-                &VllmFp8MoeExpertComputeLocalWorkletInput {
+                &MoeExpertComputeLocalWorkletInput {
                     global_expert_selections,
                 },
                 ev,
@@ -814,8 +828,8 @@ impl Qwen3VllmMoeDpAttnEpFfnModel {
 }
 
 impl IterwiseUnifiedModel for Qwen3VllmMoeDpAttnEpFfnModel {
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token.get() as u64
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        KvCacheLayout::new().with_part(KvCachePart::per_token("gqa", self.kv_bytes_per_token))
     }
 
     /// One replica spans the EP group — `ep_size` GPUs, with the DP-attention
@@ -885,6 +899,7 @@ impl IterwiseUnifiedModel for Qwen3VllmMoeDpAttnEpFfnModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::op::moe::{GroupedGemmConfig, GroupedQuantConfig};
 
     #[test]
     fn vllm_fp8_graph_has_finalize_and_ep_allreduce_only() {
@@ -900,9 +915,20 @@ mod tests {
         assert_eq!(cfg.moe_finalize.len(), 4);
         assert_eq!(cfg.moe_combine_allreduce.num_gpus, 4);
         assert_eq!(cfg.lm_head.gemm.dtype, DType::Fp8E4m3);
+        assert!(cfg.moe_expert_compute[0].use_fp8_blockscale_grouped_gemm);
         assert_eq!(
             cfg.moe_expert_compute[0].fp8_grouped_gemm_backends,
-            FP8_GROUPED_GEMM_BACKENDS
+            ROUTED_FP8_GROUPED_GEMM_BACKENDS
         );
+
+        let resolved = MoeExpertComputeLocalWorklet::resolve_config(&cfg.moe_expert_compute[0]);
+        let gate_up = resolved
+            .gate_up_fp8
+            .expect("vLLM EP expert compute must use the FP8 compound op");
+        assert!(matches!(gate_up.quant, GroupedQuantConfig::Block(_)));
+        assert!(matches!(
+            gate_up.gemm,
+            GroupedGemmConfig::TrtllmBlockscale(_)
+        ));
     }
 }

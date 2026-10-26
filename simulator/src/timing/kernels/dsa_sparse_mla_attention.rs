@@ -1,4 +1,4 @@
-//! GLM-5.2 DSA sparse MLA attention kernel.
+//! DSA sparse MLA attention kernel.
 //!
 //! The cache uses physical `(num_queries, num_cache_tokens)` coordinates. The
 //! static `valid_counts_pattern` deterministically derives Python's canonical
@@ -8,6 +8,19 @@
 //! misses, and speculative removes unsupported odd-Q grid holes while adding
 //! Q134/Q266 and S3/S23/S45/S182. Cache math and the public query contract are
 //! unchanged.
+//!
+//! A speculative verify step submits one group of `next_n` query rows per
+//! request, so the group width is a physical property of the pattern rather than
+//! a fixed two. `ValidCountsPattern::SpeculativeGroups` carries it, and derives
+//! its axes from the group-of-two anchors by request count.
+//!
+//! GLM-5.3-Flash's pooled indexer (kpool) selects `index_topk` pools plus the
+//! trailing partial pool, so a row's active count is
+//! `min(n, index_topk + n mod index_kpool) <= index_topk + index_kpool - 1`
+//! (2051), inside a page table `round_up(2051, 128) = 2176` wide
+//! (`selected_k`). `ValidCountsPattern::PooledUniformFull` carries the pooling
+//! so decode derives `u:min(ctx, index_topk + index_kpool - 1)` instead of
+//! clipping at the page-table width, and sweeps its own smaller grid.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -40,6 +53,89 @@ const SPECULATIVE_CACHE_AXIS: [u32; 31] = [
     1, 2, 3, 4, 8, 16, 23, 32, 45, 63, 64, 65, 127, 128, 129, 182, 256, 512, 1024, 2047, 2048,
     2049, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
 ];
+/// Pooled decode queries stop at the TRTLLM 32,768-query launch guard, so the
+/// grid carries no cell the backend must mask. 96 splits the 64..127 decode
+/// batch gap, where the saturated time bends (B200 b3 fidelity).
+const POOLED_QUERY_AXIS: [u32; 21] = [
+    1, 2, 4, 8, 16, 32, 64, 96, 127, 128, 129, 255, 256, 257, 512, 1024, 2048, 4096, 8192, 16384,
+    32768,
+];
+/// Pooled context points below and above the saturating count. The
+/// pooling-derived `index_topk` and cap points are added by
+/// `pooled_cache_axis`; past the cap only the gather footprint grows.
+/// 768 splits 512..1024, where small-batch time dips then climbs.
+const POOLED_CACHE_AXIS: [u32; 21] = [
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 4096, 8192, 16384, 32768, 65536,
+    131072, 262144, 1048576,
+];
+
+/// Which valid-slot-count shape a config sweeps.
+///
+/// One choice, not two: the shape decides both the measured grid and the
+/// flattened count vector that grid enumerates.
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidCountsPattern {
+    /// Every query row sees the whole cache.
+    UniformFull,
+    /// One prefill request's rows walk a causal ramp over its own context.
+    CausalTail,
+    /// A speculative verify step: `group_size` rows per request, each seeing one
+    /// fewer context token than the next.
+    SpeculativeGroups { group_size: u32 },
+    /// Pooled-indexer decode: every row sees its whole context, but the indexer
+    /// keeps at most `index_topk` pools of `index_kpool` tokens plus the
+    /// partial tail pool, so the count saturates at
+    /// `index_topk + index_kpool - 1`, below the `selected_k` page-table width.
+    PooledUniformFull { index_topk: u32, index_kpool: u32 },
+}
+
+impl ValidCountsPattern {
+    /// Choose the decode shape for a step submitting `verify_width` query rows
+    /// per request, or `None` if that is not a width.
+    ///
+    /// One row is ordinary decode and every row sees the whole cache. Two or
+    /// more rows are a verify group walking a descending context ramp. The two
+    /// sweep different measured grids — uniform is dense in query count, while
+    /// speculative anchors on request count — so this picks a grid, not just an
+    /// encoding.
+    pub fn for_decode(verify_width: u32) -> Option<Self> {
+        match verify_width {
+            0 => None,
+            1 => Some(Self::UniformFull),
+            group_size => Some(Self::SpeculativeGroups { group_size }),
+        }
+    }
+
+    /// Largest active count a row can reach under this pattern.
+    ///
+    /// Unpooled patterns clip at the `selected_k` page-table width. The pooled
+    /// pattern keeps `index_topk` whole pools plus up to `index_kpool - 1`
+    /// trailing tokens (vLLM `_expand_pools_and_append_tail`), which must fit
+    /// the page table.
+    fn valid_count_cap(self, selected_k: u32) -> u32 {
+        match self {
+            Self::PooledUniformFull {
+                index_topk,
+                index_kpool,
+            } => {
+                assert!(
+                    index_topk > 0 && index_kpool > 0,
+                    "pooled index_topk and index_kpool must be positive"
+                );
+                let cap = index_topk
+                    .checked_add(index_kpool - 1)
+                    .expect("pooled valid-count cap overflows u32");
+                assert!(
+                    cap <= selected_k,
+                    "pooled valid-count cap {cap} exceeds selected_k {selected_k}"
+                );
+                cap
+            }
+            Self::UniformFull | Self::CausalTail | Self::SpeculativeGroups { .. } => selected_k,
+        }
+    }
+}
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DsaSparseMlaAttentionKernelConfig {
@@ -59,7 +155,7 @@ pub struct DsaSparseMlaAttentionKernelConfig {
     pub cache_dtype: DType,
     pub index_dtype: String,
     pub output_dtype: DType,
-    pub valid_counts_pattern: String,
+    pub valid_counts_pattern: ValidCountsPattern,
     pub index_distribution: String,
     pub cache_layout: String,
 }
@@ -79,12 +175,26 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
     const KIND: KernelKind = "dsa_sparse_mla_attention";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        let (query_axis, cache_axis): (&[u32], &[u32]) = match config.valid_counts_pattern.as_str()
-        {
-            "uniform_full" => (&UNIFORM_QUERY_AXIS, &UNIFORM_CACHE_AXIS),
-            "causal_tail" => (&CAUSAL_QUERY_AXIS, &CAUSAL_CACHE_AXIS),
-            "speculative_pairs" => (&SPECULATIVE_QUERY_AXIS, &SPECULATIVE_CACHE_AXIS),
-            pattern => panic!("unsupported valid_counts_pattern {pattern:?}"),
+        let (query_axis, cache_axis): (Vec<u32>, Vec<u32>) = match config.valid_counts_pattern {
+            ValidCountsPattern::UniformFull => {
+                (UNIFORM_QUERY_AXIS.to_vec(), UNIFORM_CACHE_AXIS.to_vec())
+            }
+            ValidCountsPattern::CausalTail => {
+                (CAUSAL_QUERY_AXIS.to_vec(), CAUSAL_CACHE_AXIS.to_vec())
+            }
+            ValidCountsPattern::SpeculativeGroups { group_size } => (
+                speculative_query_axis(group_size),
+                speculative_cache_axis(group_size, config.selected_k),
+            ),
+            ValidCountsPattern::PooledUniformFull { index_topk, .. } => (
+                POOLED_QUERY_AXIS.to_vec(),
+                pooled_cache_axis(
+                    index_topk,
+                    config
+                        .valid_counts_pattern
+                        .valid_count_cap(config.selected_k),
+                ),
+            ),
         };
         SweepGrid::new(vec![
             Axis::values(query_axis.iter().copied()),
@@ -101,13 +211,24 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
-        match config.valid_counts_pattern.as_str() {
-            "uniform_full" => vec![false; grid.axes()[0].len() * grid.axes()[1].len()],
-            "causal_tail" => {
-                grid.expand_2d(|num_queries, num_cache_tokens| num_queries > num_cache_tokens)
+        // TRTLLM-gen rejects the 65,536-query launch on B200. Production caps
+        // one iteration far below that, so 32,768 remains a generous measured
+        // extrapolation guard without requiring an unsupported launch.
+        let trtllm_query_too_large = |num_queries: f64| {
+            config.backends.contains(&"flashinfer_trtllm_fp8") && num_queries > 32_768.0
+        };
+        match config.valid_counts_pattern {
+            ValidCountsPattern::UniformFull | ValidCountsPattern::PooledUniformFull { .. } => {
+                grid.expand_2d(|num_queries, _| trtllm_query_too_large(num_queries))
             }
-            "speculative_pairs" => grid.expand_2d(|num_queries, _| num_queries as u32 % 2 != 0),
-            pattern => panic!("unsupported valid_counts_pattern {pattern:?}"),
+            ValidCountsPattern::CausalTail => grid.expand_2d(|num_queries, num_cache_tokens| {
+                num_queries > num_cache_tokens || trtllm_query_too_large(num_queries)
+            }),
+            ValidCountsPattern::SpeculativeGroups { group_size } => {
+                grid.expand_2d(|num_queries, _| {
+                    num_queries as u32 % group_size != 0 || trtllm_query_too_large(num_queries)
+                })
+            }
         }
     }
 
@@ -144,10 +265,12 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
                 .with(
                     "valid_counts",
                     canonical_valid_counts(
-                        &config.valid_counts_pattern,
+                        config.valid_counts_pattern,
                         num_queries,
                         num_cache_tokens,
-                        config.selected_k,
+                        config
+                            .valid_counts_pattern
+                            .valid_count_cap(config.selected_k),
                     ),
                 )
                 .with("index_distribution", config.index_distribution.clone())
@@ -157,10 +280,17 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
 }
 
 /// Derive the exact canonical Python valid-count encoding from physical axes.
-fn canonical_valid_counts(pattern: &str, q: u32, s: u32, k: u32) -> String {
+///
+/// `k` is the pattern's valid-count cap (`ValidCountsPattern::valid_count_cap`):
+/// `selected_k` for unpooled patterns, `index_topk + index_kpool - 1` pooled.
+fn canonical_valid_counts(pattern: ValidCountsPattern, q: u32, s: u32, k: u32) -> String {
     match pattern {
-        "uniform_full" => format!("u:{}x{q}", s.min(k)),
-        "causal_tail" => {
+        ValidCountsPattern::UniformFull => format!("u:{}x{q}", s.min(k)),
+        ValidCountsPattern::PooledUniformFull {
+            index_topk,
+            index_kpool,
+        } => canonical_pooled_counts(q, s, index_topk, index_kpool),
+        ValidCountsPattern::CausalTail => {
             if q > s {
                 return masked_placeholder(q);
             }
@@ -175,23 +305,179 @@ fn canonical_valid_counts(pattern: &str, q: u32, s: u32, k: u32) -> String {
                 format!("c:{first}..{last}@{k}")
             }
         }
-        "speculative_pairs" => {
-            if q % 2 != 0 {
+        ValidCountsPattern::SpeculativeGroups { group_size } => {
+            if q % group_size != 0 {
                 return masked_placeholder(q);
             }
-            let first = s.saturating_sub(1).min(k);
-            let second = s.min(k);
-            if first == second {
-                format!("u:{first}x{q}")
-            } else if q == 2 {
-                debug_assert_eq!(second, first + 1);
-                format!("r:{first}..{second}")
-            } else {
-                format!("g:({first},{second})x{}", q / 2)
-            }
+            canonical_speculative_counts(q, s, k, group_size)
         }
-        _ => panic!("unsupported valid_counts_pattern {pattern:?}"),
     }
+}
+
+/// Pooled decode rows past `index_topk` keep `index_topk` pools plus the
+/// `n mod index_kpool` tail tokens of their own context `n`. A decode batch's
+/// contexts are unrelated, so its rows spread over every tail phase: row `i`
+/// sees `min(s, index_topk + i mod index_kpool)`. The phases are not
+/// interchangeable on B200 (job 1141, 32 queries): 2048 / 2049 / 2050 / 2051
+/// active rows take 16.8 / 26.3 / 21.9 / 18.8 us and the phase-mixed batch
+/// 21.9 us, so a single saturated count would misstate the batch by up to 30%.
+///
+/// The encoding mirrors Python `_encode_valid_counts`: uniform, then a +1
+/// ramp, then the shortest repeating group.
+fn canonical_pooled_counts(q: u32, s: u32, index_topk: u32, index_kpool: u32) -> String {
+    if s <= index_topk {
+        return format!("u:{s}x{q}");
+    }
+    let counts: Vec<u32> = (0..q)
+        .map(|row| s.min(index_topk + row % index_kpool))
+        .collect();
+    if counts.iter().all(|&count| count == counts[0]) {
+        return format!("u:{}x{q}", counts[0]);
+    }
+    if counts
+        .iter()
+        .enumerate()
+        .all(|(row, &count)| count == counts[0] + row as u32)
+    {
+        return format!("r:{}..{}", counts[0], counts[counts.len() - 1]);
+    }
+    let len = counts.len();
+    let period = (1..=len)
+        .find(|&candidate| {
+            len % candidate == 0
+                && counts
+                    .iter()
+                    .enumerate()
+                    .all(|(row, &count)| count == counts[row % candidate])
+        })
+        .expect("the whole vector is always a period");
+    let group = counts[..period]
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("g:({group})x{}", len / period)
+}
+
+/// Scale the frozen group-of-two query anchors by request count.
+///
+/// Each grid point is `requests * group_size` query rows, so holding the request
+/// count fixed keeps the measured batch sizes — and the odd-Q holes the R.4 gate
+/// removed — aligned across group sizes.
+fn speculative_query_axis(group_size: u32) -> Vec<u32> {
+    assert!(group_size > 0, "speculative group_size must be positive");
+    if group_size == 2 {
+        return SPECULATIVE_QUERY_AXIS.to_vec();
+    }
+    SPECULATIVE_QUERY_AXIS
+        .iter()
+        .map(|num_queries| {
+            (num_queries / 2)
+                .checked_mul(group_size)
+                .expect("speculative query axis overflows u32")
+        })
+        .collect()
+}
+
+/// Add the group-sensitive transition points a wider verify group crosses.
+///
+/// The RLE form changes shape where the group first fits in the context
+/// (`num_cache_tokens` near `group_size`) and where it straddles the `selected_k`
+/// clip (`selected_k ..= selected_k + group_size - 1`). Without samples at
+/// those boundaries the cache interpolates across a discontinuity it never
+/// measured. The frozen group-of-two axis is returned untouched.
+fn speculative_cache_axis(group_size: u32, selected_k: u32) -> Vec<u32> {
+    if group_size == 2 {
+        return SPECULATIVE_CACHE_AXIS.to_vec();
+    }
+    let saturated_context = selected_k
+        .checked_add(group_size - 1)
+        .expect("speculative saturation boundary overflows u32");
+    let mut axis = SPECULATIVE_CACHE_AXIS.to_vec();
+    axis.extend(
+        [
+            group_size - 1,
+            group_size,
+            group_size + 1,
+            selected_k.saturating_sub(group_size - 1),
+            selected_k,
+            selected_k + 1,
+            saturated_context.saturating_sub(1),
+            saturated_context,
+            saturated_context
+                .checked_add(1)
+                .expect("speculative saturation guard overflows u32"),
+        ]
+        .into_iter()
+        .filter(|value| *value > 0),
+    );
+    axis.sort_unstable();
+    axis.dedup();
+    axis
+}
+
+/// Mirror Python's canonical encoder for `q / group_size` repeats of one
+/// speculative verify group.
+///
+/// Row `i` of a group sees `num_cache_tokens - (group_size - 1 - i)` context
+/// tokens, clipped to `selected_k` above and to zero below, so the group is
+/// non-decreasing and one group determines the whole vector. Building just that
+/// group keeps enumeration `O(group_size)` instead of `O(num_queries)` at the
+/// largest request anchor, and is exact:
+///
+/// * `u:` needs every row equal, which is a property of the group alone.
+/// * `r:` and `c:` compare against a ramp seeded at row 0. With more than one
+///   repeat, row `group_size` is back at the group's first value while the ramp
+///   has advanced, and the ramp can only have stalled by reaching `selected_k` —
+///   which would have made the group uniform. So both forms require exactly one
+///   repeat.
+/// * Python's `g:` uses the minimal period. A non-decreasing sequence whose
+///   period divides its length is constant, so a non-uniform group's minimal
+///   period is the whole group, and Fine and Wilf's theorem rules out a shorter
+///   period appearing only once the group is repeated.
+fn canonical_speculative_counts(q: u32, s: u32, k: u32, group_size: u32) -> String {
+    let group: Vec<u32> = (0..group_size)
+        .map(|row| s.saturating_sub(group_size - 1 - row).min(k))
+        .collect();
+    let first = group[0];
+    let last = group[group.len() - 1];
+    if first == last {
+        return format!("u:{first}x{q}");
+    }
+
+    if q == group_size {
+        let is_ramp = |cap: u32| {
+            group
+                .iter()
+                .enumerate()
+                .all(|(row, &count)| count == (first + row as u32).min(cap))
+        };
+        if is_ramp(u32::MAX) {
+            return format!("r:{first}..{last}");
+        }
+        let unclipped_last = first + group_size - 1;
+        if first < k && k < unclipped_last && unclipped_last <= s && is_ramp(k) {
+            return format!("c:{first}..{unclipped_last}@{k}");
+        }
+    }
+
+    let counts = group
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("g:({counts})x{}", q / group_size)
+}
+
+/// Pooled context axis: the fixed points plus `index_topk` (last unsaturated
+/// power-of-two anchor) and the saturating cap, so the linear cache never
+/// interpolates across the point where the count stops growing.
+fn pooled_cache_axis(index_topk: u32, cap: u32) -> Vec<u32> {
+    let mut axis = POOLED_CACHE_AXIS.to_vec();
+    axis.extend([index_topk, cap]);
+    axis.sort_unstable();
+    axis.dedup();
+    axis
 }
 
 fn masked_placeholder(q: u32) -> String {
@@ -202,11 +488,12 @@ register_kernel!(DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionSpec);
 
 #[cfg(test)]
 mod tests {
+    use super::ValidCountsPattern;
     use super::{
-        canonical_valid_counts, DsaSparseMlaAttentionKernelConfig,
-        DsaSparseMlaAttentionKernelInput, DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS,
-        CAUSAL_QUERY_AXIS, SPECULATIVE_CACHE_AXIS, SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS,
-        UNIFORM_QUERY_AXIS,
+        canonical_valid_counts, speculative_cache_axis, speculative_query_axis,
+        DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput,
+        DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, SPECULATIVE_CACHE_AXIS,
+        SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
     };
     use crate::timing::bridge::{ArgsPayload, DType};
     use crate::timing::cache::{CacheKind, Extrapolation};
@@ -217,7 +504,7 @@ mod tests {
 
     const TORCH_BACKEND: &str = "torch";
     const FLASHMLA_BACKEND: &str = "vllm_flashmla_bf16";
-    fn config(pattern: &str) -> DsaSparseMlaAttentionKernelConfig {
+    fn config(pattern: ValidCountsPattern) -> DsaSparseMlaAttentionKernelConfig {
         DsaSparseMlaAttentionKernelConfig {
             backends: vec![TORCH_BACKEND, FLASHMLA_BACKEND],
             gpu_name: "NVIDIA H200".to_string(),
@@ -232,7 +519,7 @@ mod tests {
             cache_dtype: DType::Bf16,
             index_dtype: "int32".to_string(),
             output_dtype: DType::Bf16,
-            valid_counts_pattern: pattern.to_string(),
+            valid_counts_pattern: pattern,
             index_distribution: "recent_contiguous".to_string(),
             cache_layout: "token_major_mqa_bf16_latent_rope".to_string(),
         }
@@ -240,7 +527,7 @@ mod tests {
 
     #[test]
     fn config_kind_and_dtype_identity_match_the_python_handoff() {
-        let cfg = config("uniform_full");
+        let cfg = config(ValidCountsPattern::UniformFull);
 
         assert_eq!(DsaSparseMlaAttentionSpec::KIND, "dsa_sparse_mla_attention");
         assert_eq!(
@@ -267,7 +554,7 @@ mod tests {
     #[test]
     fn describe_config_preserves_rich_dimensions_and_static_modes() {
         assert_eq!(
-            config("causal_tail").describe_config(),
+            config(ValidCountsPattern::CausalTail).describe_config(),
             serde_json::json!({
                 "backends": [TORCH_BACKEND, FLASHMLA_BACKEND],
                 "gpu_name": "NVIDIA H200",
@@ -282,7 +569,7 @@ mod tests {
                 "cache_dtype": "bf16",
                 "index_dtype": "int32",
                 "output_dtype": "bf16",
-                "valid_counts_pattern": "causal_tail",
+                "valid_counts_pattern": ValidCountsPattern::CausalTail,
                 "index_distribution": "recent_contiguous",
                 "cache_layout": "token_major_mqa_bf16_latent_rope",
             })
@@ -309,14 +596,19 @@ mod tests {
     #[test]
     fn grids_have_the_exact_pattern_specific_axes_and_boundaries() {
         assert_grid(
-            "uniform_full",
+            ValidCountsPattern::UniformFull,
             &UNIFORM_QUERY_AXIS,
             &UNIFORM_CACHE_AXIS,
             810,
         );
-        assert_grid("causal_tail", &CAUSAL_QUERY_AXIS, &CAUSAL_CACHE_AXIS, 1_517);
         assert_grid(
-            "speculative_pairs",
+            ValidCountsPattern::CausalTail,
+            &CAUSAL_QUERY_AXIS,
+            &CAUSAL_CACHE_AXIS,
+            1_517,
+        );
+        assert_grid(
+            ValidCountsPattern::SpeculativeGroups { group_size: 2 },
             &SPECULATIVE_QUERY_AXIS,
             &SPECULATIVE_CACHE_AXIS,
             620,
@@ -324,13 +616,18 @@ mod tests {
 
         // Every pattern's cache axis now reaches the arch's full 1,048,576-token
         // timing domain, and every query axis reaches 65,536.
-        for pattern in ["uniform_full", "causal_tail", "speculative_pairs"] {
+        for pattern in [
+            ValidCountsPattern::UniformFull,
+            ValidCountsPattern::CausalTail,
+            ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+        ] {
             let grid = DsaSparseMlaAttentionSpec::sweep_grid(&config(pattern));
             assert_eq!(grid.axes()[0].last(), Some(&65536.0));
             assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
         }
 
-        let uniform = DsaSparseMlaAttentionSpec::sweep_grid(&config("uniform_full"));
+        let uniform =
+            DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::UniformFull));
         assert_contiguous(&uniform.axes()[0], &[127, 128, 129]);
         assert_contiguous(&uniform.axes()[0], &[131, 132, 133]);
         assert_contiguous(&uniform.axes()[0], &[255, 256, 257, 263, 264, 265]);
@@ -338,7 +635,7 @@ mod tests {
         assert_contiguous(&uniform.axes()[1], &[65, 91, 127]);
         assert_contiguous(&uniform.axes()[1], &[2047, 2048, 2049]);
 
-        let causal = DsaSparseMlaAttentionSpec::sweep_grid(&config("causal_tail"));
+        let causal = DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::CausalTail));
         assert_contiguous(&causal.axes()[0], &[1, 2, 3, 4, 6, 8, 11]);
         assert_contiguous(&causal.axes()[0], &[127, 128, 129, 130, 131, 132, 133]);
         assert_contiguous(&causal.axes()[0], &[254, 255, 256, 257, 258, 263, 264, 265]);
@@ -346,7 +643,10 @@ mod tests {
         assert_contiguous(&causal.axes()[1], &[255, 256, 260, 511, 512, 513, 724]);
         assert_contiguous(&causal.axes()[1], &[2047, 2048, 2049]);
 
-        let speculative = DsaSparseMlaAttentionSpec::sweep_grid(&config("speculative_pairs"));
+        let speculative =
+            DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::SpeculativeGroups {
+                group_size: 2,
+            }));
         assert!(speculative.axes()[0]
             .iter()
             .all(|query| *query as u32 % 2 == 0));
@@ -359,12 +659,14 @@ mod tests {
 
     #[test]
     fn masks_match_each_frozen_pattern_domain() {
-        let uniform_grid = DsaSparseMlaAttentionSpec::sweep_grid(&config("uniform_full"));
-        let uniform = mask_for("uniform_full", &uniform_grid);
+        let uniform_grid =
+            DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::UniformFull));
+        let uniform = mask_for(ValidCountsPattern::UniformFull, &uniform_grid);
         assert_mask_split(&uniform, 810, 0);
 
-        let causal_grid = DsaSparseMlaAttentionSpec::sweep_grid(&config("causal_tail"));
-        let causal = mask_for("causal_tail", &causal_grid);
+        let causal_grid =
+            DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::CausalTail));
+        let causal = mask_for(ValidCountsPattern::CausalTail, &causal_grid);
         assert_mask_split(&causal, 858, 659);
         assert!(!masked(&causal, &causal_grid, 3, 3));
         assert!(!masked(&causal, &causal_grid, 3, 4));
@@ -377,8 +679,14 @@ mod tests {
         assert!(!masked(&causal, &causal_grid, 65536, 1_048_576));
         assert!(masked(&causal, &causal_grid, 65536, 32768));
 
-        let speculative_grid = DsaSparseMlaAttentionSpec::sweep_grid(&config("speculative_pairs"));
-        let speculative = mask_for("speculative_pairs", &speculative_grid);
+        let speculative_grid =
+            DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::SpeculativeGroups {
+                group_size: 2,
+            }));
+        let speculative = mask_for(
+            ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+            &speculative_grid,
+        );
         assert_mask_split(&speculative, 620, 0);
         assert!(!masked(&speculative, &speculative_grid, 2, 1));
         assert!(!masked(&speculative, &speculative_grid, 32, 2048));
@@ -389,80 +697,396 @@ mod tests {
     }
 
     #[test]
+    fn trtllm_fp8_masks_only_the_rejected_65536_query_row() {
+        let mut cfg = config(ValidCountsPattern::CausalTail);
+        cfg.backends = vec!["flashinfer_trtllm_fp8"];
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
+
+        assert!(!masked(&mask, &grid, 32768, 1_048_576));
+        assert!(masked(&mask, &grid, 65536, 1_048_576));
+    }
+
+    const TRTLLM_BACKEND: &str = "flashinfer_trtllm_fp8";
+
+    /// GLM-5.3-Flash TP4 decode on B200, the exact values of b2-dsa 5.1.
+    fn pooled_config() -> DsaSparseMlaAttentionKernelConfig {
+        DsaSparseMlaAttentionKernelConfig {
+            backends: vec![TRTLLM_BACKEND],
+            gpu_name: "NVIDIA B200".to_string(),
+            num_heads: Dim::param("num_attention_heads", 16),
+            num_kv_heads: Dim::param("num_kv_heads", 1),
+            selected_k: 2176,
+            latent_dim: Dim::param("kv_lora_rank", 512),
+            rope_dim: Dim::param("qk_rope_head_dim", 0),
+            value_dim: Dim::param("kv_lora_rank", 512),
+            softmax_scale_denominator: 16,
+            q_dtype: DType::Fp8E4m3,
+            cache_dtype: DType::Fp8E4m3,
+            index_dtype: "int32".to_string(),
+            output_dtype: DType::Bf16,
+            valid_counts_pattern: ValidCountsPattern::PooledUniformFull {
+                index_topk: 2048,
+                index_kpool: 4,
+            },
+            index_distribution: "unique_scattered_pages".to_string(),
+            cache_layout: "hnd_paged_mqa_fp8_latent".to_string(),
+        }
+    }
+
+    /// Catches a pooled decode clipping at the 2176-wide page table (up to 125
+    /// phantom active slots per row) or any drift from the rope-free runner args.
+    #[test]
+    fn pooled_payloads_cap_at_topk_plus_kpool_minus_one() {
+        let cfg = pooled_config();
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        let payloads = DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, TRTLLM_BACKEND);
+
+        // Past index_topk the rows spread over the four tail phases (job 1141).
+        for (q, s, expected) in [
+            (32, 1024, "u:1024x32"),
+            (32, 2048, "u:2048x32"),
+            (32, 2051, "g:(2048,2049,2050,2051)x8"),
+            (32, 4096, "g:(2048,2049,2050,2051)x8"),
+            (4, 4096, "r:2048..2051"),
+            (2, 4096, "r:2048..2049"),
+        ] {
+            let fields = payload_for(&payloads, &grid, q, s).fields();
+            assert_eq!(fields.get("valid_counts"), Some(&Value::from(expected)));
+        }
+        let odd = payload_for(&payloads, &grid, 127, 4096).fields()["valid_counts"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(odd.starts_with("g:(2048,2049,2050,2051,2048,") && odd.ends_with(",2050)x1"));
+        let fields = payload_for(&payloads, &grid, 1, 1_048_576).fields();
+        assert_eq!(fields.get("valid_counts"), Some(&Value::from("u:2048x1")));
+        assert_eq!(
+            serde_json::to_value(fields).unwrap(),
+            serde_json::json!({
+                "backend": TRTLLM_BACKEND,
+                "num_queries": 1,
+                "num_cache_tokens": 1_048_576,
+                "num_heads": 16,
+                "num_kv_heads": 1,
+                "selected_k": 2176,
+                "latent_dim": 512,
+                "rope_dim": 0,
+                "value_dim": 512,
+                "softmax_scale": 0.0625,
+                "q_dtype": "fp8_e4m3",
+                "cache_dtype": "fp8_e4m3",
+                "index_dtype": "int32",
+                "output_dtype": "bf16",
+                "valid_counts": "u:2048x1",
+                "index_distribution": "unique_scattered_pages",
+                "cache_layout": "hnd_paged_mqa_fp8_latent",
+            })
+        );
+        assert_eq!(cfg.compute_dtype(), Some(DType::Fp8E4m3));
+        assert_eq!(cfg.kv_dtype(), Some(DType::Fp8E4m3));
+    }
+
+    /// Catches the pooled grid losing the saturation bracket or growing past
+    /// the 500-feasible-coordinate ceiling.
+    #[test]
+    fn pooled_grid_brackets_saturation_within_the_coordinate_ceiling() {
+        let cfg = pooled_config();
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        assert_contiguous(&grid.axes()[1], &[1024, 1536, 2048, 2051, 4096]);
+        assert_eq!(grid.axes()[0].last(), Some(&32768.0));
+        assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
+        let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
+        assert_mask_split(&mask, 21 * 23, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds selected_k")]
+    fn pooled_cap_must_fit_the_page_table() {
+        let mut cfg = pooled_config();
+        cfg.selected_k = 2048;
+        DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+    }
+
+    /// Catches the pooled pattern escaping the TRTLLM >32,768-query guard.
+    #[test]
+    fn pooled_pattern_keeps_the_trtllm_query_guard() {
+        let pooled = pooled_config();
+        let synthetic = crate::timing::sweep::SweepGrid::new(vec![
+            crate::timing::sweep::Axis::values([32768, 65536]),
+            crate::timing::sweep::Axis::values([2051]),
+        ]);
+        assert_eq!(
+            DsaSparseMlaAttentionSpec::infeasible_mask(&pooled, &synthetic),
+            vec![false, true]
+        );
+    }
+
+    #[test]
     fn speculative_odd_query_defense_remains_for_synthetic_grids() {
         let grid = crate::timing::sweep::SweepGrid::new(vec![
             crate::timing::sweep::Axis::values([2, 3, 4]),
             crate::timing::sweep::Axis::values([1, 2]),
         ]);
-        let mask = mask_for("speculative_pairs", &grid);
+        let mask = mask_for(
+            ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+            &grid,
+        );
 
         assert_mask_split(&mask, 4, 2);
         assert!(masked(&mask, &grid, 3, 1));
         assert!(masked(&mask, &grid, 3, 2));
         assert_eq!(
-            canonical_valid_counts("speculative_pairs", 3, 2, 2048),
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+                3,
+                2,
+                2048
+            ),
             "u:0x3"
         );
     }
 
     #[test]
     fn canonical_valid_counts_obeys_python_precedence_for_every_pattern() {
-        assert_eq!(canonical_valid_counts("uniform_full", 1, 1, 2048), "u:1x1");
         assert_eq!(
-            canonical_valid_counts("uniform_full", 256, 131072, 2048),
+            canonical_valid_counts(ValidCountsPattern::UniformFull, 1, 1, 2048),
+            "u:1x1"
+        );
+        assert_eq!(
+            canonical_valid_counts(ValidCountsPattern::UniformFull, 256, 131072, 2048),
             "u:2048x256"
         );
 
-        assert_eq!(canonical_valid_counts("causal_tail", 1, 1, 2048), "u:1x1");
         assert_eq!(
-            canonical_valid_counts("causal_tail", 128, 128, 2048),
+            canonical_valid_counts(ValidCountsPattern::CausalTail, 1, 1, 2048),
+            "u:1x1"
+        );
+        assert_eq!(
+            canonical_valid_counts(ValidCountsPattern::CausalTail, 128, 128, 2048),
             "r:1..128"
         );
         assert_eq!(
-            canonical_valid_counts("causal_tail", 128, 2048, 2048),
+            canonical_valid_counts(ValidCountsPattern::CausalTail, 128, 2048, 2048),
             "r:1921..2048"
         );
         assert_eq!(
-            canonical_valid_counts("causal_tail", 128, 2049, 2048),
+            canonical_valid_counts(ValidCountsPattern::CausalTail, 128, 2049, 2048),
             "c:1922..2049@2048"
         );
         assert_eq!(
-            canonical_valid_counts("causal_tail", 128, 4096, 2048),
+            canonical_valid_counts(ValidCountsPattern::CausalTail, 128, 4096, 2048),
             "u:2048x128"
         );
         assert_eq!(
-            canonical_valid_counts("causal_tail", 4096, 1, 2048),
+            canonical_valid_counts(ValidCountsPattern::CausalTail, 4096, 1, 2048),
             "u:0x4096"
         );
 
         assert_eq!(
-            canonical_valid_counts("speculative_pairs", 2, 1, 2048),
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+                2,
+                1,
+                2048
+            ),
             "r:0..1"
         );
         assert_eq!(
-            canonical_valid_counts("speculative_pairs", 32, 2048, 2048),
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+                32,
+                2048,
+                2048
+            ),
             "g:(2047,2048)x16"
         );
         assert_eq!(
-            canonical_valid_counts("speculative_pairs", 2, 2049, 2048),
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+                2,
+                2049,
+                2048
+            ),
             "u:2048x2"
         );
         assert_eq!(
-            canonical_valid_counts("speculative_pairs", 127, 2048, 2048),
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+                127,
+                2048,
+                2048
+            ),
             "u:0x127"
+        );
+
+        // Group six, at coordinates its own grid actually visits. `r:`/`c:` need
+        // a single repeat, so they only appear at the smallest query anchor.
+        assert_eq!(
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 6 },
+                6,
+                5,
+                2048
+            ),
+            "r:0..5"
+        );
+        assert_eq!(
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 6 },
+                6,
+                2043,
+                2048
+            ),
+            "r:2038..2043"
+        );
+        assert_eq!(
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 6 },
+                6,
+                2049,
+                2048
+            ),
+            "c:2044..2049@2048"
+        );
+        assert_eq!(
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 6 },
+                6,
+                3,
+                2048
+            ),
+            "g:(0,0,0,1,2,3)x1"
+        );
+        assert_eq!(
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 6 },
+                12,
+                2048,
+                2048
+            ),
+            "g:(2043,2044,2045,2046,2047,2048)x2"
+        );
+        assert_eq!(
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 6 },
+                12,
+                2049,
+                2048
+            ),
+            "g:(2044,2045,2046,2047,2048,2048)x2"
+        );
+        assert_eq!(
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 6 },
+                12,
+                4096,
+                2048
+            ),
+            "u:2048x12"
+        );
+        assert_eq!(
+            canonical_valid_counts(
+                ValidCountsPattern::SpeculativeGroups { group_size: 6 },
+                7,
+                4096,
+                2048
+            ),
+            "u:0x7"
         );
     }
 
+    /// Group two is a measured grid, not just an encoding. Generalizing the
+    /// derivation must leave both its axes and its RLE bytes exactly where the
+    /// R.4 gate put them.
     #[test]
-    #[should_panic(expected = "unsupported valid_counts_pattern")]
-    fn unknown_pattern_fails_during_valid_count_derivation() {
-        let _ = canonical_valid_counts("requests", 1, 1, 2048);
+    fn group_two_keeps_its_frozen_axes_and_bytes() {
+        assert_eq!(speculative_query_axis(2), SPECULATIVE_QUERY_AXIS);
+        assert_eq!(speculative_cache_axis(2, 2048), SPECULATIVE_CACHE_AXIS);
+
+        // The generalized encoder must reproduce the frozen group-two bytes on
+        // every coordinate of the frozen grid, not just the sampled ones.
+        for &num_queries in SPECULATIVE_QUERY_AXIS.iter() {
+            for &num_cache_tokens in SPECULATIVE_CACHE_AXIS.iter() {
+                let first = num_cache_tokens.saturating_sub(1).min(2048);
+                let second = num_cache_tokens.min(2048);
+                let expected = if first == second {
+                    format!("u:{first}x{num_queries}")
+                } else if num_queries == 2 {
+                    format!("r:{first}..{second}")
+                } else {
+                    format!("g:({first},{second})x{}", num_queries / 2)
+                };
+                assert_eq!(
+                    canonical_valid_counts(
+                        ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+                        num_queries,
+                        num_cache_tokens,
+                        2048
+                    ),
+                    expected,
+                    "group-two identity drifted at ({num_queries}, {num_cache_tokens})"
+                );
+            }
+        }
     }
 
+    /// A wider verify group changes RLE shape where the group first fits the
+    /// context and where it straddles the `selected_k` clip. Anchoring the query
+    /// axis on request count keeps every cell feasible; dropping either cache
+    /// boundary leaves the cache interpolating across a discontinuity.
     #[test]
-    #[should_panic(expected = "unsupported valid_counts_pattern")]
-    fn unknown_pattern_fails_during_grid_construction() {
-        let _ = DsaSparseMlaAttentionSpec::sweep_grid(&config("requests"));
+    fn group_six_grid_anchors_requests_and_pins_its_transitions() {
+        let cfg = config(ValidCountsPattern::SpeculativeGroups { group_size: 6 });
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+
+        assert_eq!(grid.axes()[0].len(), SPECULATIVE_QUERY_AXIS.len());
+        assert_eq!(grid.axes()[0][0], 6.0);
+        assert_eq!(grid.axes()[0].last(), Some(&196_608.0));
+        assert!(grid.axes()[0].iter().all(|q| *q as u32 % 6 == 0));
+        for (index, &num_queries) in SPECULATIVE_QUERY_AXIS.iter().enumerate() {
+            assert_eq!(grid.axes()[0][index], f64::from(num_queries / 2 * 6));
+        }
+
+        // Retain existing points and add both sides of the all-rows-saturated boundary.
+        assert_eq!(grid.axes()[1].len(), SPECULATIVE_CACHE_AXIS.len() + 7);
+        assert_contiguous(&grid.axes()[1], &[4, 5, 6, 7, 8]);
+        assert_contiguous(&grid.axes()[1], &[1024, 2043, 2047, 2048, 2049]);
+        assert_contiguous(&grid.axes()[1], &[2049, 2052, 2053, 2054, 4096]);
+        assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
+
+        let mask = mask_for(
+            ValidCountsPattern::SpeculativeGroups { group_size: 6 },
+            &grid,
+        );
+        assert_mask_split(&mask, 760, 0);
+
+        let payloads = DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, FLASHMLA_BACKEND);
+        assert_eq!(payloads.len(), 760);
+        assert_payload(
+            payload_for(&payloads, &grid, 12, 2052),
+            12,
+            2052,
+            "g:(2047,2048,2048,2048,2048,2048)x2".to_string(),
+        );
+        assert_payload(
+            payload_for(&payloads, &grid, 12, 2053),
+            12,
+            2053,
+            "u:2048x12".to_string(),
+        );
+        assert_payload(
+            payload_for(&payloads, &grid, 6, 2049),
+            6,
+            2049,
+            "c:2044..2049@2048".to_string(),
+        );
+        assert_payload(
+            payload_for(&payloads, &grid, 12, 2043),
+            12,
+            2043,
+            "g:(2038,2039,2040,2041,2042,2043)x2".to_string(),
+        );
     }
 
     #[test]
@@ -480,9 +1104,9 @@ mod tests {
     #[test]
     fn enumeration_emits_backend_plus_the_exact_python_schema() {
         for (pattern, expected_payloads) in [
-            ("uniform_full", 810),
-            ("causal_tail", 1_517),
-            ("speculative_pairs", 620),
+            (ValidCountsPattern::UniformFull, 810),
+            (ValidCountsPattern::CausalTail, 1_517),
+            (ValidCountsPattern::SpeculativeGroups { group_size: 2 }, 620),
         ] {
             let cfg = config(pattern);
             let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
@@ -545,11 +1169,11 @@ mod tests {
         }
 
         assert_critical_payloads(
-            "uniform_full",
+            ValidCountsPattern::UniformFull,
             &[(132, 6), (132, 11), (132, 91), (131, 8192), (133, 8192)],
         );
         assert_critical_payloads(
-            "causal_tail",
+            ValidCountsPattern::CausalTail,
             &[
                 (3, 3),
                 (132, 182),
@@ -563,7 +1187,7 @@ mod tests {
             ],
         );
         assert_critical_payloads(
-            "speculative_pairs",
+            ValidCountsPattern::SpeculativeGroups { group_size: 2 },
             &[
                 (32, 3),
                 (132, 23),
@@ -588,9 +1212,12 @@ mod tests {
         let mut memberships = 0;
 
         for distribution in distributions {
-            let uniform = feasible_payload_keys("uniform_full", distribution);
-            let causal = feasible_payload_keys("causal_tail", distribution);
-            let speculative = feasible_payload_keys("speculative_pairs", distribution);
+            let uniform = feasible_payload_keys(ValidCountsPattern::UniformFull, distribution);
+            let causal = feasible_payload_keys(ValidCountsPattern::CausalTail, distribution);
+            let speculative = feasible_payload_keys(
+                ValidCountsPattern::SpeculativeGroups { group_size: 2 },
+                distribution,
+            );
 
             assert_eq!(uniform.len(), 810);
             assert_eq!(causal.len(), 858);
@@ -628,7 +1255,12 @@ mod tests {
         })
     }
 
-    fn assert_grid(pattern: &str, query_axis: &[u32], cache_axis: &[u32], cells: usize) {
+    fn assert_grid(
+        pattern: ValidCountsPattern,
+        query_axis: &[u32],
+        cache_axis: &[u32],
+        cells: usize,
+    ) {
         let grid = DsaSparseMlaAttentionSpec::sweep_grid(&config(pattern));
         let axes = grid.axes();
 
@@ -663,7 +1295,7 @@ mod tests {
         );
     }
 
-    fn assert_critical_payloads(pattern: &str, coordinates: &[(u32, u32)]) {
+    fn assert_critical_payloads(pattern: ValidCountsPattern, coordinates: &[(u32, u32)]) {
         let cfg = config(pattern);
         let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
         let payloads = DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, FLASHMLA_BACKEND);
@@ -678,7 +1310,7 @@ mod tests {
         }
     }
 
-    fn feasible_payload_keys(pattern: &str, distribution: &str) -> BTreeSet<String> {
+    fn feasible_payload_keys(pattern: ValidCountsPattern, distribution: &str) -> BTreeSet<String> {
         let mut cfg = config(pattern);
         cfg.index_distribution = distribution.to_string();
         let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
@@ -692,7 +1324,7 @@ mod tests {
             .collect()
     }
 
-    fn mask_for(pattern: &str, grid: &crate::timing::sweep::SweepGrid) -> Vec<bool> {
+    fn mask_for(pattern: ValidCountsPattern, grid: &crate::timing::sweep::SweepGrid) -> Vec<bool> {
         DsaSparseMlaAttentionSpec::infeasible_mask(&config(pattern), grid)
     }
 

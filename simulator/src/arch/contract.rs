@@ -8,6 +8,7 @@
 //! at the per-layer attn/ffn boundary so the two disaggregated worker pools can
 //! interleave attn-of-layer-N with ffn-of-layer-(N-1).
 
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::timing::{CostManifest, CostManifestDoc, LeafMetrics, SlotInput};
 
 /// One attention/FFN group view for an iter-wise batch. Local/unified and PD
@@ -84,6 +85,13 @@ pub struct UnifiedArchInput {
 /// iteration (embedding → layers → lm_head). `&UnifiedArchInput` is concrete on
 /// the signature (no `dyn`); L5 binds via `<M: IterwiseUnifiedModel>` generic.
 pub trait IterwiseUnifiedModel: Send + Sync + 'static {
+    /// Reject a batch this model cannot cost, with the reason, before any
+    /// eval. `eval_iter` panics on the same batches; callers that take input
+    /// from outside the simulator (timing-predict) check first.
+    fn check_input(&self, _batch: &UnifiedArchInput) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Per-iter cost of the whole iteration (embedding → layers → lm_head) via the
     /// compiled CostTree path: stream each leaf's [`LeafMetrics`] into `slots`
     /// (the caller's reused buffer — cleared + refilled to the manifest length),
@@ -136,47 +144,21 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         }
     }
 
-    /// **Total** KV-cache bytes one token occupies — summed over **all** layers,
-    /// **all** KV heads, **all** attention ranks. This is the wire size of a
-    /// token's KV (what a PD handoff transfers across the comm group); it is
-    /// *not* per-GPU.
-    ///
-    /// To size one worker KV partition for an attention shard, the worker reads
-    /// `attn_kv_bytes` (per-GPU budget), multiplies by `num_attn_shards()` (the
-    /// GPUs in one attn shard set), and divides by this total to get capacity
-    /// in tokens. To compute a PD transfer size, the prefill worker multiplies
-    /// tokens by this to get total wire bytes; the cluster then divides by
-    /// link count to recover per-rank bytes.
-    fn total_kv_bytes_per_token(&self) -> u64;
+    /// What one request keeps in the KV cache, part by part (global attention,
+    /// sliding windows, compressed indexers, recurrent states), with bytes summed
+    /// over every rank of one KV partition. L5 sizes capacity, admission, prefix
+    /// entries and PD transfers from it; see [`crate::arch::kv_layout`].
+    fn kv_cache_layout(&self) -> KvCacheLayout;
 
-    /// **Total** recurrent-state bytes one *request* occupies — summed over
-    /// **all** recurrent (SSM / linear-attention) layers, **all** heads, **all**
-    /// attention ranks, and including both the SSM state and the causal-conv
-    /// window (neither alone can resume a sequence). Same "total, not per-GPU"
-    /// convention as [`Self::total_kv_bytes_per_token`], so a worker converts it
-    /// to that function's token unit by dividing.
+    /// Whether the `cost_log` must keep each decode request's KV length.
     ///
-    /// Unlike KV, this is **fixed per request**: it does not grow as the request
-    /// decodes. A pure full-attention model has no such state and returns 0
-    /// (the default), which is what keeps every dense arch untouched.
-    fn recurrent_state_bytes_per_request(&self) -> u64 {
-        0
-    }
-
-    /// Token interval at which a checkpoint of [`Self::recurrent_state_bytes_per_request`]
-    /// can be taken and later resumed from — vLLM's hybrid `block_size`.
-    ///
-    /// A recurrent state is a single rolling snapshot, not per-token entries, so
-    /// it is only reusable at positions where a snapshot was actually written.
-    /// vLLM writes them at multiples of this interval (`mamba_cache_mode`), which
-    /// quantizes every prefix-cache hit to a multiple of it. `0` means the model
-    /// has no recurrent state; `1` would mean "resumable anywhere", which no real
-    /// recurrent layer is.
-    ///
-    /// The arch owns the derivation because only it knows the state and KV page
-    /// shapes; L5 only reads the value (and may override it from a preset).
-    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        0
+    /// The default logs decode as a request count plus a KV total, which is all a
+    /// model whose necessary work is linear in context needs. A sparse-attention
+    /// model with a per-request top-k cap (GLM-5.3's kpool DSA) cannot recover its
+    /// minimum work from the total, so it opts in; the independent labeler then
+    /// reconstructs each request's exact causal interaction.
+    fn logs_decode_kv_lens(&self) -> bool {
+        false
     }
 
     /// GPUs one replica of this model spans. The model_arch is the source of truth
@@ -202,6 +184,285 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// prefill worker nor the PD flow re-derives the formula.
     fn num_attn_shards(&self) -> u16 {
         (self.gpus_per_replica() / self.num_attn_dp_groups().max(1)).max(1)
+    }
+}
+
+// ── speculative iter-wise contract ───────────────────────────────────────────
+//
+// A speculative iteration is not an ordinary iteration with more tokens. One
+// decode request presents `k + 1` query rows to the target verify pass. The MTP
+// first pass consumes those rows and recurrent passes consume endpoints, so
+// "decode rows" and "decode requests"
+// stop being the same number and the lm-head row count stops following either.
+//
+// `ArchGroupInput::request_count` documents the rule this obeys: an input mode
+// with different logits semantics gets its own ArchInput type rather than an
+// optional axis on the ordinary one. The same rule is applied one level up —
+// the capability is a separate trait, so an ordinary recipe fails its type
+// bound instead of selecting logits semantics through a runtime role branch,
+// and a speculative model compiles its own CostTree instead of reusing the
+// ordinary one with dead slots.
+
+/// One decode request in a speculative verify batch.
+///
+/// Unlike [`ArchGroupInput::decode_kv_lens`], `query_len` is explicit because a
+/// verify step may present more than one query row for one request. Keeping the
+/// pair together prevents callers from recovering request count from the
+/// query-row count.
+///
+/// The width is `draft_tokens + 1` except at the context limit, where vLLM's
+/// scheduler clips it ([`Self::verify_query_len`]); such a boundary row ends
+/// exactly at `max_model_len - 1`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeculativeDecodeInput {
+    /// Timing context visible to the final query row of this request's verify
+    /// group. It includes all resident keys and every query row. Durable KV
+    /// advances by accepted tokens.
+    pub kv_len: u32,
+    /// Query rows emitted for this request in the current verify group.
+    pub query_len: u32,
+}
+
+impl SpeculativeDecodeInput {
+    /// Query rows a resident request verifies this step: the full
+    /// `draft_tokens + 1` window, clipped so the position after its last row,
+    /// where the step samples, stays inside `max_model_len`.
+    ///
+    /// This is vLLM's scheduler rule, `num_new_tokens = min(num_new_tokens,
+    /// max_model_len - num_computed_tokens - num_sampled_tokens_per_step)` with
+    /// one sampled token per step; the drafts past the clip are not verified.
+    /// `resident_kv` is that `num_computed_tokens`: the context before the
+    /// pending target token. Zero means no room for even that token.
+    pub fn verify_query_len(resident_kv: u64, draft_tokens: u32, max_model_len: u32) -> u32 {
+        let room = u64::from(max_model_len).saturating_sub(resident_kv.saturating_add(1));
+        u64::from(draft_tokens + 1).min(room) as u32
+    }
+
+    /// Validate this row against the verify width and the model limit, and
+    /// return whether it is a clipped boundary row (fewer than
+    /// `draft_tokens + 1` queries). A clipped row must end exactly at
+    /// `max_model_len - 1`, the only place [`Self::verify_query_len`] produces
+    /// it. A full-width row may end anywhere up to `max_model_len`, although
+    /// [`Self::verify_query_len`] never ends one past `max_model_len - 1`: that
+    /// slack is accepted for callers that do not clip (offline cases).
+    pub fn check_verify_row(&self, draft_tokens: u32, max_model_len: u32) -> Result<bool, String> {
+        let width = draft_tokens + 1;
+        if !(1..=width).contains(&self.query_len) {
+            return Err(format!(
+                "query_len {} must be in 1..={width} (draft_tokens + 1)",
+                self.query_len
+            ));
+        }
+        if !(self.query_len..=max_model_len).contains(&self.kv_len) {
+            return Err(format!(
+                "kv_len {} must be in {}..={max_model_len}",
+                self.kv_len, self.query_len
+            ));
+        }
+        let clipped = self.query_len < width;
+        if clipped && self.kv_len + 1 != max_model_len {
+            return Err(format!(
+                "a clipped verify row ({} of {width} queries) must end at max_model_len - 1 \
+                 ({}), not kv_len {}",
+                self.query_len,
+                max_model_len - 1,
+                self.kv_len
+            ));
+        }
+        Ok(clipped)
+    }
+}
+
+/// One attention/FFN group view for a speculative iter-wise batch.
+#[derive(Clone, Debug, Default)]
+pub struct SpeculativeArchGroupInput {
+    /// Tokens this group processes this forward pass.
+    pub batch_tokens: u32,
+    /// Of those, the prefill portion (token count).
+    pub prefill_tokens: u32,
+    /// Of those, speculative decode query rows — **not** decode request count.
+    pub decode_tokens: u32,
+    /// Per prefill/chunked request: `(prefix_len, append_len)`.
+    pub prefill_chunk_pairs: Vec<(u32, u32)>,
+    /// Per speculative decode request: final KV length plus verify query rows.
+    pub decode_requests: Vec<SpeculativeDecodeInput>,
+    /// Cumulative resident KV before this verify pass (KV-cache pressure).
+    /// `decode_requests[*].kv_len` is the final verify-row length instead.
+    pub total_kv_len: u32,
+}
+
+impl SpeculativeArchGroupInput {
+    /// Requests represented by this group, counting each decode request once
+    /// however many verify rows it presents.
+    pub fn request_count(&self) -> u32 {
+        u32::try_from(self.prefill_chunk_pairs.len() + self.decode_requests.len())
+            .expect("SpeculativeArchGroupInput request count must fit u32")
+    }
+
+    /// Reset to an empty group, retaining `Vec` capacity, so a worker can refill
+    /// a held input in place each iteration.
+    pub fn clear(&mut self) {
+        self.batch_tokens = 0;
+        self.prefill_tokens = 0;
+        self.decode_tokens = 0;
+        self.total_kv_len = 0;
+        self.prefill_chunk_pairs.clear();
+        self.decode_requests.clear();
+    }
+}
+
+/// Speculative worker's per-iteration input. Deliberately separate from
+/// [`UnifiedArchInput`]: decode query rows and decode request cardinality are
+/// different quantities under draft/verify execution.
+#[derive(Clone, Debug, Default)]
+pub struct SpeculativeArchInput {
+    /// Candidate positions drafted per request this iteration.
+    ///
+    /// This is **not** the number of draft forward passes, and the pass count is
+    /// not derivable from it: a recurrent drafter (MTP, EAGLE) runs one pass per
+    /// candidate, while a block-parallel drafter produces a whole block in one
+    /// pass. The pass count belongs to whatever the model composes as its draft
+    /// stage; this is only the candidate budget the verify pass must cover.
+    ///
+    /// It is also not the verify width. For a chain the width is `k + 1`, but a
+    /// tree submits one row per tree node while advancing at most its depth, so
+    /// per-request rows live in [`SpeculativeDecodeInput::query_len`] instead.
+    /// Models validate this against the width they were built for; it selects a
+    /// profiled kernel shape and therefore cannot vary per iteration.
+    pub draft_tokens: u32,
+    pub groups: Vec<SpeculativeArchGroupInput>,
+    pub tokens_per_source_rank: Vec<u32>,
+}
+
+/// Iter-wise query face for a speculative co-located worker.
+///
+/// Mirrors [`IterwiseUnifiedModel`]'s reusable-buffer protocol but accepts only
+/// [`SpeculativeArchInput`]. A model implements this **instead of**, not in
+/// addition to, the ordinary trait: the two walk different compiled trees, so a
+/// type that offered both would be two models wearing one name.
+pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
+    /// Reject a batch this model cannot cost, with the reason, before any
+    /// eval. `eval_speculative_iter` panics on the same batches; callers that take input
+    /// from outside the simulator (timing-predict) check first.
+    fn check_input(&self, _batch: &SpeculativeArchInput) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Per-iter cost of one whole speculative iteration: the target verify pass
+    /// over `k + 1` rows per decode request, then the `k` draft passes. Same
+    /// `(slots, scratch) -> LeafMetrics` protocol as
+    /// [`IterwiseUnifiedModel::eval_iter`].
+    fn eval_speculative_iter(
+        &self,
+        batch: &SpeculativeArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics;
+
+    /// Like [`Self::eval_speculative_iter`], but also captures each leaf's typed
+    /// kernel input for the `cost_log` `slot_input` column.
+    fn eval_speculative_iter_with_inputs(
+        &self,
+        batch: &SpeculativeArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        inputs.clear();
+        self.eval_speculative_iter(batch, slots, scratch)
+    }
+
+    /// The `cost_log` manifest for this model's own compiled tree. A speculative
+    /// model's manifest is not the ordinary model's: the draft passes are real
+    /// slots, so the two are structurally distinguishable in a cost-log row.
+    fn cost_log_manifest(&self) -> CostManifest {
+        CostManifest {
+            slots: Vec::new(),
+            nodes: Vec::new(),
+            node_labels: Vec::new(),
+        }
+    }
+
+    /// The target model's layout plus the drafter's own cache parts. See
+    /// [`IterwiseUnifiedModel::kv_cache_layout`].
+    fn kv_cache_layout(&self) -> KvCacheLayout;
+
+    /// Maximum context accepted by the model's timing kernels. A verify
+    /// window that would pass it is clipped
+    /// ([`SpeculativeDecodeInput::verify_query_len`]).
+    fn max_model_len(&self) -> u32;
+
+    /// See [`IterwiseUnifiedModel::gpus_per_replica`].
+    fn gpus_per_replica(&self) -> u16;
+
+    /// See [`IterwiseUnifiedModel::num_attn_dp_groups`].
+    fn num_attn_dp_groups(&self) -> u16 {
+        1
+    }
+
+    /// See [`IterwiseUnifiedModel::num_attn_shards`].
+    fn num_attn_shards(&self) -> u16 {
+        (self.gpus_per_replica() / self.num_attn_dp_groups().max(1)).max(1)
+    }
+
+    /// Batch-token slots the drafter adds to every scheduled request, beyond
+    /// the rows the request itself submits. vLLM charges them against
+    /// `max_num_batched_tokens` for each request it schedules, decode or
+    /// prefill chunk (`SpeculativeConfig.max_num_new_slots_for_drafting`): a
+    /// parallel drafter such as DFlash runs K mask queries per request, which
+    /// share the engine's input buffers. A sequential drafter (MTP, EAGLE)
+    /// reuses the verify rows and adds none.
+    fn drafting_slots_per_request(&self) -> u32 {
+        0
+    }
+
+    /// Whether the drafter's prefix lookup prunes the last matching block
+    /// (`SpeculativeConfig.use_eagle_block_drop`). Every drafter modelled here
+    /// reads target hidden states (vLLM `use_eagle()`: EAGLE, MTP, DFlash);
+    /// return false only for a drafter outside that set (ngram, suffix). Under
+    /// checkpoint-aligned chunking the engine then caches a prompt's recurrent
+    /// state one block before its last whole block, which moves where a chunk
+    /// must stop. Only the chunk-end stop reads this; prefix-hit lengths do not
+    /// yet drop the block. Inert for a layout without resumable recurrent state.
+    fn prunes_last_prefix_block(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod speculative_arch_input_tests {
+    use super::{SpeculativeArchGroupInput, SpeculativeDecodeInput};
+
+    #[test]
+    fn request_count_counts_requests_not_verify_rows() {
+        // The defect this catches: recovering request count from `decode_tokens`
+        // or from a flat KV-length vector. Two decode requests present twelve
+        // query rows at k=5, and the group holds three requests, not thirteen.
+        let mut group = SpeculativeArchGroupInput {
+            batch_tokens: 15,
+            prefill_tokens: 3,
+            decode_tokens: 12,
+            prefill_chunk_pairs: vec![(0, 3)],
+            decode_requests: vec![
+                SpeculativeDecodeInput {
+                    kv_len: 64,
+                    query_len: 6,
+                },
+                SpeculativeDecodeInput {
+                    kv_len: 91,
+                    query_len: 6,
+                },
+            ],
+            total_kv_len: 155,
+        };
+
+        assert_eq!(group.request_count(), 3);
+
+        group.clear();
+        assert_eq!(group.request_count(), 0);
+        assert_eq!(group.batch_tokens, 0);
+        assert_eq!(group.decode_tokens, 0);
+        assert!(group.decode_requests.capacity() >= 2);
     }
 }
 
@@ -248,7 +509,7 @@ pub struct AttnArchInput {
 /// each arch owns the shape its cost actually reads. `deny_unknown_fields` keeps a
 /// predicted ffn case from carrying stray attention vocabulary it would silently
 /// drop.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize, schema_derive::ParamStruct)]
 #[serde(deny_unknown_fields)]
 pub struct FfnArchInput {
     /// Tokens processed by each attention DP shard this forward pass (length =
@@ -278,10 +539,9 @@ pub trait AttnLayerwiseModel: Send + Sync + 'static {
         (self.gpus_per_replica() / self.num_attn_dp_groups().max(1)).max(1)
     }
 
-    /// **Total** KV-cache bytes one token occupies (all layers / KV heads / attn
-    /// ranks). Sizes the attention worker's KV partition capacity (same
-    /// definition as the iter-wise `total_kv_bytes_per_token`).
-    fn total_kv_bytes_per_token(&self) -> u64;
+    /// The attention side's KV cache layout, summed over one attention shard.
+    /// See [`IterwiseUnifiedModel::kv_cache_layout`].
+    fn kv_cache_layout(&self) -> KvCacheLayout;
 
     /// Bytes the attn side emits per token to the ffn side after a layer's
     /// attention (the attention output, `q_dim · bpe`). The attn worker attaches

@@ -1,27 +1,32 @@
 ---
 name: orchestrator-add-kernel-to-python-profile
-description: Use when orchestrating Python-side VibeSim L1 profiling work for a new kernel kind or a new backend of an existing kind. This skill is for the coordinator who writes implementer briefs, defines completion checks, and sequences Torch reference work before framework backends. It does not cover Rust timing/cache wiring.
+description: Use when owning the Python-side ServingStudio Sim L1 profiling work for a new kernel kind or a new backend of an existing kind, either as the coordinator who writes implementer briefs or as the agent a whole kernel was handed to. Defines the steps, their completion checks, and the order of Torch reference work before framework backends. It does not cover Rust timing/cache wiring.
 ---
 
 # Orchestrator Add Kernel To Python Profile
 
-You are the orchestrator, not the implementer. Your job is to turn a user's
-kernel request into one or more clear implementation tasks for the Python
-profiling side under `profiling/`, with enough completion criteria that you can
-verify whether the step is done.
+This skill turns a kernel request into the steps of the Python profiling side
+under `profiling/`, each with completion criteria that show whether it is done.
+It is written for the orchestrator who briefs an implementer. When a whole
+kernel was handed to you (`top-add-kernel`), you own it: do the steps yourself
+and run their checks yourself.
 
 This skill deliberately stops before Rust timing/cache wiring. Any Rust
 `KernelSpec`, cache, bridge, or simulator integration belongs to a later skill.
 
 ## Verification Ownership
 
-The implementer may be another agent, but the verifier is the orchestrator. Ask
-the implementer for evidence, then independently check it before accepting the
-step. Do not treat "the implementer says it works" as completion.
+The tasks below are checkpoints for whoever owns the kernel, not one delegation
+each. The owner checks each one before moving on and stops at the first that
+fails. Do not treat "it ran" as completion: name the evidence each step leaves,
+such as file diffs, imports, registry entries, generated facade symbols, focused
+tests, dry-run output, environment notes, and unresolved assumptions.
 
-For each assigned task, state what evidence must come back and what you will
-check yourself: file diffs, imports, registry entries, generated facade symbols,
-focused tests, dry-run output, environment notes, and unresolved assumptions.
+An orchestrator that delegated the kernel reviews it once, at the closeout. Read
+the diff and the returned evidence, and rerun only the cheapest checks that
+would expose a false claim, such as one focused test or `profiling list`. Do not
+reproduce the owner's whole suite, and never delegate a task whose only purpose
+is to re-check the previous one.
 
 ## Grounding
 
@@ -43,8 +48,8 @@ implementation.
 Classify the request before doing anything else:
 
 - **Brand-new kernel kind**: the user is asking for a new operation family, not
-  just another implementation of an operation VibeSim already knows how to
-  describe. For example, if VibeSim currently has `rmsnorm` and `single_gemm`, and
+  just another implementation of an operation ServingStudio Sim already knows how to
+  describe. For example, if ServingStudio Sim currently has `rmsnorm` and `single_gemm`, and
   the user asks to add convolution, convolution is a new kernel kind. It needs a
   new semantic contract, args shape, Torch reference, runner, and registry
   entry.
@@ -54,9 +59,21 @@ Classify the request before doing anything else:
   norm kind is a new backend, not a new kind, unless the requested behavior
   changes the operation contract.
 
+A backend is a distinct implementation of the operation. Execution modes of the
+same kernel, such as graph capture versus eager launch, are not separate
+backends: profile the kernel once, and charge the extra work a mode adds to the
+layer that issues it.
+
 If the user asks for both, split it into ordered tasks. The new kind lands first
-with a Torch backend, then additional backends reuse that established kind and
-args schema.
+with its production backend and an independent Torch correctness oracle, then
+additional backends reuse that established kind and args schema. Register a
+Torch backend only when the production operation is itself a public Torch
+callable worth timing.
+
+Before accepting “brand-new kind”, compare the nearest existing contract across
+operation semantics, args meaning, dtype/layout, production callable, and
+logical launch boundary. Source ambiguity requires a matched-shape A/B with
+identical logical I/O. A backend may change implementation, never field meaning.
 
 ## Path A: Brand-New Kernel Kind
 
@@ -108,10 +125,11 @@ Things to verify:
 - numerical expectations and tolerance are stated;
 - edge cases and unsupported cases are explicit.
 
-**Task A.3 — Torch profiling backend.** Ask the implementer to turn the Torch
-reference into the first profiling backend by using `impl-register-kernel`.
-The brief should name the kernel kind, backend `torch`, args fields, closest
-existing kernel/runner to mirror, and the Torch reference from Task A.2.
+**Task A.3 — Production profiling backend.** Ask the implementer to wrap the
+production public callable by using `dev-explore-kernel` and
+`impl-register-kernel`. The brief should name the kernel kind, backend, args
+fields, closest existing runner to mirror, and the Torch oracle from Task A.2.
+Do not vendor specialized kernel source into the profiler.
 
 Things to verify:
 
@@ -122,16 +140,15 @@ Things to verify:
   `uv run python -c "from profiling import perf_api; assert hasattr(perf_api, 'get_<kind>_times')"`;
 - a real profiling smoke succeeds through the public CLI on a representative
   spec, writing only a temporary DB, e.g.
-  `uv run python -m profiling run <kind> --backend torch --db /tmp/<kind>_torch_smoke.db --spec '<json spec>' --json`;
-- the reference semantics from Task A.2 are what the runner measures;
+  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json`;
+- the production callable is what the runner measures, while the Task A.2
+  reference checks it outside timing;
 - the implementer produced tests and smoke evidence, without writing shared
   `profiling/profile.db` unless the user explicitly authorized it.
 
-Once the Torch backend is in place, ask the user whether they need additional
-backends before continuing. If the user originally pointed to a custom or
-framework implementation, do not stop here; continue directly to Path B and make
-Task B.1 explore that specific implementation rather than doing an open-ended
-framework search.
+Once the production backend is in place, ask whether additional implementations
+are needed. Use Path B for each added backend; do not repeat Path A or change the
+kind's established semantics.
 
 ## Path B: New Backend For An Existing Kind
 
@@ -152,9 +169,9 @@ Things to verify:
 - the backend fits the existing kind's args schema without hidden backend-only
   fields;
 - backend support constraints are explicit: compute dtype, KV/cache dtype if
-  relevant, output dtype assumptions, GPU names or architecture gates, and any
-  package-version constraints;
-- unsupported dtype/GPU/shape cases are stated;
+  relevant, output dtype assumptions, the compute capability the kernel build
+  needs (never a list of GPU names), and any package-version constraints;
+- unsupported dtype/capability/shape cases are stated;
 - the plan says how the wrapper will be smoke-tested through the public
   profiling CLI.
 
@@ -174,8 +191,8 @@ Things to verify:
 - the claimed backend support matrix is checked on available hardware/dtypes,
   or untested entries are clearly marked as assumptions;
 - unsupported shapes or dtypes fail clearly;
-- you independently review the correctness evidence and, when feasible, rerun
-  the provided check before allowing registration work to proceed.
+- the correctness evidence is reviewed; registration follows once this check
+  passes.
 
 **Task B.3 — Backend registration.** Ask the implementer to add the backend
 through `impl-register-kernel`, reusing the existing kind's args schema.
@@ -186,13 +203,13 @@ Things to verify:
 - environment selection is declared through registry metadata, not ad hoc runner
   environment mutation;
 - `BackendSupport` matches the verified support matrix: compute dtype, KV/cache
-  dtype if relevant, and GPU/architecture gates;
+  dtype if relevant, and compute-capability gates;
 - `uv run python -m profiling list --json` shows the new backend under the
   existing kind;
 - the existing generated perf API symbol still resolves for that kind;
 - a real profiling smoke succeeds through the public CLI on a representative
   spec for that backend, writing only a temporary DB, e.g.
-  `uv run python -m profiling run <kind> --backend <backend> --db /tmp/<kind>_<backend>_smoke.db --spec '<json spec>' --json`;
+  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json`;
 - focused tests and smoke evidence cover the new backend. If no compatible
   GPU/environment is available, treat the task as not fully verified and return
   the exact blocker instead of accepting it as done.
@@ -217,6 +234,6 @@ bridge code, or L2/L3/L4 consumers. End the task with a **Python-to-Rust
 handoff** section for the later role that will add the Rust `KernelSpec` /
 bridge/cache wiring. This is not Rust implementation work; it is a short list
 of facts the Python work established: `KIND` / facade stem, backend strings,
-`KernelArgs` fields and order, metric family, dtype/GPU capability axes, a
+`KernelArgs` fields and order, metric family, dtype and compute-capability axes, a
 representative smoke spec, and shape or dtype constraints discovered while
 validating the runner.

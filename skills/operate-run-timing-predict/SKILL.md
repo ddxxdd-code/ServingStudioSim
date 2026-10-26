@@ -37,6 +37,10 @@ Start from the nearest `presets/predict_*.json` file. Set:
 - a fresh `log_dir`;
 - `cases_file`, resolved relative to the config file.
 
+For MoE models, first read and apply the
+[shared popularity-file selection rule](../operate-run-simulation/references/moe-routing.md).
+Select routing before running the predictor.
+
 The cases file is a top-level JSON array:
 
 - `iter` and `attn`: each case contains `groups`, one per expected attention-DP
@@ -57,14 +61,42 @@ uv run python -m launcher timing-predict presets/<config>.json
 ```
 
 Multiple configs may be passed in one call, for example the two AFD halves.
-Supported flags are `--build-type <build-type>` (default `release`) and
-`--no-analyze`. Timing-predict does not support simulation-run flags such as
-`--dry-run` or `--override`.
+Supported flags are `--build-type <build-type>` (default `release`),
+`--no-analyze`, `--analyzer-essential-only`, `--no-plot`, `--dry-run`, and
+`--no-gpu`. There is no `--override`.
+
+By default the full analysis runs: every applicable Analyzer subject, the trace,
+and the per-case iteration breakdown. `--analyzer-essential-only` runs only the
+iteration breakdown and `kernel-time-share`, in milliseconds instead of about a
+second; `--no-analyze` runs neither. `--no-plot` keeps the full analysis but
+draws no PNGs.
+
+Run `--dry-run` first on a new config. It builds the model, checks every case
+against it, and prints one line per kernel with the `profile.db` specs a real
+run would JIT-profile. It writes nothing and needs no GPU. `total: 0 / N specs
+missing` means the real run needs no GPU either. A rejected case fails the dry
+run with the same error the real run would give.
+
+Pass `--no-gpu` when the run must not touch a GPU: the user asks, or the host's
+GPUs are not yours to use. A missing row then fails with `GpuDisabledError`,
+naming the kernel, instead of being profiled. Report that error; do not drop
+`--no-gpu` to get past it without asking.
 
 Do not pin GPUs by default. A warm `profiling/profile.db` needs no GPU. On a cold
 cache, timing-predict asks the profiling layer to JIT-fill the rows it actually
 uses, and that layer selects idle GPUs. Do not precompute a guessed row list or
 restrict `CUDA_VISIBLE_DEVICES` unless the user or machine policy requires it.
+
+`--remote NAME` runs the same command on a machine from the untracked
+`remote.yaml` (see `remote.example.yaml`) and blocks until `log_dir` is copied
+back in full. Use it when the user asks. Run from the checkout root; `log_dir`
+must be under `logs/`, and so must any config or cases file that is not
+tracked. The remote runs with `--no-gpu --no-plot`, so a row missing there fails
+instead of being profiled: run `--dry-run` here first and fill reported missing
+specs here (or with `kernel-profile run --remote`). `--dry-run` itself never
+goes remote. Do not create or edit `remote.yaml` or ssh setup unless asked; if
+the remote fails to connect, stop and report it. Details: `launcher/README.md`,
+"Remote execution".
 
 If prediction or JIT profiling fails, preserve the exact error and stop. Do not
 report totals from an incomplete run. Use `operate-profile-existing-kernel` only
@@ -77,8 +109,10 @@ cost artifacts under `log_dir`. Important outputs include:
 
 - `prediction.cases.json`: snapshotted cases;
 - `raw/cost_log/worker_predict_0.parquet` and its manifest;
-- `reports/iter_breakdown.ans`: per-case CostTree totals and leaves when analysis
-  was enabled;
+- `reports/iter_breakdown.ans` and `payloads/iter_breakdown.json`: per-case
+  CostTree totals and leaves, unless `--no-analyze`;
+- `payloads/kernel_time_share_composition.json`: kernels ranked by their share,
+  with a rollup by kernel kind, unless `--no-analyze`;
 - trace and plot artifacts produced by the normal analysis path.
 
 A timing-predict directory is explicitly cataloged as `timing_predict`; it does
@@ -87,7 +121,8 @@ Use `operate-use-analyzer` to read user-visible prediction values after analysis
 completes.
 
 Report the selector, config and cases paths, command, `log_dir`, per-case totals,
-and any profiling failure. For AFD, report attention and FFN results separately.
+and any profiling failure. For MoE, report the selected popularity file(s) or
+the reason for uniform fallback. For AFD, report attention and FFN results separately.
 
 ## Boundaries
 

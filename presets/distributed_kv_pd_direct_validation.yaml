@@ -5,7 +5,6 @@ workload:
   - ${trace}
   input_file_format: text-generation-session-execution-v2
   arrival_mode: trace_timed
-  session_dependency: chained
   run_to_end: true
   request_rate: 1.0
   tick_dt_us: ${tick}

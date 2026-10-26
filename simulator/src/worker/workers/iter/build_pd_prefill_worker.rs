@@ -7,13 +7,13 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{PendingOrder, PrefillHandoffAdmission};
+use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{IterBatchWorker, PdPrefillWorker};
-use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prepare_unified_iter_build_essentials,
+use crate::worker::workers::iter_build_essentials::{
+    kv_cache_store, prepare_iter_build_essentials, resolve_kv_accounting,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -30,23 +30,20 @@ pub(crate) fn build_pd_prefill_worker<M: IterwiseUnifiedModel>(
 ) -> PdPrefillWorker<M> {
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let num_attn_shards = model.num_attn_shards().max(1);
-    let kv_capacity = full_attention_token_capacity(model.as_ref(), &config);
-    let prefix_cache = config.prefix_cache.resolve_tokens(
-        kv_capacity,
-        model.total_kv_bytes_per_token(),
-        model.num_attn_shards(),
-    );
-    let essentials = prepare_unified_iter_build_essentials(
+    let kv_accounting =
+        resolve_kv_accounting(&model.kv_cache_layout(), model.num_attn_shards(), &config);
+    let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
-        model,
         requests,
         &config,
         cost_log_dir,
         pool,
         gpu_name,
         &cluster,
-        kv_capacity,
+        model.gpus_per_replica(),
+        model.cost_log_manifest(),
+        &kv_accounting,
         1,
     );
     let send_group_id = cluster.borrow_mut().register_comm_group(
@@ -55,10 +52,11 @@ pub(crate) fn build_pd_prefill_worker<M: IterwiseUnifiedModel>(
         pool_tag,
         id.0,
     );
-    let kv_store = FullAttnKv::with_prefix_cache(
+    let kv_store = kv_cache_store(
+        kv_accounting,
         1,
-        essentials.kv_capacity,
-        prefix_cache,
+        model.num_attn_shards(),
+        &config,
         essentials.sampler,
         prefix_cache_logger,
     );
@@ -69,7 +67,7 @@ pub(crate) fn build_pd_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.context,
         kv_store,
         admission,
-        essentials.execution,
+        UnifiedIterExecution::new(model, essentials.cost),
     )
 }
 
@@ -160,6 +158,45 @@ mod tests {
                 .progress
                 .prefill_tokens_processed,
             116
+        );
+    }
+
+    #[test]
+    fn pinned_prefix_is_not_computed_but_the_handoff_carries_it() {
+        let store = shared_with(&[(0, 16, 3)]);
+        store.borrow_mut()[RequestId(0)].request.definition.session =
+            SessionInput::PinnedPrefix { prefix_tokens: 100 };
+        let mut worker = build_pd_prefill_worker(
+            WorkerId(0),
+            "prefill",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig::default(),
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(PdPrefillMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..20 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+
+        assert_eq!(
+            events,
+            vec![PdPrefillEvent::PrefillDone {
+                worker: WorkerId(0),
+                req: RequestId(0),
+                send_gid: 0,
+                kv_tokens: 116,
+            }]
+        );
+        let requests = store.borrow();
+        assert_eq!(requests[RequestId(0)].progress.prefill_tokens_processed, 16);
+        assert_eq!(
+            requests[RequestId(0)].telemetry.prefix_cache_hit_tokens,
+            Some(100)
         );
     }
 

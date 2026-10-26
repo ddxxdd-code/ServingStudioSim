@@ -9,8 +9,7 @@ use crate::orchestrator::{
     DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
 };
 use crate::sim::frontend::{
-    ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, SessionDependency,
-    TraceFrontend,
+    ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, TraceFrontend,
 };
 use crate::sim::run::{run_sim, TickCfg};
 use crate::test_helpers::FakeModel;
@@ -19,15 +18,15 @@ use crate::worker::admission::{
 };
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::FullAttnKv;
+use crate::worker::kv::KvCacheStore;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
     RemoteCacheWorkerEvent as Event, RemoteCacheWorkerMsg as Msg, RemoteReadPlan, WorkerConfig,
     WorkerEventCommon, WorkerMsgCommon,
 };
 use crate::worker::workers::iter::IterBatchWorker;
-use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prepare_unified_iter_build_essentials,
+use crate::worker::workers::iter_build_essentials::{
+    kv_cache_store, prepare_iter_build_essentials, resolve_kv_accounting,
 };
 use std::{
     cell::RefCell,
@@ -42,18 +41,24 @@ use std::{
 
 static MISSES: AtomicUsize = AtomicUsize::new(0);
 struct AlwaysMiss(RemoteCachePrefillDecodeAdmission<PendingOrder>);
-impl IterAdmission<FullAttnKv> for AlwaysMiss {
+impl IterAdmission<KvCacheStore> for AlwaysMiss {
     type Msg = WorkerMsgCommon;
     type Event = WorkerEventCommon;
-    fn accept_message(&mut self, kv: &mut FullAttnKv, msg: Self::Msg, context: &WorkerContext) {
+    fn accept_message(&mut self, kv: &mut KvCacheStore, msg: Self::Msg, context: &WorkerContext) {
         let WorkerMsgCommon::Request(req) = msg;
         self.0.accept_message(kv, Msg::Request(req), context);
     }
-    fn form_batch(&mut self, kv: &mut FullAttnKv, context: &WorkerContext, now: Time) -> bool {
+    fn form_batch(
+        &mut self,
+        kv: &mut KvCacheStore,
+        context: &WorkerContext,
+        batch_plan: &mut crate::worker::types::IterBatchPlan,
+        now: Time,
+    ) -> bool {
         loop {
-            let active = self.0.form_batch(kv, context, now);
+            let active = self.0.form_batch(kv, context, batch_plan, now);
             let mut lookups = Vec::new();
-            <RemoteCachePrefillDecodeAdmission<PendingOrder> as RemoteKvAdmission<FullAttnKv>>::drain_lookups(&mut self.0, context, &mut lookups);
+            <RemoteCachePrefillDecodeAdmission<PendingOrder> as RemoteKvAdmission<KvCacheStore>>::drain_lookups(&mut self.0, context, &mut lookups);
             if lookups.is_empty() {
                 return active;
             }
@@ -77,13 +82,15 @@ impl IterAdmission<FullAttnKv> for AlwaysMiss {
     }
     fn complete_iteration(
         &mut self,
-        kv: &mut FullAttnKv,
+        kv: &mut KvCacheStore,
         context: &WorkerContext,
+        batch_plan: &crate::worker::types::IterBatchPlan,
         events: &mut Vec<Self::Event>,
         now: Time,
     ) {
         let mut remote = Vec::new();
-        self.0.complete_iteration(kv, context, &mut remote, now);
+        self.0
+            .complete_iteration(kv, context, batch_plan, &mut remote, now);
         for event in remote {
             match event {
                 Event::KvPushOffer { req, tokens, .. } => self.0.accept_message(
@@ -103,23 +110,23 @@ impl IterAdmission<FullAttnKv> for AlwaysMiss {
         }
     }
     fn queued_requests(&self) -> u32 {
-        <RemoteCachePrefillDecodeAdmission<PendingOrder> as IterAdmission<FullAttnKv>>::queued_requests(&self.0)
+        <RemoteCachePrefillDecodeAdmission<PendingOrder> as IterAdmission<KvCacheStore>>::queued_requests(&self.0)
     }
     fn cancel_pending(&mut self, req: RequestId) -> bool {
-        <RemoteCachePrefillDecodeAdmission<PendingOrder> as IterAdmission<FullAttnKv>>::cancel_pending(&mut self.0, req)
+        <RemoteCachePrefillDecodeAdmission<PendingOrder> as IterAdmission<KvCacheStore>>::cancel_pending(&mut self.0, req)
     }
 }
-impl RemoteKvAdmission<FullAttnKv> for AlwaysMiss {
+impl RemoteKvAdmission<KvCacheStore> for AlwaysMiss {
     fn drain_reuse(&mut self) -> Vec<crate::log::rows::KvStoreEventEntry> {
-        <RemoteCachePrefillDecodeAdmission<PendingOrder> as RemoteKvAdmission<FullAttnKv>>::drain_reuse(&mut self.0)
+        <RemoteCachePrefillDecodeAdmission<PendingOrder> as RemoteKvAdmission<KvCacheStore>>::drain_reuse(&mut self.0)
     }
     fn drain_lookups(&mut self, _: &WorkerContext, _: &mut Vec<Self::Event>) {}
-    fn take_read(&mut self, kv: &FullAttnKv) -> Option<(RequestId, RemoteReadPlan)> {
+    fn take_read(&mut self, kv: &KvCacheStore) -> Option<(RequestId, RemoteReadPlan)> {
         let plan = self.0.take_read(kv);
         assert!(plan.is_none(), "zero-hit service must never transfer bytes");
         plan
     }
-    fn read_landed(&mut self, _: &mut FullAttnKv, _: RequestId, _: Time) {
+    fn read_landed(&mut self, _: &mut KvCacheStore, _: RequestId, _: Time) {
         panic!("always-miss read")
     }
 }
@@ -135,14 +142,25 @@ fn build_stub(
     pool: PoolId,
     gpu: &str,
     cluster: SharedGpuCluster,
-) -> RemoteCacheIterWorker<FullAttnKv, AlwaysMiss, UnifiedIterExecution<FakeModel>> {
-    let capacity = full_attention_token_capacity(model.as_ref(), &config);
-    let cache = config.prefix_cache.resolve_tokens(capacity, 1, 1);
+) -> RemoteCacheIterWorker<KvCacheStore, AlwaysMiss, UnifiedIterExecution<FakeModel>> {
+    use crate::arch::contract::IterwiseUnifiedModel;
+    let accounting = resolve_kv_accounting(&model.kv_cache_layout(), 1, &config);
     let prefix_logger = PrefixCacheLogger::open_opt(log.as_deref(), tag, id);
-    let essentials = prepare_unified_iter_build_essentials(
-        id, tag, model, requests, &config, log, pool, gpu, &cluster, capacity, 1,
+    let essentials = prepare_iter_build_essentials(
+        id,
+        tag,
+        requests,
+        &config,
+        log,
+        pool,
+        gpu,
+        &cluster,
+        model.gpus_per_replica(),
+        model.cost_log_manifest(),
+        &accounting,
+        1,
     );
-    let kv = FullAttnKv::with_prefix_cache(1, capacity, cache, essentials.sampler, prefix_logger);
+    let kv = kv_cache_store(accounting, 1, 1, &config, essentials.sampler, prefix_logger);
     let admission = AlwaysMiss(RemoteCachePrefillDecodeAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
@@ -152,7 +170,12 @@ fn build_stub(
         0,
     ));
     RemoteCacheIterWorker::new(
-        IterBatchWorker::from_components(essentials.context, kv, admission, essentials.execution),
+        IterBatchWorker::from_components(
+            essentials.context,
+            kv,
+            admission,
+            UnifiedIterExecution::new(model, essentials.cost),
+        ),
         cluster,
         1,
     )
@@ -219,7 +242,6 @@ fn always_miss_shell_matches_barebone_on_the_same_chained_session_fixture() {
             &schema,
             ArrivalSchedule::trace_timed(1.0).unwrap(),
             CapacityLimit::unlimited(),
-            SessionDependency::Chained,
         )
         .unwrap();
         requests

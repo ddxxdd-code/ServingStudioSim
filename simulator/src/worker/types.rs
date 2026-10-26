@@ -7,6 +7,9 @@
 //! neutral home here so no concrete cadence shell owns the shared protocol
 //! vocabulary.
 
+use std::rc::Rc;
+
+use crate::arch::contract::UnifiedArchInput;
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::LoadBalance;
 
@@ -281,6 +284,66 @@ pub struct BatchFsmState {
     pub compute_end: Time,
 }
 
+/// Shell-owned composition of one whole-model iteration.
+///
+/// KV membership remains authoritative in the KV axis. This plan only states
+/// whether each partition's resident decode requests participate in the
+/// current iteration, so a prefill-only scheduler can leave those requests
+/// resident without charging or advancing them. A pipeline head narrows that
+/// to a selected subset: requests whose previous step is still in flight on a
+/// later stage stay resident but sit the microbatch out.
+#[derive(Clone, Debug, Default)]
+pub struct IterBatchPlan {
+    decode_participation: Vec<bool>,
+    /// Per partition, sorted: the only resident decodes that run when the
+    /// partition participates. `None` means all of them.
+    selected_decodes: Vec<Option<Vec<RequestId>>>,
+}
+
+impl IterBatchPlan {
+    pub(crate) fn reset_decode_participation(&mut self, num_partitions: usize, participates: bool) {
+        self.decode_participation.clear();
+        self.decode_participation
+            .resize(num_partitions, participates);
+        self.selected_decodes.clear();
+        self.selected_decodes.resize(num_partitions, None);
+    }
+
+    pub(crate) fn set_partition_runs_decode(&mut self, partition: u16, runs_decode: bool) {
+        let entry = self
+            .decode_participation
+            .get_mut(usize::from(partition))
+            .expect("batch plan partition must exist");
+        *entry = runs_decode;
+    }
+
+    /// Run only `requests` among the partition's resident decodes.
+    pub(crate) fn select_partition_decodes(
+        &mut self,
+        partition: u16,
+        mut requests: Vec<RequestId>,
+    ) {
+        self.set_partition_runs_decode(partition, !requests.is_empty());
+        requests.sort_unstable();
+        self.selected_decodes[usize::from(partition)] = Some(requests);
+    }
+
+    pub(crate) fn partition_runs_decode(&self, partition: u16) -> bool {
+        self.decode_participation
+            .get(usize::from(partition))
+            .copied()
+            .expect("batch plan partition must exist")
+    }
+
+    /// Whether resident decode `request` runs, given its partition participates.
+    pub(crate) fn decode_member_runs(&self, partition: u16, request: RequestId) -> bool {
+        match &self.selected_decodes[usize::from(partition)] {
+            None => true,
+            Some(selected) => selected.binary_search(&request).is_ok(),
+        }
+    }
+}
+
 // ── Messages / events (L6 interface) ──────────────────────────────────────────
 //
 // Each worker carries its own `type Msg` / `type Event` (associated types on
@@ -365,9 +428,8 @@ pub enum PdDecodeMsg {
         /// Sender's comm-group id (registered at prefill worker construction).
         send_gid: u16,
         /// Total KV **tokens** produced by prefill and transferred for this
-        /// request. The decode side multiplies by its arch's
-        /// `total_kv_bytes_per_token` when calling `cluster.submit_transfer` to
-        /// recover wire bytes.
+        /// request. The decode side converts them to wire bytes with its KV
+        /// accounting's `transfer_bytes` when calling `cluster.submit_transfer`.
         tokens: u64,
         /// The prefill worker that holds this request's KV until the pull
         /// completes. Carried through the decode worker's pending-pull → in-
@@ -427,7 +489,7 @@ impl From<RequestId> for PdDecodeMsg {
 /// is `Copy` and no allocation is needed per handoff. `prefill_worker` is the
 /// owner of the held KV at the source side, threaded through so the decode
 /// worker can ack the prefill side once the pull lands. `tokens` is the wire
-/// KV count; `cluster.submit_transfer` is called with `tokens × total_kv_bytes_per_token`.
+/// KV count; `cluster.submit_transfer` is called with its `transfer_bytes`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferPlan {
     pub send_gid: u16,
@@ -640,6 +702,67 @@ pub enum FfnWorkerEvent {
     },
 }
 
+// ── Pipeline-parallel protocol ───────────────────────────────────────────────
+
+/// One microbatch's activations moving from one pipeline stage to the next.
+///
+/// The head stage lowers the batch once; every stage costs its own layers on the
+/// same shared `input`. `send_gid` and `ready_at` say where and when the previous
+/// stage's output is resident, so the receiving stage submits its own pull.
+#[derive(Clone, Debug)]
+pub struct PipelineMicrobatch {
+    /// Head-local sequence number. Every stage logs its cost under this
+    /// iteration id, so one microbatch's rows line up across stage cost logs.
+    pub id: u64,
+    pub input: Rc<UnifiedArchInput>,
+    pub activation_bytes: u64,
+    pub send_gid: u16,
+    pub ready_at: Time,
+}
+
+/// Pipeline head (stage 0) message set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelineHeadMsg {
+    Request(RequestId),
+    /// Microbatch `microbatch` left the last stage at `at`.
+    MicrobatchExit {
+        microbatch: u64,
+        at: Time,
+    },
+}
+
+/// Pipeline head event set.
+#[derive(Clone, Debug)]
+pub enum PipelineHeadEvent {
+    /// Stage 0 finished the microbatch; L6 hands it to stage 1.
+    MicrobatchLaunched {
+        worker: WorkerId,
+        microbatch: PipelineMicrobatch,
+    },
+    RequestComplete {
+        worker: WorkerId,
+        req: RequestId,
+    },
+}
+
+/// Pipeline follower stage message set.
+#[derive(Clone, Debug)]
+pub enum PipelineStageMsg {
+    Microbatch(PipelineMicrobatch),
+}
+
+/// Pipeline follower stage event set.
+#[derive(Clone, Debug)]
+pub enum PipelineStageEvent {
+    /// This stage finished the microbatch. `microbatch.send_gid`/`ready_at` now
+    /// name this stage's output; L6 hands it to the next stage, or reports the
+    /// exit to the head when this was the last stage.
+    StageDone {
+        worker: WorkerId,
+        microbatch: PipelineMicrobatch,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorkerStatus {
     pub queued_requests: u32,
@@ -654,9 +777,9 @@ pub struct WorkerConfig {
     pub max_inflight_remote_reads: usize,
     pub balance: LoadBalance,
     /// This worker's KV-cache memory allowance in bytes (its GPU's attention
-    /// budget). Same per-worker tier as `gpu_name`; the worker divides it by the
-    /// model's `total_kv_bytes_per_token` and attention shard count to size each
-    /// full-attention KV partition.
+    /// budget). Same per-worker tier as `gpu_name`; times the attention shard
+    /// count it is one KV partition's budget, which the arch's
+    /// `kv_cache_layout` turns into capacity units.
     pub attn_kv_bytes: u64,
     /// Mirror of `io.log_output_token_times`: when off, decodes do not build the
     /// per-token timestamp array (the hot-path cost on saturated runs). Threaded
@@ -677,6 +800,9 @@ pub struct WorkerConfig {
     /// selector; passed to `CostBuffers`, applied where a segment's wall time is
     /// returned (cost_log stays pre-scale).
     pub gpu_time_multiplier: f64,
+    /// Multiplier for prefill-bearing iterations (from the chunked-prefill
+    /// selector). `None` applies `gpu_time_multiplier` to every iteration.
+    pub prefill_gpu_time_multiplier: Option<f64>,
     /// Optional per-iteration prefill token budget (from the worker selector).
     /// `Some(n)`: admission reserves the budget for live decodes (1 tok/req)
     /// then fills the remainder with whole prefills, force-admitting one
@@ -689,14 +815,53 @@ pub struct WorkerConfig {
     /// (from the worker selector). Only the iter-wise local-prefill/decode and
     /// prefill-handoff lifecycles read it today.
     pub pending_order: crate::worker::admission::PendingOrderKind,
+    /// Whether chunked prefill may share an iteration with resident decode.
+    /// Only `ChunkedPrefillAdmission` reads this; other lifecycles state their
+    /// fixed composition directly in the per-iteration batch plan.
+    pub batch_policy: crate::worker::config::BatchPolicy,
+    /// KV admission/retraction mechanics for chunked prefill. Other worker
+    /// recipes retain the full-footprint default.
+    pub kv_admission: crate::worker::config::KvAdmissionConfig,
+    /// Cap each pipeline microbatch's decodes at `ceil(resident decodes /
+    /// depth)` instead of scheduling every ready decode (vLLM). Only the
+    /// pipeline head recipe reads it.
+    pub balance_decode_microbatches: bool,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
-    /// Preset override for a hybrid arch's SSM snapshot interval, in context
-    /// tokens (from the worker selector). `None` uses the arch's own
-    /// `recurrent_checkpoint_interval_tokens`. Only the hybrid KV recipe reads
-    /// it.
-    pub ssm_checkpoint_interval_tokens: Option<u32>,
+    /// Whether KV charges include the serving engine's own allocation (padding,
+    /// state copies, engine blocks, in-flight window tokens).
+    pub kv_overhead: crate::worker::kv::KvOverhead,
+    /// Where a finished request keeps sliding-window tails and recurrent state
+    /// for prefix reuse. `None` follows `kv_overhead`.
+    pub prefix_resume_points: Option<crate::worker::kv::PrefixResumePoints>,
+    /// Also keep them at every multiple of this many tokens.
+    pub prefix_resume_interval: Option<u32>,
+    /// Tokens one step may have in flight, which caps what admission charges a
+    /// sliding window. `None` is two steps of `max_batch_tokens` (vLLM's async
+    /// scheduling), or the whole prompt without a token budget.
+    pub kv_max_in_flight_tokens: Option<u32>,
+    /// The longest request the arch serves (`IterArchSel::max_model_len`). Used
+    /// only to report KV concurrency at that length (`kv_cache.json`); `None`
+    /// when the arch cannot give one.
+    pub max_model_len: Option<u32>,
+    /// Whether non-final prefill chunks end on the layout's checkpoint block
+    /// when the layout keeps a resumable recurrent state and prefix caching is
+    /// on. `None` follows `kv_overhead`: vLLM aligns, the model alone does not.
+    pub prefill_chunk_alignment: Option<crate::worker::config::PrefillChunkAlignment>,
+    /// Candidate positions the drafter proposes per request per iteration (from
+    /// the worker selector). The verify width is one more than this. Only the
+    /// speculative recipe reads it, and it must match the width the model was
+    /// built for — it selects a profiled kernel shape, so the two cannot drift.
+    /// `0` means the worker does not speculate.
+    pub speculative_draft_tokens: u32,
+    /// Seed for the per-iteration draft-acceptance draws. `None` uses `0`: the
+    /// draw must be reproducible run-to-run like every other modeled quantity,
+    /// so this selects *which* deterministic stream, never whether there is one.
+    pub speculative_acceptance_seed: Option<u64>,
+    /// Attention-DP partition placement (from the chunked-prefill selector).
+    /// Only multi-partition chunked-prefill workers read it.
+    pub dp_placement: crate::worker::config::DpPlacement,
 }
 
 impl Default for WorkerConfig {
@@ -708,11 +873,23 @@ impl Default for WorkerConfig {
             log_stage_transitions: true,
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
+            prefill_gpu_time_multiplier: None,
             max_batch_tokens: None,
             max_inflight_remote_reads: 16,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
+            batch_policy: crate::worker::config::BatchPolicy::Mix,
+            kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
+            balance_decode_microbatches: false,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
-            ssm_checkpoint_interval_tokens: None,
+            kv_overhead: crate::worker::kv::KvOverhead::Vllm,
+            prefix_resume_points: None,
+            prefix_resume_interval: None,
+            kv_max_in_flight_tokens: None,
+            max_model_len: None,
+            prefill_chunk_alignment: None,
+            speculative_draft_tokens: 0,
+            speculative_acceptance_seed: None,
+            dp_placement: crate::worker::config::DpPlacement::RoundRobin,
         }
     }
 }

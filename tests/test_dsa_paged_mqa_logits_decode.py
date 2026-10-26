@@ -27,7 +27,7 @@ from profiling.runners.attention.dsa_paged_mqa_logits_decode_reference import (
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 
 _BACKEND = "torch"
-_DEEPGEMM_BACKEND = "vllm_deepgemm_fp8"
+_DEEPGEMM_BACKEND = "deepgemm_fp8"
 _BASE_SPEC = {
     "batch_size": 2,
     "context_len": 65,
@@ -117,10 +117,15 @@ def test_registration_support_and_facades():
         kv_dtype=DType.BF16,
         gpu="NVIDIA H200",
     )
-    assert not spec.supports.allows(
+    assert spec.supports.allows(
         DType.FP8_E4M3,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H100",
+    )
+    assert spec.supports.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
     )
     assert hasattr(perf_api, "get_dsa_paged_mqa_logits_decode_times")
     assert hasattr(perf_api, "count_missing_dsa_paged_mqa_logits_decode")
@@ -140,11 +145,35 @@ def test_deepgemm_registration_reuses_kind_table_args_family_and_facades():
         "profiling.runners.attention.dsa_paged_mqa_logits_decode"
     )
     assert deepgemm_spec.runner_ref.function_name == (
-        "profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8"
+        "profile_dsa_paged_mqa_logits_decode_deepgemm_fp8"
     )
-    assert deepgemm_spec.supports == torch_spec.supports
+    assert deepgemm_spec.supports.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA H200",
+    )
+    assert deepgemm_spec.supports.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
+    )
     assert hasattr(perf_api, "get_dsa_paged_mqa_logits_decode_times")
     assert hasattr(perf_api, "count_missing_dsa_paged_mqa_logits_decode")
+
+
+def test_neutral_deepgemm_entry_routes_through_the_pinned_loader(monkeypatch):
+    from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
+
+    seen = {}
+
+    def common(load_backend, **kwargs):
+        seen["loader"] = load_backend
+        seen["kwargs"] = kwargs
+        return "metrics"
+
+    monkeypatch.setattr(runner, "_profile_dsa_paged_mqa_logits_decode_deepgemm_fp8", common)
+    assert runner.profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**_BASE_SPEC) == "metrics"
+    assert seen == {"loader": runner._load_deepgemm_backend, "kwargs": _BASE_SPEC}
 
 
 def test_registry_barrel_import_is_lazy():
@@ -181,7 +210,7 @@ def test_runner_refs_resolve_without_importing_frameworks_or_running_jit():
                 "runner = find_kernel_profiler_spec("
                 "'dsa_paged_mqa_logits_decode', 'torch').runner_ref.load(); "
                 "deepgemm_runner = find_kernel_profiler_spec("
-                "'dsa_paged_mqa_logits_decode', 'vllm_deepgemm_fp8'"
+                "'dsa_paged_mqa_logits_decode', 'deepgemm_fp8'"
                 ").runner_ref.load(); "
                 "print(runner.__module__); "
                 "print(runner.__name__); "
@@ -200,7 +229,7 @@ def test_runner_refs_resolve_without_importing_frameworks_or_running_jit():
         "profiling.runners.attention.dsa_paged_mqa_logits_decode",
         "profile_dsa_paged_mqa_logits_decode_torch",
         "profiling.runners.attention.dsa_paged_mqa_logits_decode",
-        "profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8",
+        "profile_dsa_paged_mqa_logits_decode_deepgemm_fp8",
         "False",
         "False",
         "False",
@@ -214,10 +243,10 @@ def test_runner_refs_resolve_without_importing_frameworks_or_running_jit():
         ({"context_len": 0}, "must be > 0"),
         ({"max_model_len": 0}, "must be > 0"),
         ({"context_len": 129}, "must be <= max_model_len"),
-        ({"next_n": 2}, "next_n=1"),
-        ({"num_heads": 32}, r"== \(64, 128, 64\)"),
-        ({"head_dim": 64}, r"== \(64, 128, 64\)"),
-        ({"block_size": 32}, r"== \(64, 128, 64\)"),
+        ({"next_n": 0}, "next_n > 0"),
+        ({"num_heads": 0}, r"num_heads, head_dim, and block_size > 0"),
+        ({"head_dim": 0}, r"num_heads, head_dim, and block_size > 0"),
+        ({"block_size": -64}, r"num_heads, head_dim, and block_size > 0"),
         ({"q_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"cache_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"scale_dtype": DType.BF16}, "scale_dtype=weight_dtype"),
@@ -234,6 +263,30 @@ def test_rejects_unsupported_args_before_allocation(overrides, match):
 
     with pytest.raises(ValueError, match=match):
         _validate_args(**(_BASE_SPEC | overrides))
+
+
+def test_accepts_sglang_native_32_head_instantiation():
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import _validate_args
+
+    validated = _validate_args(**(_BASE_SPEC | {"num_heads": 32}))
+
+    assert validated[4] == 32
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"num_heads": 16},
+        {"num_heads": 8},
+        {"head_dim": 64},
+        {"block_size": 32},
+        {"block_size": 128},
+    ],
+)
+def test_shape_validation_leaves_deepgemm_bounds_to_the_device_check(overrides):
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import _validate_args
+
+    _validate_args(**(_BASE_SPEC | overrides))
 
 
 def test_rejects_nonboolean_clean_logits():
@@ -276,55 +329,95 @@ def test_missing_torch_is_typed(monkeypatch):
         runner.profile_dsa_paged_mqa_logits_decode_torch(**_BASE_SPEC)
 
 
-def test_rejects_missing_cuda_and_unverified_gpu():
+def _deepgemm_device(capability, num_sms):
+    return SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_capability=lambda _device: capability,
+            get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=num_sms),
+        )
+    )
+
+
+_GLM_SHAPE = {"num_heads": 64, "head_dim": 128, "block_size": 64, "next_n": 1}
+
+
+def test_deepgemm_launch_bounds_return_the_device_sm_count():
     from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
-        _validate_cuda_device,
+        _check_deepgemm_launch_bounds,
     )
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_cuda_device(h100)
+    # vLLM schedules for the device's own SM count: H100 SXM, H200, a
+    # partitioned H200, B200 and B300 all launch.
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((9, 0), 132), **_GLM_SHAPE) == 132
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((9, 0), 130), **_GLM_SHAPE) == 130
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((10, 0), 148), **_GLM_SHAPE) == 148
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((10, 3), 148), **_GLM_SHAPE) == 148
 
 
-def test_deepgemm_rejects_cuda_gpu_and_sm_count_mismatches():
+@pytest.mark.parametrize(
+    ("capability", "overrides", "accepted"),
+    [
+        ((9, 0), {"num_heads": 16}, False),
+        ((10, 0), {"num_heads": 16}, True),
+        ((10, 0), {"num_heads": 8}, True),
+        ((9, 0), {"block_size": 32}, True),
+        ((9, 0), {"block_size": 128}, False),
+        ((10, 0), {"block_size": 128}, True),
+        ((9, 0), {"next_n": 2}, True),
+        ((9, 0), {"next_n": 3}, False),
+        ((10, 0), {"next_n": 3}, True),
+        ((9, 0), {"head_dim": 64}, True),
+        ((9, 0), {"head_dim": 256}, False),
+        ((12, 0), {"head_dim": 64}, False),
+    ],
+)
+def test_deepgemm_launch_bounds_apply_each_arch_bound(capability, overrides, accepted):
     from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
-        _validate_deepgemm_cuda_device,
+        _check_deepgemm_launch_bounds,
     )
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_deepgemm_cuda_device(no_cuda)
+    device = _deepgemm_device(capability, 132)
+    if accepted:
+        _check_deepgemm_launch_bounds(device, **(_GLM_SHAPE | overrides))
+    else:
+        with pytest.raises(ProfilerNotImplemented, match="DeepGEMM paged MQA logits"):
+            _check_deepgemm_launch_bounds(device, **(_GLM_SHAPE | overrides))
 
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_deepgemm_cuda_device(h100)
 
-    wrong_sm_count = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H200",
-            get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=130),
-        )
+def test_deepgemm_cupti_filter_is_architecture_agnostic():
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _DEEPGEMM_KERNEL_NAME,
     )
-    with pytest.raises(ProfilerNotImplemented, match="132-SM H200"):
-        _validate_deepgemm_cuda_device(wrong_sm_count)
+
+    # Substring of sm90_fp8_paged_mqa_logits (H200) and sm100_paged_mqa_logits (B200).
+    assert _DEEPGEMM_KERNEL_NAME == "paged_mqa_logits"
+
+
+def test_deepgemm_check_accepts_matching_and_rejects_wrong_logits():
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _build_operands,
+        _check_first_request,
+        _torch_composite,
+    )
+
+    shape = {"context_len": 65, "max_model_len": 128}
+    operands = _build_operands(
+        torch,
+        batch_size=2,
+        next_n=1,
+        num_heads=32,
+        head_dim=128,
+        block_size=64,
+        device="cpu",
+        **shape,
+    )
+    expected = _torch_composite(operands, **shape)
+    _check_first_request(torch, operands, expected, **shape)
+    expected[0, 3] += 1.0
+    with pytest.raises(KernelLaunchFailed, match="disagrees with the Torch composite"):
+        _check_first_request(torch, operands, expected, **shape)
 
 
 def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatch):
@@ -343,10 +436,10 @@ def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatc
         ({"context_len": 0}, "must be > 0"),
         ({"max_model_len": 0}, "must be > 0"),
         ({"context_len": 129}, "must be <= max_model_len"),
-        ({"next_n": 2}, "next_n=1"),
-        ({"num_heads": 32}, r"== \(64, 128, 64\)"),
-        ({"head_dim": 64}, r"== \(64, 128, 64\)"),
-        ({"block_size": 32}, r"== \(64, 128, 64\)"),
+        ({"next_n": -1}, "next_n > 0"),
+        ({"num_heads": 0}, r"num_heads, head_dim, and block_size > 0"),
+        ({"head_dim": 0}, r"num_heads, head_dim, and block_size > 0"),
+        ({"block_size": -64}, r"num_heads, head_dim, and block_size > 0"),
         ({"q_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"cache_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"scale_dtype": DType.BF16}, "scale_dtype=weight_dtype"),
@@ -359,7 +452,7 @@ def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatc
     ]
     for overrides, match in invalid_cases:
         with pytest.raises(ValueError, match=match):
-            runner.profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(**(_BASE_SPEC | overrides))
+            runner.profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**(_BASE_SPEC | overrides))
     assert not loaded
 
 
@@ -463,7 +556,8 @@ def test_deepgemm_loader_rejects_both_paged_entry_points_missing(monkeypatch):
         runner._load_deepgemm_backend()
 
 
-def test_deepgemm_adapter_and_callable_forwarding():
+@pytest.mark.parametrize("next_n", [1, 6])
+def test_deepgemm_adapter_and_callable_forwarding(next_n):
     from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
         _build_operands,
         _prepare_deepgemm_call,
@@ -473,7 +567,7 @@ def test_deepgemm_adapter_and_callable_forwarding():
         torch,
         batch_size=2,
         context_len=65,
-        next_n=1,
+        next_n=next_n,
         max_model_len=128,
         num_heads=64,
         head_dim=128,
@@ -509,6 +603,7 @@ def test_deepgemm_adapter_and_callable_forwarding():
     assert runnable_context_lens.is_contiguous()
     assert torch.equal(runnable_context_lens, operands.context_lens[:, 0])
     assert actual_metadata is metadata
+    assert operands.q.shape == (2, next_n, 64, 128)
     assert torch.equal(operands.context_lens, original_contexts)
 
     assert kernel() == "output"
@@ -526,6 +621,17 @@ def test_deepgemm_adapter_and_callable_forwarding():
     assert kwargs == {"clean_logits": False}
 
 
+def test_spec5_public_runner_reaches_backend_loading(monkeypatch):
+    from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
+
+    def backend_unavailable():
+        raise ProfilerNotImplemented("test backend unavailable")
+
+    monkeypatch.setattr(runner, "_load_deepgemm_backend", backend_unavailable)
+    with pytest.raises(ProfilerNotImplemented, match="test backend unavailable"):
+        runner.profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**(_BASE_SPEC | {"next_n": 6}))
+
+
 def test_deepgemm_launch_failure_is_typed(monkeypatch):
     from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
 
@@ -533,7 +639,7 @@ def test_deepgemm_launch_failure_is_typed(monkeypatch):
         cuda=SimpleNamespace(
             is_available=lambda: True,
             current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H200",
+            get_device_capability=lambda _device: (9, 0),
             get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=132),
         )
     )
@@ -551,7 +657,7 @@ def test_deepgemm_launch_failure_is_typed(monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("synthetic launch failure")),
     )
     with pytest.raises(KernelLaunchFailed, match="synthetic launch failure"):
-        runner.profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(**_BASE_SPEC)
+        runner.profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**_BASE_SPEC)
 
 
 def test_launch_failure_is_typed(monkeypatch):

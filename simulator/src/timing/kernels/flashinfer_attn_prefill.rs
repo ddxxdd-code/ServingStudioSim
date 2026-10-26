@@ -67,10 +67,7 @@ impl SweepCoords for FlashinferAttnPrefillKernelInput {
         Coords::new([a, self.append_len as f64])
     }
     fn coord_field_names() -> &'static [&'static str] {
-        // The *query-point* keys (physical, history-append) — what a caller sends.
-        // NOTE: these are NOT the cache's (A,B) axis labels; the grid's
-        // `grid_axes` are in (A,B) space, not (prefix,append).
-        &["prefix_len", "append_len"]
+        &["effective_kv_tokens", "append_len"]
     }
 }
 
@@ -160,7 +157,7 @@ mod tests {
 
     fn config() -> FlashinferAttnPrefillKernelConfig {
         FlashinferAttnPrefillKernelConfig {
-            backends: vec!["fa2", "fa3", "trt", "cudnn"],
+            backends: vec!["fa2", "fa3", "cudnn"],
             gpu_name: "H100".to_string(),
             num_qo_heads: 32.into(),
             num_kv_heads: 8.into(),
@@ -174,7 +171,7 @@ mod tests {
     #[test]
     fn config_identity_includes_backends_and_attention_dims() {
         let cfg = config();
-        assert_eq!(cfg.backends, vec!["fa2", "fa3", "trt", "cudnn"]);
+        assert_eq!(cfg.backends, vec!["fa2", "fa3", "cudnn"]);
         assert_eq!(cfg.num_qo_heads, 32);
         assert_eq!(cfg.num_kv_heads, 8);
         assert_eq!(cfg.head_dim, 128);
@@ -188,7 +185,7 @@ mod tests {
         assert_eq!(
             config().describe_config(),
             serde_json::json!({
-                "backends": ["fa2", "fa3", "trt", "cudnn"], "gpu_name": "H100",
+                "backends": ["fa2", "fa3", "cudnn"], "gpu_name": "H100",
                 "num_qo_heads": {"value": 32, "expression": null, "bindings": {}},
                 "num_kv_heads": {"value": 8, "expression": null, "bindings": {}},
                 "head_dim": {"value": 128, "expression": null, "bindings": {}},
@@ -208,12 +205,10 @@ mod tests {
     }
 
     #[test]
-    fn coord_field_names_are_the_physical_query_keys() {
-        // The `grid` op pairs `grid_axes` (A,B) with these query-point keys; the
-        // keys stay physical (history-append) even though the axes are (A,B).
+    fn coord_field_names_label_the_cache_axes() {
         assert_eq!(
             FlashinferAttnPrefillKernelInput::coord_field_names(),
-            ["prefix_len", "append_len"]
+            ["effective_kv_tokens", "append_len"]
         );
     }
 

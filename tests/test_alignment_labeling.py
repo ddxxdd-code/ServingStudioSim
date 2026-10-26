@@ -19,11 +19,46 @@ from alignment.labeling import (
     load_rules,
     read_coverage,
     slots_ending,
+    subsumptions,
     transfer_labels,
     walk_kernels,
 )
 from alignment.labeling import cli as labeling_cli
+from alignment.labeling.rules import NO_NEIGHBOUR, label_body
 from launcher.alignment_config import load_labeled_kernel_sequences
+
+
+def test_unmapped_collective_rule_preserves_missing_simulator_owner():
+    from launcher.alignment_config import _validate_labeled_kernel
+
+    rule = Rule.from_mapping({
+        "name": "allreduce", "operation": "draft.embedding",
+        "status": "unmapped", "cross_rank": "synchronizing",
+        "phase": "draft", "after_name": "embedding", "before_name": "norm",
+    })
+    label = label_body(rule, [])
+    assert label == {
+        "status": "unmapped", "cross_rank": "synchronizing",
+        "collective": "draft.embedding",
+    }
+    operations, slots = {}, {}
+    kernel = {"name": "allreduce", "suggested_category": "all_reduce", "label": label}
+    _validate_labeled_kernel(kernel, "test", operations, slots)
+    assert operations == slots == {}
+    label["cross_rank"] = "independent"
+    with pytest.raises(ValueError, match="collective identity requires"):
+        _validate_labeled_kernel(kernel, "test", {}, {})
+
+
+@pytest.mark.parametrize("extra", [
+    {"slot_suffixes": ["embedding"]}, {"cross_rank": "independent"},
+])
+def test_unmapped_collective_rule_rejects_invented_mapping(extra):
+    with pytest.raises(ValueError, match="unmapped collective rules require"):
+        Rule.from_mapping({
+            "name": "allreduce", "operation": "draft.embedding",
+            "status": "unmapped", "cross_rank": "synchronizing", **extra,
+        })
 
 
 def _tracks(*programs: list[dict]) -> list[dict]:
@@ -48,7 +83,6 @@ def _tracks(*programs: list[dict]) -> list[dict]:
     ]
 
 
-
 def test_initialize_writes_explicit_unmapped_cross_rank_labels(tmp_path):
     source = tmp_path / "source.json"
     output = tmp_path / "labeled.json"
@@ -60,16 +94,18 @@ def test_initialize_writes_explicit_unmapped_cross_rank_labels(tmp_path):
                         "unique_sequences": [
                             {
                                 "sequence_id": "sequence_test",
-                                "tracks": _tracks([
-                                    {
-                                        "kernels": [
-                                            {
-                                                "name": "kernel",
-                                                "suggested_category": "other",
-                                            }
-                                        ]
-                                    }
-                                ]),
+                                "tracks": _tracks(
+                                    [
+                                        {
+                                            "kernels": [
+                                                {
+                                                    "name": "kernel",
+                                                    "suggested_category": "other",
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ),
                             }
                         ]
                     }
@@ -99,20 +135,22 @@ def test_initialize_refuses_to_overwrite_existing_label_decisions(tmp_path):
                         "unique_sequences": [
                             {
                                 "sequence_id": "sequence_test",
-                                "tracks": _tracks([
-                                    {
-                                        "kernels": [
-                                            {
-                                                "name": "kernel",
-                                                "suggested_category": "other",
-                                                "label": {
-                                                    "status": "unmapped",
-                                                    "cross_rank": "independent",
-                                                },
-                                            }
-                                        ]
-                                    }
-                                ]),
+                                "tracks": _tracks(
+                                    [
+                                        {
+                                            "kernels": [
+                                                {
+                                                    "name": "kernel",
+                                                    "suggested_category": "other",
+                                                    "label": {
+                                                        "status": "unmapped",
+                                                        "cross_rank": "independent",
+                                                    },
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ),
                             }
                         ]
                     }
@@ -145,25 +183,27 @@ def test_initialize_unfolds_repeats_for_occurrence_specific_boundaries(tmp_path)
                                 "sequence_id": "sequence_test",
                                 "occurrences": [{"device_id": 0, "iterations": [7]}],
                                 "expanded_kernel_count": 4,
-                                "tracks": _tracks([
-                                    {
-                                        "repeat": {
-                                            "count": 2,
-                                            "body": {
-                                                "kernels": [
-                                                    {
-                                                        "name": "norm",
-                                                        "suggested_category": "other",
-                                                    },
-                                                    {
-                                                        "name": "projection",
-                                                        "suggested_category": "other",
-                                                    },
-                                                ]
-                                            },
+                                "tracks": _tracks(
+                                    [
+                                        {
+                                            "repeat": {
+                                                "count": 2,
+                                                "body": {
+                                                    "kernels": [
+                                                        {
+                                                            "name": "norm",
+                                                            "suggested_category": "other",
+                                                        },
+                                                        {
+                                                            "name": "projection",
+                                                            "suggested_category": "other",
+                                                        },
+                                                    ]
+                                                },
+                                            }
                                         }
-                                    }
-                                ]),
+                                    ]
+                                ),
                             }
                         ]
                     }
@@ -201,16 +241,18 @@ def test_rule_before_name_distinguishes_last_identical_boundary():
                 "unique_sequences": [
                     {
                         "sequence_id": "sequence_boundary",
-                        "tracks": _tracks([
-                            {
-                                "kernels": [
-                                    kernel("norm"),
-                                    kernel("qkv"),
-                                    kernel("norm"),
-                                    kernel("lm_head"),
-                                ]
-                            }
-                        ]),
+                        "tracks": _tracks(
+                            [
+                                {
+                                    "kernels": [
+                                        kernel("norm"),
+                                        kernel("qkv"),
+                                        kernel("norm"),
+                                        kernel("lm_head"),
+                                    ]
+                                }
+                            ]
+                        ),
                     }
                 ]
             }
@@ -246,21 +288,23 @@ def document():
                 "unique_sequences": [
                     {
                         "sequence_id": "sequence_aaaa1111",
-                        "tracks": _tracks([
-                            {"kernels": [kernel("norm_kernel", dict(MAPPED_NORM))]},
-                            {
-                                "repeat": {
-                                    "count": 18,
-                                    "body": {
-                                        "kernels": [
-                                            kernel("nvjet_tile_TNT"),
-                                            kernel("splitKreduce_kernel"),
-                                            kernel("cudaMemsetAsync_filler"),
-                                        ]
-                                    },
-                                }
-                            },
-                        ]),
+                        "tracks": _tracks(
+                            [
+                                {"kernels": [kernel("norm_kernel", dict(MAPPED_NORM))]},
+                                {
+                                    "repeat": {
+                                        "count": 18,
+                                        "body": {
+                                            "kernels": [
+                                                kernel("nvjet_tile_TNT"),
+                                                kernel("splitKreduce_kernel"),
+                                                kernel("cudaMemsetAsync_filler"),
+                                            ]
+                                        },
+                                    }
+                                },
+                            ]
+                        ),
                     }
                 ]
             },
@@ -351,6 +395,15 @@ def test_slots_ending_collects_every_layer_variant_and_rejects_a_stale_suffix():
         slots_ending(SLOTS, "attention.renamed_away")
 
 
+def test_target_rule_does_not_absorb_matching_mtp_slots():
+    rule = Rule.from_mapping({
+        "name": "gemm", "operation": "target.head", "type": "model", "role": "target head",
+        "slot_suffixes": ["lm_head"], "excluded_slot_prefixes": ["unified.mtp."],
+    })
+    slots = [("unified.lm_head", "gemm"), ("unified.mtp.step_0.lm_head", "gemm")]
+    assert label_body(rule, slots)["simulated_slots"] == ["unified.lm_head"]
+
+
 def test_a_rule_chain_labels_the_reduce_that_follows_the_gemm_it_reduces(document):
     rules = [
         Rule(
@@ -407,6 +460,65 @@ def test_a_phase_rule_separates_the_lm_head_from_the_decoder_tile(document):
     assert positions[1].operation == "attention.q_absorb"
     assert positions[4].operation == "main.lm_head"
     assert check(document) == []
+
+
+def test_a_stream_role_rule_separates_reused_kernels_on_concurrent_tracks():
+    document = {
+        "phases": {
+            "forward": {
+                "unique_sequences": [
+                    {
+                        "sequence_id": "sequence_two_roles",
+                        "tracks": _tracks(
+                            [{"kernels": [kernel("reused_tile")]}],
+                            [{"kernels": [kernel("reused_tile")]}],
+                        ),
+                    }
+                ]
+            }
+        }
+    }
+    rules = [
+        Rule(
+            name="reused_tile",
+            operation="moe.shared_expert.gate_up_proj",
+            type="model",
+            role="concurrent projection",
+            slot_suffixes=("router.router_gemm_bf16_proxy",),
+            stream_role="concurrent",
+        )
+    ]
+
+    report = apply_rules(document, rules, SLOTS)
+    positions = list(walk_kernels(document))
+    assert report.applied == {"moe.shared_expert.gate_up_proj": 1}
+    assert positions[0].operation is None
+    assert positions[1].operation == "moe.shared_expert.gate_up_proj"
+    assert check(document) == []
+
+
+def test_a_before_rule_uses_a_mapped_successor_from_an_earlier_pass(document):
+    reduction = Rule(
+        name="splitKreduce_kernel",
+        operation="moe.router.router_gemm",
+        type="model",
+        role="router reduction",
+        slot_suffixes=("router.router_gemm_bf16_proxy",),
+    )
+    producer = Rule(
+        name="nvjet_tile_TNT",
+        operation="moe.router.router_gemm",
+        type="model",
+        role="router producer",
+        slot_suffixes=("router.router_gemm_bf16_proxy",),
+        before="moe.router.router_gemm",
+    )
+
+    assert apply_rules(document, [reduction], SLOTS).applied == {"moe.router.router_gemm": 1}
+    assert apply_rules(document, [producer], SLOTS).applied == {"moe.router.router_gemm": 1}
+    positions = list(walk_kernels(document))
+    assert positions[1].operation == "moe.router.router_gemm"
+    assert positions[1].next_operation == "moe.router.router_gemm"
 
 
 def test_an_already_mapped_position_is_kept_and_reported_rather_than_overwritten(document):
@@ -518,6 +630,18 @@ def test_rules_load_from_a_file_and_reject_an_unknown_key(tmp_path):
     with pytest.raises(ValueError, match="unknown keys"):
         load_rules(path)
 
+    invalid_stream_role = {
+        "name": "x",
+        "operation": "y",
+        "type": "model",
+        "role": "test",
+        "slot_suffixes": ["lm_head"],
+        "stream_role": "side",
+    }
+    path.write_text(json.dumps([invalid_stream_role]))
+    with pytest.raises(ValueError, match="stream_role must be one of"):
+        load_rules(path)
+
 
 def test_coverage_aggregates_the_per_row_unmapped_lists_by_name(tmp_path):
     """The analyzer reports one row per folded position, so a kernel that runs
@@ -591,3 +715,127 @@ def test_transfer_refuses_an_inventory_whose_program_differs(document):
 
     with pytest.raises(ValueError, match="not the same program"):
         transfer_labels(document, destination)
+
+
+def _rule(operation: str, **keys) -> Rule:
+    return Rule.from_mapping(
+        {
+            "operation": operation,
+            "type": "ffn",
+            "role": "gemm",
+            "slot_suffixes": ["gate_up_proj"],
+            **keys,
+        }
+    )
+
+
+def test_subsumptions_proves_the_wider_matcher_decides_nothing_on_its_own():
+    """The real defect this was written for: a later file's wider matcher was
+    survived rather than corrected, so the label came from the file order.
+
+    `nvjet_sm100_tst_` is a family prefix — every position the narrow rule can
+    ever see, the wide one sees too, and they disagree about the operation.
+    """
+    wide = _rule("ffn.gate_up_proj", name="nvjet_sm100_tst_", phase="forward")
+    narrow = _rule(
+        "moe.shared_expert.gate_up_proj",
+        name="nvjet_sm100_tst_64x32_64x16",
+        phase="forward",
+    )
+
+    (finding,) = subsumptions([wide, narrow])
+    assert "ffn.gate_up_proj" in finding and "moe.shared_expert.gate_up_proj" in finding
+    # Order-independent itself: swapping the two reports the same pair.
+    assert subsumptions([narrow, wide]) == [finding]
+    # Same matcher, same answer, no ambiguity to report.
+    assert subsumptions([wide, _rule("ffn.gate_up_proj", name="nvjet", phase="forward")]) == []
+
+
+def test_subsumptions_is_silent_when_a_key_can_separate_the_two_rules():
+    """An omitted key is no constraint, an exact key must agree, and the empty
+    slot is structural — it subsumes only itself. Each is enough to separate."""
+    base = {"name": "cublasLt::splitKreduce_kernel", "phase": "forward"}
+    wide = _rule("attention.q_b_proj", **base)
+
+    # Distinguished by an exact key both constrain, to different values. Both
+    # must constrain it: omitting a key widens a rule, so `wide` without a
+    # `stream_role` still claims everything a rule that pins one claims.
+    assert subsumptions(
+        [
+            _rule("attention.q_b_proj", **base, stream_role="primary"),
+            _rule("moe.router", **base, stream_role="concurrent"),
+        ]
+    ) == []
+    assert len(subsumptions([wide, _rule("moe.router", **base, stream_role="concurrent")])) == 1
+    # Distinguished by the neighbour sentinel: "no predecessor" is not "any".
+    assert subsumptions(
+        [
+            _rule("attention.q_b_proj", **base, after=NO_NEIGHBOUR),
+            _rule("moe.router", **base, after="moe.router"),
+        ]
+    ) == []
+    # Narrow on different axes: each constrains a key the other leaves open, so
+    # neither claims everything the other does and the file order settles
+    # nothing. They may still overlap on some position — that is `disagreements`
+    # to find against a capture, not something the rule text can decide.
+    assert subsumptions(
+        [
+            _rule("attention.q_b_proj", **base, after="attention.q_b_proj"),
+            _rule("moe.router", **base, stream_role="concurrent"),
+        ]
+    ) == []
+
+
+def test_an_exact_name_rule_claims_only_the_anonymous_kernel_not_every_name_containing_it():
+    """A launch literally named `kernel` is a fragment of every other name.
+
+    DeepSeek-V4.1's FusedQKRMSNorm is such a launch. A fragment rule for it
+    would also claim `_indexer_k_norm_rope_quant_store_kernel` beside it; the
+    exact rule claims the anonymous position alone, and `subsumptions` treats
+    the two spellings by the sets of names they can actually match.
+    """
+    kernels = [
+        {"name": "gemm_tile", "suggested_category": "gemm"},
+        {"name": "kernel", "suggested_category": "other"},
+        {"name": "quant_1280", "suggested_category": "other"},
+        {"name": "_indexer_k_norm_rope_quant_store_kernel", "suggested_category": "other"},
+        {"name": "quant_1280", "suggested_category": "other"},
+    ]
+    document = {
+        "phases": {
+            "forward": {
+                "unique_sequences": [
+                    {
+                        "sequence_id": "sequence_exact",
+                        "expanded_kernel_count": len(kernels),
+                        "occurrences": [{"device_id": 0, "iterations": [0]}],
+                        "tracks": _tracks([{"kernels": kernels}]),
+                    }
+                ]
+            }
+        }
+    }
+    exact = _rule("attention.qk_rmsnorm", name="kernel", name_exact=True, before_name="quant_1280")
+    fragment = _rule("attention.qk_rmsnorm", name="kernel", before_name="quant_1280")
+    slots = [("unified.layer0.gate_up_proj", "gemm")]
+
+    exact_doc = copy.deepcopy(document)
+    apply_rules(exact_doc, [exact], slots)
+    assert [p.operation for p in walk_kernels(exact_doc)] == [
+        None, "attention.qk_rmsnorm", None, None, None
+    ]
+    fragment_doc = copy.deepcopy(document)
+    apply_rules(fragment_doc, [fragment], slots)
+    assert [p.operation for p in walk_kernels(fragment_doc)][3] == "attention.qk_rmsnorm"
+
+    # The fragment claims every name the exact rule can match; not the reverse.
+    store = _rule("indexer.k_store", name="_indexer_k_norm_rope_quant_store_kernel")
+    other = _rule("other", name="kernel", name_exact=True, before_name="quant_1280")
+    assert len(subsumptions([fragment, other])) == 1
+    assert len(subsumptions([other, fragment])) == 1
+    assert subsumptions([exact, store]) == []
+    assert len(subsumptions([exact, other])) == 1
+    # An exact rule never contains a fragment rule, even one spelled the same.
+    assert subsumptions([_rule("wide", name="kernel", name_exact=True), store]) == []
+    with pytest.raises(ValueError, match="unknown keys"):
+        Rule.from_mapping({**exact.__dict__, "name_exactly": True})

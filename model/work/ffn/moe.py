@@ -26,6 +26,19 @@ class MoE:
     # quantized config's modules_to_not_convert.
     shared_module: str = "shared_experts"
     shared_gate: bool = False
+    # Prepended to every module path this FFN reports. A quantization config's
+    # inclusion/exclusion lists are matched layer-relative, so two layers whose
+    # submodules have the same names cannot be told apart by path alone. Naming a
+    # stack that is quantized differently from the body (GLM-5.2's MTP layer
+    # keeps BF16 experts under an NVFP4 checkpoint) is what makes them distinct.
+    module_prefix: str = ""
+    # Router logits beyond one per routed expert. Inkling's router also scores its
+    # always-on sink experts (256 routed + 2 sink = 258 logits); the sink logits
+    # weight the shared-expert outputs per token instead of selecting experts.
+    router_extra_logits: int = 0
+
+    def _module(self, path: str) -> str:
+        return f"{self.module_prefix}.{path}" if self.module_prefix else path
 
     def matmul_groups(self) -> list[MatmulGroup]:
         if self.shared_gate and self.shared_intermediate <= 0:
@@ -35,10 +48,10 @@ class MoE:
             # Qwen3-235B-FP8 leave it at the master dtype.
             MatmulGroup(
                 "router",
-                n=self.num_experts,
+                n=self.num_experts + self.router_extra_logits,
                 k=self.hidden,
                 bucket="router",
-                module="mlp.gate",
+                module=self._module("mlp.gate"),
             ),
             MatmulGroup(
                 "expert_gate_up",
@@ -48,7 +61,7 @@ class MoE:
                 total_count=self.num_experts,
                 bucket="expert",
                 routed=True,
-                module="mlp.experts.gate_up_proj",
+                module=self._module("mlp.experts.gate_up_proj"),
             ),
             MatmulGroup(
                 "expert_down",
@@ -58,7 +71,7 @@ class MoE:
                 total_count=self.num_experts,
                 bucket="expert",
                 routed=True,
-                module="mlp.experts.down_proj",
+                module=self._module("mlp.experts.down_proj"),
             ),
         ]
         if self.shared_intermediate > 0:
@@ -68,7 +81,7 @@ class MoE:
                     n=2 * self.shared_intermediate,
                     k=self.hidden,
                     bucket="shared_expert",
-                    module=f"mlp.{self.shared_module}.gate_up_proj",
+                    module=self._module(f"mlp.{self.shared_module}.gate_up_proj"),
                 )
             )
             groups.append(
@@ -77,7 +90,7 @@ class MoE:
                     n=self.hidden,
                     k=self.shared_intermediate,
                     bucket="shared_expert",
-                    module=f"mlp.{self.shared_module}.down_proj",
+                    module=self._module(f"mlp.{self.shared_module}.down_proj"),
                 )
             )
             if self.shared_gate:
@@ -87,7 +100,7 @@ class MoE:
                         n=1,
                         k=self.hidden,
                         bucket="shared_expert",
-                        module="mlp.shared_expert_gate",
+                        module=self._module("mlp.shared_expert_gate"),
                     )
                 )
         return groups

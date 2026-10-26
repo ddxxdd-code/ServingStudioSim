@@ -1,14 +1,14 @@
 ---
 name: operate-run-simulation
-description: Use when the user wants to run an VibeSim simulation from a preset (YAML preferred, JSON also accepted). This skill locates the repo logs root, names the experiment as date_index_short_name, prefers expressing requested variations as internal sweeps inside one copied preset, always does a dry run to inspect the expanded run plan before launching, and runs through the VibeSim launcher.
+description: Use when the user wants to run a ServingStudio Sim simulation from a preset (YAML preferred, JSON also accepted). This skill locates the repo logs root, names the experiment as date_index_short_name, prefers expressing requested variations as internal sweeps inside one copied preset, always does a dry run to inspect the expanded run plan before launching, and runs through the ServingStudio Sim launcher.
 ---
 
-# Run VibeSim Simulation
+# Run ServingStudio Sim Simulation
 
-Prepare and run an VibeSim simulation from an existing preset. This is the
-VibeSim analogue of the global `run-moesim-experiment` skill — same shape (copy a
+Prepare and run a ServingStudio Sim simulation from an existing preset. This is the
+ServingStudio Sim analogue of the global `run-moesim-experiment` skill — same shape (copy a
 preset into a dated experiment dir, encode variations as sweeps, launch), but
-the launcher and conventions below are VibeSim-specific. When in doubt about the
+the launcher and conventions below are ServingStudio Sim-specific. When in doubt about the
 preset/sweep philosophy, defer to `run-moesim-experiment`.
 
 **Preset format is the nested config tree** (`deployment` / `workload` / `io` /
@@ -21,11 +21,9 @@ For the *offline* cost predictor (explicit batch shapes, no discrete-event sim /
 workload / pools) use `operate-run-timing-predict` instead — this skill is only
 for a real deployment run driven by a workload trace.
 
-Repo root:
-- `/m-coriander/coriander/kanzhu/VibeSim_workspace/main`
-
-Canonical logs root:
-- `/m-coriander/coriander/kanzhu/VibeSim_workspace/main/logs`
+Resolve the repository root from the active checkout with
+`git rev-parse --show-toplevel`. Its `logs/` directory is the canonical logs
+root for that checkout.
 
 Launcher (run from the repo root):
 - `uv run python -m launcher <preset>.yaml [--dry-run] [--override path=value ...]`
@@ -37,7 +35,7 @@ so you never set `LD_LIBRARY_PATH`/`PYTHONPATH` by hand.
 
 ## Trigger
 
-Use when the user wants to run a named VibeSim simulation, gives a preset to
+Use when the user wants to run a named ServingStudio Sim simulation, gives a preset to
 run, or wants a preset copied into a dedicated dated experiment log directory
 before launch.
 
@@ -77,11 +75,14 @@ If the user did not give a name, ask for one before proceeding.
    explicitly requests an analyzer subset, remove any inherited
    `analyze_subjects` key from the copied preset or variants manifest so the
    launcher runs every applicable analyzer subject. Do not add `--no-analyze`
-   to the launch command by default.
+   to the launch command by default. `--no-plot` is also opt-in; see
+   "Plots and `--no-plot`" below.
+   For MoE models, select the routing source using the MoE rule below before
+   the dry run.
 8. **Dry-run first** — validate + expand without launching, and inspect the run
    plan and per-run `log_dir`s:
    ```bash
-   cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
+   cd "$(git rev-parse --show-toplevel)"
    uv run python -m launcher logs/<experiment-name>/preset.yaml --dry-run
    ```
    Confirm the `[plan] N run(s)` count and that each expanded `log_dir` is
@@ -91,6 +92,11 @@ If the user did not give a name, ask for one before proceeding.
    ```bash
    uv run python -m launcher logs/<experiment-name>/preset.yaml
    ```
+
+## MoE routing source
+
+Before running any MoE model, read and apply
+[the shared routing-source selection rule](references/moe-routing.md).
 
 ## Sweeps
 
@@ -130,14 +136,14 @@ at eval. The default set is the arch's const-default. To tailor it per kernel:
    entry per kernel role, pre-filled with the current default and annotated
    `kind | dtype | options | shape`:
    ```bash
-   cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
+   cd "$(git rev-parse --show-toplevel)"
    uv run python -m launcher logs/<experiment-name>/preset.yaml \
      --emit-backends logs/<experiment-name>/backends.yaml
    ```
    (omit the FILE arg to print to stdout instead.)
    `options` is already dtype- AND GPU-filtered (from each kernel's declared
-   `BackendSupport`), so it lists only the backends legal for this run (e.g. `trt`
-   is dropped off a non-Blackwell GPU).
+   `BackendSupport`), so it lists only the backends legal for this run (e.g. an
+   sm_100f-only backend is dropped off a non-Blackwell GPU).
 
 2. **Edit `backends.yaml`** — set each role to a subset (`[fa3]` forces one,
    `[fa2, fa3]` is best-of-N), keep the default, or point it at a `${var}` declared
@@ -182,7 +188,6 @@ workload:
     - trace/aime_long.csv
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
   request_rate: 150.0
   duration_ms: 20000000.0
   run_to_end: false
@@ -226,6 +231,13 @@ per kernel per cache key, builds nothing). Reach for
 `operate-profile-existing-kernel` only for a question about one specific
 kernel's rows, never as a pre-step for a simulation.
 
+**KV capacity before a run.** `uv run python -m launcher <preset> --kv-report`
+prints each KV pool's layout, what one request at `max_model_len` holds per
+part, and the max concurrency, with no profile.db, GPU or log_dir
+(`--kv-report-json` for the machine form). A finished run has the same document
+at `raw/kv_cache.json`. For KV questions in general, use skill
+`dev-calculate-kv-cache-capacity`.
+
 ## GPU selection
 
 **Do not restrict how many GPUs the run may use unless there is a concrete
@@ -241,6 +253,37 @@ user asks, or when the fill must stay off specific cards; say why when you do.
 modeled GPU count comes from the preset's pools, and is never inferred from the
 host.)
 
+### No GPU: `--no-gpu`
+
+`--no-gpu` (or `SERVINGSTUDIO_NO_GPU=1`) guarantees the launcher uses no GPU in
+any mode. Pass it when the user asks, or when the run must stay off the host's
+GPUs. A run over a warm `profile.db` is unchanged. With missing rows, the cache
+prebuild fails before profiling and names the missing count; check coverage
+first with `--cache-report`. Report that failure; do not drop `--no-gpu`
+without asking.
+
+### On another machine: `--remote NAME`
+
+Append `--remote NAME` to the launch command (step 9) to run it on a machine
+from `remote.yaml` (an untracked file; `remote.example.yaml` lists the fields),
+when the user asks for it or this host's CPUs are not available. The dry run in
+step 8 stays local. Run from the checkout root; the preset and `io.log_dir`
+must be under `logs/`. The command blocks until the results are copied back to
+the same `logs/<experiment-name>/`, relaying remote output with a heartbeat at
+least once a minute; rerunning it resumes on the remote. A managed run is
+registered here, so the Analyzer ID is the same as for a local run.
+
+The remote runs with `--no-gpu --no-plot`: it never profiles, so check
+`--cache-report` first and fill missing rows locally (or with
+`kernel-profile run --remote`), and it renders no PNGs. Copy-back leaves out
+`raw/cost_log/` and `plots/`; the full run stays on the remote, and
+`remote-run.json` in the experiment root records where. Report the remote name
+and that file's remote path. A one-call field change is
+`--remote-set launch.slurm.time=04:00:00`. Do not create or edit `remote.yaml`,
+its ssh keys, or `.remote/known_hosts` unless the user asks; if the named remote
+is missing or ssh fails, stop and report it. Details: `launcher/README.md`,
+"Remote execution".
+
 ## Analysis output
 
 Each finished run is auto-analyzed (best-effort — a failure never fails the run)
@@ -249,6 +292,26 @@ its `log_dir`. The full list of analysis **subjects** a run produces and what ea
 one reads and emits is the canonical Subjects catalog in
 `analyzer/README.md` — point there instead of guessing metric names. Selection is
 the optional preset key `analyze_subjects`.
+
+### Plots and `--no-plot`
+
+By default the launcher also renders PNGs: each run's `plots/`, and a sweep's
+aggregate figures in the experiment root's `plots/`. `--no-plot` runs the
+same analysis and writes the same `reports/`, `payloads/` and trace, but
+renders no PNGs at all. The Analyzer UI and `operate-use-analyzer` read
+reports and payloads, not PNGs, so nothing downstream breaks.
+
+Rendering is the most expensive post-run step. On a 640-run Llama-3-8B sweep
+it took ~22 CPU-s per run against ~3 CPU-s for the simulation, and
+`--no-plot` cut the sweep from 200 s to 92 s. Keep the default for a single
+run or a small sweep. Pass `--no-plot` when the user asks for speed or says
+they do not need figures. For a large sweep (hundreds of runs), suggest
+`--no-plot` to the user before launching, rather than choosing it for them.
+With either flag, you can later render one run's figures with
+`uv run python analyzer/python render <run log_dir>`.
+
+`--no-plot` is not `--no-analyze`: `--no-analyze` skips the analyzer, so no
+reports, payloads, trace or PNGs are written.
 
 **Default invariant: run all applicable subjects.** Omit `analyze_subjects`
 (preferred; an empty list has the same launcher meaning) and do not pass
@@ -268,7 +331,9 @@ After setup and launch, report:
 - copied preset path
 - the `--dry-run` plan summary (run count)
 - exact launcher command used
-- analysis selection (`all applicable` by default, or the user-requested subset)
+- MoE routing source: the selected corpus or popularity file, or the reason for uniform fallback
+- analysis selection (`all applicable` by default, or the user-requested subset),
+  and whether PNGs were rendered (`--no-plot`)
 - any analyzer subjects that failed best-effort post-run analysis
 
 When the result reaches `ready`, switch to

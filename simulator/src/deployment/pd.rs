@@ -85,6 +85,7 @@ impl Deployment for PdDeployment {
 
         let prefill_wc = worker_config(
             &pg.worker,
+            pg.arch.max_model_len().ok(),
             &cfg.io.log_dir,
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
@@ -92,6 +93,7 @@ impl Deployment for PdDeployment {
         )?;
         let decode_wc = worker_config(
             &dg.worker,
+            dg.arch.max_model_len().ok(),
             &cfg.io.log_dir,
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
@@ -237,6 +239,7 @@ fn ensure_pd_decode(worker: &IterWorkerSel) -> anyhow::Result<()> {
 
 fn worker_config(
     worker: &IterWorkerSel,
+    max_model_len: Option<u32>,
     _log_dir: &Path,
     log_output_token_times: bool,
     log_stage_transitions: bool,
@@ -267,6 +270,7 @@ fn worker_config(
             prefix_cache_mode,
             prefix_cache_policy,
             prefix_cache_max_gpu_memory_gb,
+            ..
         } => (
             *attn_gpu_memory_gb,
             *gpu_time_multiplier,
@@ -285,6 +289,7 @@ fn worker_config(
         | IterWorkerSel::PdDecode {
             attn_gpu_memory_gb,
             gpu_time_multiplier,
+            ..
         } => (
             *attn_gpu_memory_gb,
             *gpu_time_multiplier,
@@ -326,7 +331,7 @@ fn worker_config(
         max_inflight_remote_reads > 0,
         "max_inflight_remote_reads must be positive"
     );
-    Ok(WorkerConfig {
+    let mut config = WorkerConfig {
         max_inflight_remote_reads,
         max_batch_tokens,
         pending_order,
@@ -336,8 +341,11 @@ fn worker_config(
         kv_log_stride,
         gpu_time_multiplier,
         prefix_cache,
+        max_model_len,
         ..WorkerConfig::default()
-    })
+    };
+    worker.kv_accounting().apply("pd", &mut config)?;
+    Ok(config)
 }
 
 fn pool_cfg(
@@ -378,9 +386,18 @@ where
     // two worker factories below (each opens its own per-worker `cost_log`).
     let net_log_dir = log_dir.clone();
     if let Some(spec) = kv_store {
-        let bytes = prefill_model.total_kv_bytes_per_token();
+        let bytes = crate::worker::workers::remote_kv_bytes_per_token(
+            &prefill_model.kv_cache_layout(),
+            prefill_model.num_attn_shards(),
+            &prefill_wc,
+        )?;
         ensure!(
-            bytes == decode_model.total_kv_bytes_per_token(),
+            bytes
+                == crate::worker::workers::remote_kv_bytes_per_token(
+                    &decode_model.kv_cache_layout(),
+                    decode_model.num_attn_shards(),
+                    &decode_wc
+                )?,
             "PD relay KV layouts must match"
         );
         spec.validate(bytes)?;
@@ -483,7 +500,7 @@ mod remote_config_tests {
         }))
         .unwrap();
         ensure_pd_prefill(&worker).unwrap();
-        let config = worker_config(&worker, Path::new("unused"), true, true, 4).unwrap();
+        let config = worker_config(&worker, None, Path::new("unused"), true, true, 4).unwrap();
         assert_eq!(config.attn_kv_bytes, 1000);
         assert_eq!(config.max_batch_tokens, Some(32));
         assert_eq!(config.max_inflight_remote_reads, 3);
@@ -495,7 +512,7 @@ mod remote_config_tests {
         }))
         .unwrap();
         ensure_pd_decode(&decode).unwrap();
-        let config = worker_config(&decode, Path::new("unused"), false, false, 1).unwrap();
+        let config = worker_config(&decode, None, Path::new("unused"), false, false, 1).unwrap();
         assert_eq!(config.attn_kv_bytes, 2000);
         assert_eq!(
             config.prefix_cache,
@@ -583,7 +600,7 @@ mod remote_config_tests {
             max_batch_tokens: None,
             pending_order: crate::worker::PendingOrderKind::SessionStart,
         };
-        let error = worker_config(&worker, Path::new("unused"), false, false, 1)
+        let error = worker_config(&worker, None, Path::new("unused"), false, false, 1)
             .err()
             .unwrap();
         assert!(error.to_string().contains("enabled local prefix cache"));
@@ -607,7 +624,7 @@ mod remote_config_tests {
             let yaml = format!(
                 r#"
 deployment: pd
-{store}workload: {{ trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1.0, run_to_end: true, request_rate: 1.0 }}
+{store}workload: {{ trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 1.0, run_to_end: true, request_rate: 1.0 }}
 io: {{ log_dir: "unused", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }}
 pools:
   prefill:
@@ -666,8 +683,9 @@ pools:
             ) -> LeafMetrics {
                 self.0.eval_iter(batch, slots, scratch)
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                2
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                crate::arch::kv_layout::KvCacheLayout::new()
+                    .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 2))
             }
             fn gpus_per_replica(&self) -> u16 {
                 1

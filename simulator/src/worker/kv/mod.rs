@@ -3,21 +3,23 @@
 //! `KvStore` is the common resource lifecycle. `IterWorkerKv` is the narrow
 //! capability required by the whole-iteration worker family. Membership is
 //! exposed through generic visitors, not owned snapshots, so abstraction does
-//! not add hot-path allocation or leak `FullAttnPartitionState`.
+//! not add hot-path allocation or leak partition state.
 
 use crate::common::{RequestId, SessionInput, Time};
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
 use self::shared::prefix_cache::PrefixCacheReturnMetadata;
 
-mod full_attn;
-mod hybrid_gdn;
+mod kv_cache_store;
 mod shared;
 
-pub use full_attn::FullAttnKv;
-pub use hybrid_gdn::HybridGdnKv;
-pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
-pub(crate) use shared::prefix_cache::{PrefixCache, PrefixCacheMutation, PrefixCacheMutationKind};
+pub use kv_cache_store::KvCacheStore;
+pub(crate) use shared::kv_accounting::{KvAccounting, KvAccountingOptions, SharedKvAccounting};
+pub use shared::kv_accounting::{KvOverhead, PrefixResumePoints};
+pub use shared::kv_cache_report::KvCacheReport;
+pub(crate) use shared::prefix_cache::{
+    PrefixCache, PrefixCacheBudget, PrefixCacheMutation, PrefixCacheMutationKind,
+};
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
@@ -28,6 +30,8 @@ pub struct ResolvedPrefillContext {
     resident_prefix_tokens: u32,
     prefill_tokens_to_compute: u32,
     post_prefill_context_tokens: u32,
+    processed_prefill_tokens: u32,
+    active_chunk_tokens: u32,
     cache_return_metadata: Option<PrefixCacheReturnMetadata>,
 }
 
@@ -67,6 +71,8 @@ impl ResolvedPrefillContext {
             resident_prefix_tokens,
             prefill_tokens_to_compute,
             post_prefill_context_tokens,
+            processed_prefill_tokens: 0,
+            active_chunk_tokens: prefill_tokens_to_compute,
             cache_return_metadata: None,
         }
     }
@@ -90,6 +96,32 @@ impl ResolvedPrefillContext {
 
     pub fn post_prefill_context_tokens(self) -> u32 {
         self.post_prefill_context_tokens
+    }
+
+    /// Context and append length exposed to the model in this iteration.
+    pub fn active_chunk(self) -> (u32, u32) {
+        (
+            self.resident_prefix_tokens + self.processed_prefill_tokens,
+            self.active_chunk_tokens,
+        )
+    }
+
+    pub fn remaining_prefill_tokens(self) -> u32 {
+        self.prefill_tokens_to_compute
+            .saturating_sub(self.processed_prefill_tokens)
+    }
+
+    fn schedule_chunk(&mut self, chunk_tokens: u32) {
+        debug_assert!(chunk_tokens <= self.remaining_prefill_tokens());
+        self.active_chunk_tokens = chunk_tokens;
+    }
+
+    fn complete_chunk(&mut self) {
+        self.processed_prefill_tokens = self
+            .processed_prefill_tokens
+            .checked_add(self.active_chunk_tokens)
+            .expect("processed prefill token count overflow");
+        self.active_chunk_tokens = 0;
     }
 
     fn with_cache_return_metadata(
@@ -165,12 +197,20 @@ pub trait PrefixKv: KvStore {
     /// How much of `session_input`'s declared prefix is resident *right now*,
     /// wherever it lives. This is what a cache-aware pending order ranks by;
     /// `declared_prefix_tokens` is only its upper bound. A session with no
-    /// retained partition has nothing to reuse and scores zero.
+    /// retained partition has nothing to reuse and scores zero; a pinned prefix
+    /// is resident on every partition.
     ///
     /// Two hash lookups, no mutation — cheap enough for the admission hot path.
     fn resident_prefix_tokens(&self, fresh_prompt_tokens: u32, session_input: SessionInput) -> u32 {
-        let Some(partition) = self.retained_prefix_partition(session_input) else {
-            return 0;
+        let partition = match session_input {
+            SessionInput::Standalone => return 0,
+            SessionInput::PinnedPrefix { .. } => 0,
+            SessionInput::Session { .. } => {
+                let Some(partition) = self.retained_prefix_partition(session_input) else {
+                    return 0;
+                };
+                partition
+            }
         };
         self.preview_prefill_context(partition, fresh_prompt_tokens, session_input)
             .resident_prefix_tokens()
@@ -189,6 +229,67 @@ pub trait PrefixKv: KvStore {
     }
 }
 
+/// Partial-prefill refinement for the whole-iteration worker family.
+///
+/// Admission reserves one policy-defined waiting-request footprint, while it
+/// exposes one hard-capped chunk at a time to execution. Historical workers use
+/// the full request footprint. A bounded-future scheduler instead reserves the
+/// source-defined waiting-request estimate and checks physical allocation again
+/// immediately before every decode step.
+pub trait ChunkedPrefillKv: PrefixKv + IterWorkerKv {
+    fn bounded_future_footprint(
+        &self,
+        request: RequestId,
+        post_prefill_context_tokens: u32,
+        remaining_output_tokens: u32,
+        max_future_tokens: u32,
+        page_size: u32,
+    ) -> Self::Footprint;
+    /// `decode_step_tokens` is how far each running decode advances in the
+    /// same step as this prefill, 0 when prefill steps run no decode; the
+    /// admission then also leaves room for that step.
+    fn fits_bounded_future(
+        &self,
+        partition: PartitionId,
+        footprint: &Self::Footprint,
+        max_future_tokens: u32,
+        new_token_ratio: f64,
+        decode_step_tokens: u32,
+    ) -> bool;
+    /// Shortfall, in KV units, for the next decode step, after shrinking the
+    /// prefix cache. `step_tokens` is how far one decode can advance per step:
+    /// 1 for autoregressive decode, the verify width for a speculating engine.
+    fn prepare_next_decode(
+        &mut self,
+        partition: PartitionId,
+        page_size: u32,
+        step_tokens: u32,
+        now: Time,
+    ) -> u64;
+    fn visit_decode_states(&self, partition: PartitionId, visitor: impl FnMut(RequestId, u64, u32));
+    fn reserve_chunked_prefill_context(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        resolved_prefill: ResolvedPrefillContext,
+        footprint: Self::Footprint,
+        now: Time,
+    );
+    fn schedule_prefill_chunk(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        chunk_tokens: u32,
+    );
+    fn complete_prefill_chunk(&mut self, request: RequestId);
+    fn finish_chunked_prefill(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        remaining_output_tokens: u32,
+    );
+}
+
 pub trait IterWorkerKv: KvStore {
     fn drain_ready(&mut self);
     fn clear_prefill_admits(&mut self, partition: PartitionId);
@@ -196,6 +297,10 @@ pub trait IterWorkerKv: KvStore {
     fn live_decode_count(&self, partition: PartitionId) -> u32;
     fn has_prefill_admit(&self, partition: PartitionId) -> bool;
     fn status_active(&self, partition: PartitionId) -> u32;
+    /// Fraction of the partition's KV capacity that running requests hold or
+    /// have reserved (retained prefix KV is reclaimable, so it does not count),
+    /// the analogue of vLLM's per-engine `kv_cache_usage`.
+    fn kv_usage(&self, partition: PartitionId) -> f64;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
 
     /// Static-dispatch iteration over this iteration's fresh prefills.

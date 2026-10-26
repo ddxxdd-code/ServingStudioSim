@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from profiling import cli, perf_api
-from profiling.exec.env import ProfileEnv
+from profiling.exec.env import ContainerProfileEnv, ProfileEnv
 from profiling.measure import _run_worker
 from profiling.profilers import trend
 from profiling.profilers.measure_context import (
@@ -104,6 +104,22 @@ def test_trend_summarize_shape():
     assert summary["metadata"]["label"] == "single_gemm:torch"
 
 
+def test_optional_plot_skips_only_missing_matplotlib():
+    def missing_matplotlib() -> None:
+        raise ModuleNotFoundError(name="matplotlib")
+
+    assert trend._render_optional_plot(missing_matplotlib) == (
+        False,
+        "matplotlib is not installed in the profiling environment",
+    )
+
+    def missing_required_dependency() -> None:
+        raise ModuleNotFoundError(name="required_dependency")
+
+    with pytest.raises(ModuleNotFoundError):
+        trend._render_optional_plot(missing_required_dependency)
+
+
 def test_align_telemetry_bins_runtimes_onto_samples():
     from profiling.profilers import telemetry
 
@@ -156,6 +172,52 @@ def _record(name: str, start_ns: int, duration_ns: int, correlation_id: int):
         end_ns=start_ns + duration_ns,
         duration_ns=duration_ns,
     )
+
+
+def test_interval_union_duration_merges_overlap_but_preserves_gaps():
+    from profiling.profilers.cupti_kernel_profiler import interval_union_duration_ns
+
+    records = [
+        _record("producer", 100, 200, 0),
+        _record("reduction", 250, 100, 1),
+        _record("next", 500, 150, 2),
+    ]
+
+    assert interval_union_duration_ns(records) == 400
+
+
+def test_interval_union_capture_accepts_either_stream_starting_first():
+    # Defect caught: a two-stream callable (sconv_qkvr_prep's KV kernel on a
+    # side stream beside its q kernel) aborts the capture when the side
+    # stream's kernel happens to start first in a later launch.
+    from profiling.profilers import cupti_kernel_profiler as cupti
+
+    pattern = cupti._LaunchPattern(callable_kernel_names=("kv", "q"), clear_kernel_names=("clr",))
+    records = [
+        _record("kv", 0, 90, 0),
+        _record("q", 5, 50, 1),
+        _record("clr", 200, 10, 2),
+        _record("q", 300, 50, 3),
+        _record("kv", 302, 90, 4),
+    ]
+
+    class _Profiler:
+        def capture_once(self, fn, **_):
+            return records
+
+    kwargs = dict(
+        launches_per_run=2,
+        clear_l2_before_run=True,
+        clear_l2_between_launches=True,
+        kernel_name_contains=None,
+        launch_pattern=pattern,
+    )
+    per_launch, _, _ = cupti._capture_launch_unit(
+        _Profiler(), lambda: None, interval_union=True, **kwargs
+    )
+    assert per_launch == [90 / 1e6, 92 / 1e6]
+    with pytest.raises(RuntimeError, match="pattern changed"):
+        cupti._capture_launch_unit(_Profiler(), lambda: None, **kwargs)
 
 
 def test_split_launch_series_warm_layout():
@@ -400,8 +462,10 @@ def test_measure_worker_uses_selected_python_and_composed_pythonpath(
         (first_import_root, second_import_root),
         (library_root,),
     )
-    existing_pythonpath = os.pathsep.join(["/existing/first", "/existing/second"])
-    monkeypatch.setenv("PYTHONPATH", existing_pythonpath)
+    # The caller's interpreter paths name the project venv; an env with its own
+    # interpreter must not inherit them.
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["/project/site-packages", "/existing"]))
+    monkeypatch.setenv("PYTHONHOME", "/project/python-home")
     monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
     captured = {}
 
@@ -438,10 +502,60 @@ def test_measure_worker_uses_selected_python_and_composed_pythonpath(
             str(Path(__file__).parents[1]),
             str(first_import_root),
             str(second_import_root),
-            existing_pythonpath,
         ]
     )
+    assert "PYTHONHOME" not in captured_env
     assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join([str(library_root), "/existing/lib"])
+    assert response["measure"]["consumed"] is True
+
+
+def test_measure_worker_uses_container_and_mounts_output(tmp_path, monkeypatch):
+    measurement_dir = tmp_path / "measurement"
+    measurement_dir.mkdir()
+    captured = {}
+
+    def fake_container_command(profiler_env, gpus, exchange_dir, additional_volumes=(), **_):
+        captured["profiler_env"] = profiler_env
+        captured["gpus"] = gpus
+        captured["additional_volumes"] = additional_volumes
+        return (
+            [
+                "fake-docker",
+                "--worker-output",
+                str(exchange_dir / "output.json"),
+            ],
+            {"EXACT_ENV": "1"},
+        )
+
+    def fake_subprocess_run(cmd, *, env, capture_output, text, check):
+        del capture_output, text, check
+        captured["cmd"] = cmd
+        captured["env"] = env
+        output_path = Path(cmd[cmd.index("--worker-output") + 1])
+        output_path.write_text(
+            '{"results": [], "measure": {"consumed": true}}',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("profiling.measure._container_worker_command", fake_container_command)
+    monkeypatch.setattr("profiling.measure.subprocess.run", fake_subprocess_run)
+    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test")
+
+    response = _run_worker(
+        kernel_kind="single_gemm",
+        spec={"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"},
+        gpu_index=4,
+        profiler_env=profiler_env,
+        measure_block={"output_dir": str(measurement_dir)},
+    )
+
+    assert captured["profiler_env"] is profiler_env
+    assert captured["gpus"] == [4]
+    assert captured["additional_volumes"] == (
+        (measurement_dir.resolve(), measurement_dir.resolve()),
+    )
+    assert captured["env"] == {"EXACT_ENV": "1"}
     assert response["measure"]["consumed"] is True
 
 
@@ -449,7 +563,7 @@ def test_measure_worker_uses_selected_python_and_composed_pythonpath(
 
 
 @pytest.mark.gpu
-def test_measure_kernel_writes_artifacts_end_to_end(tmp_path):
+def test_measure_kernel_writes_artifacts_end_to_end(tmp_path, monkeypatch):
     from pathlib import Path
 
     pytest.importorskip("torch")
@@ -464,6 +578,9 @@ def test_measure_kernel_writes_artifacts_end_to_end(tmp_path):
     if not find_idle_gpus():
         pytest.skip("no idle GPU available for the measure smoke run")
 
+    # The host worker: the plots need matplotlib, which the images leave out
+    # (a missing renderer only skips them).
+    monkeypatch.setenv("VIBESIM_PROFILE_RUNTIME", "host")
     output_dir = tmp_path / "measure_smoke"
     result = measure_kernel(
         "single_gemm",

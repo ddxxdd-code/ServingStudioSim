@@ -1,0 +1,278 @@
+//! KV compression: partial-state save plus compress/normalize/RoPE/store, as one compound.
+
+use std::collections::BTreeSet;
+
+use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
+use crate::timing::cache::{CacheKind, Extrapolation};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
+use crate::timing::sweep::{Axis, Coords, SweepGrid};
+use crate::timing::{Dim, KernelConfig, SweepCoords};
+
+/// Bytes of one `fp8_ds_mla` cache row, as this kind stores it and the gather
+/// and decode kinds read it: 448 fp8 values, 64 bf16 rope values and 8 scale
+/// bytes.
+pub const FP8_DS_MLA_ROW_BYTES: u32 = 584;
+
+/// Bytes of one `fp8_indexer` cache row, the 128-wide indexer head this kind
+/// stores on C4 layers: 128 fp8 values and one fp32 scale.
+pub const FP8_INDEXER_ROW_BYTES: u32 = 132;
+
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct KvCompressStoreKernelConfig {
+    #[serde(deserialize_with = "de_backends")]
+    pub backends: Vec<&'static str>,
+    pub gpu_name: String,
+    pub compress_ratio: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: Dim,
+    pub rope_head_dim: Dim,
+    pub logical_block_size: u32,
+    #[compute_dtype]
+    pub state_dtype: DType,
+    pub norm_dtype: DType,
+    #[kv_dtype]
+    pub kv_dtype: DType,
+    pub cache_dtype: String,
+    pub cache_layout: String,
+    pub scale_format: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct KvCompressStoreKernelInput {
+    pub row_positions: Vec<u32>,
+    pub row_request_ids: Vec<u32>,
+    pub state_block_table_width: u32,
+}
+
+impl KvCompressStoreKernelInput {
+    fn work(&self, compress_ratio: u32) -> (u32, u32) {
+        assert!(!self.row_positions.is_empty());
+        assert_eq!(self.row_positions.len(), self.row_request_ids.len());
+        assert!(self.state_block_table_width > 0);
+        let request_count = self.row_request_ids.iter().copied().max().unwrap() + 1;
+        assert_eq!(
+            self.row_request_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            (0..request_count).collect()
+        );
+        let active = self
+            .row_positions
+            .iter()
+            .filter(|&&position| (position + 1) % compress_ratio == 0)
+            .count() as u32;
+        (self.row_positions.len() as u32, active)
+    }
+}
+
+impl SweepCoords for KvCompressStoreKernelInput {
+    fn coords(&self) -> Coords {
+        // The active-row coordinate depends on the Config's compression ratio.
+        Coords::new([self.row_positions.len() as f64, 0.0])
+    }
+
+    fn coord_field_names() -> &'static [&'static str] {
+        &["num_tokens", "num_active_tokens"]
+    }
+}
+
+fn canonical_input(
+    num_tokens: u32,
+    num_active_tokens: u32,
+    compress_ratio: u32,
+) -> KvCompressStoreKernelInput {
+    let request_count = num_tokens.min(64);
+    let row_request_ids = (0..num_tokens)
+        .map(|row| row % request_count)
+        .collect::<Vec<_>>();
+    let row_positions = (0..num_tokens)
+        .map(|row| {
+            let request_ordinal = row / request_count;
+            if row < num_active_tokens {
+                compress_ratio - 1 + request_ordinal * compress_ratio
+            } else {
+                request_ordinal * compress_ratio
+            }
+        })
+        .collect::<Vec<_>>();
+    let state_block_size = if compress_ratio == 4 { 4 } else { 8 };
+    let state_block_table_width =
+        row_positions.iter().copied().max().unwrap_or(0) / state_block_size + 1;
+    KvCompressStoreKernelInput {
+        row_positions,
+        row_request_ids,
+        state_block_table_width,
+    }
+}
+
+/// The profiler's logical bytes: each active row's window of fp32 state pairs
+/// and its stored cache row, and every row's metadata and saved partial state.
+fn logical_bytes(config: &KvCompressStoreKernelConfig, input: &KvCompressStoreKernelInput) -> f64 {
+    let ratio = config.compress_ratio;
+    let head_dim = config.head_dim.get();
+    // (compression window, state width, cache row bytes), as the runners set them.
+    let (window, state_width, row_bytes) = match (head_dim, ratio) {
+        (512, 4) => (8, 1024, FP8_DS_MLA_ROW_BYTES),
+        (512, _) => (ratio, 512, FP8_DS_MLA_ROW_BYTES),
+        _ => (8, 512, FP8_INDEXER_ROW_BYTES),
+    };
+    let (rows, active) = input.work(ratio);
+    let (rows, active) = (f64::from(rows), f64::from(active));
+    active * f64::from(window * head_dim * 2 * 4)
+        + active * f64::from(row_bytes)
+        + rows * 28.0
+        + rows * f64::from(state_width * 20 + 16)
+}
+
+pub struct KvCompressStoreSpec;
+
+fn validate_config(config: &KvCompressStoreKernelConfig) {
+    assert_eq!(config.num_kv_heads, 1);
+    assert_eq!(config.rope_head_dim.get(), 64);
+    assert_eq!(config.logical_block_size, 256);
+    assert_eq!(config.state_dtype, DType::Fp32);
+    assert_eq!(config.norm_dtype, DType::Bf16);
+    assert_eq!(config.kv_dtype, DType::Fp8E4m3);
+    assert_eq!(config.cache_layout, "block_segregated_data_then_scales");
+    match config.head_dim.get() {
+        512 => {
+            assert!(matches!(config.compress_ratio, 4 | 128));
+            assert_eq!(config.backends, ["vllm_cutedsl"]);
+            assert_eq!(config.cache_dtype, "fp8_ds_mla");
+            assert_eq!(config.scale_format, "ue8m0");
+        }
+        128 => {
+            assert_eq!(config.compress_ratio, 4);
+            assert_eq!(config.backends, ["vllm_triton"]);
+            assert_eq!(config.cache_dtype, "fp8_indexer");
+            assert_eq!(config.scale_format, "fp32_per_token");
+        }
+        head_dim => panic!("unsupported compressor head_dim {head_dim}"),
+    }
+}
+
+impl KernelSpec for KvCompressStoreSpec {
+    type Config = KvCompressStoreKernelConfig;
+    type Input = KvCompressStoreKernelInput;
+
+    const KIND: KernelKind = "kv_compress_store";
+
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        validate_config(config);
+        // This compound has two smooth work terms: save-partial-state scales
+        // with all rows, while compress/store scales with boundary-active rows.
+        // Crossing the dense shared token axis with itself would profile 1,595
+        // feasible points per config without introducing a device dispatch
+        // boundary. Power-of-two anchors retain decode through 8K prefill while
+        // keeping the 2D interpolation surface measurable and auditable.
+        SweepGrid::new(vec![
+            Axis::pow2(0, 13),
+            Axis::chain([Axis::values([0]), Axis::pow2(0, 13)]),
+        ])
+    }
+
+    fn cache_kind(_backend: &'static str) -> CacheKind {
+        CacheKind::Cache2DLinear(Extrapolation::Weighted)
+    }
+
+    fn cache_coords(config: &Self::Config, input: &Self::Input) -> Coords {
+        let (num_tokens, num_active_tokens) = input.work(config.compress_ratio);
+        Coords::new([f64::from(num_tokens), f64::from(num_active_tokens)])
+    }
+
+    fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
+        grid.expand_2d(|num_tokens, num_active_tokens| num_active_tokens > num_tokens)
+    }
+
+    /// Past the grid the kernel holds its bandwidth: on H200 the largest
+    /// measured points sit within 35% of their neighbor's bandwidth and up to
+    /// 87% off its TFLOPS.
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Bandwidth(logical_bytes(config, input))
+    }
+
+    fn enumerate(
+        config: &Self::Config,
+        grid: &SweepGrid,
+        backend: &'static str,
+    ) -> Vec<ArgsPayload> {
+        grid.expand_2d(|num_tokens, num_active_tokens| {
+            let input = canonical_input(
+                num_tokens as u32,
+                num_active_tokens.min(num_tokens) as u32,
+                config.compress_ratio,
+            );
+            ArgsPayload::new()
+                .with("backend", backend)
+                .with("row_positions", input.row_positions)
+                .with("row_request_ids", input.row_request_ids)
+                .with("state_block_table_width", input.state_block_table_width)
+                .with("compress_ratio", config.compress_ratio)
+                .with("num_kv_heads", config.num_kv_heads)
+                .with("head_dim", config.head_dim.get())
+                .with("rope_head_dim", config.rope_head_dim.get())
+                .with("logical_block_size", config.logical_block_size)
+                .with("rms_eps", 1.0e-6_f64)
+                .with("state_dtype", config.state_dtype.as_str())
+                .with("norm_dtype", config.norm_dtype.as_str())
+                .with("cache_dtype", config.cache_dtype.clone())
+                .with("cache_layout", config.cache_layout.clone())
+                .with("scale_format", config.scale_format.clone())
+        })
+    }
+}
+
+register_kernel!(KvCompressStoreKernel, KvCompressStoreSpec);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_topology_has_the_requested_boundary_count() {
+        for compress_ratio in [4, 128] {
+            let input = canonical_input(128, 17, compress_ratio);
+            assert_eq!(input.work(compress_ratio), (128, 17));
+            assert_eq!(input.row_request_ids.iter().copied().max(), Some(63));
+            for request in 0..64 {
+                let positions = input
+                    .row_positions
+                    .iter()
+                    .zip(&input.row_request_ids)
+                    .filter_map(|(&position, &row_request)| {
+                        (row_request == request).then_some(position)
+                    })
+                    .collect::<Vec<_>>();
+                assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            }
+        }
+    }
+
+    #[test]
+    fn logical_bytes_match_measured_rows() {
+        // Profiled H200 rows' logged bandwidth x time, one per backend.
+        let input = KvCompressStoreKernelInput {
+            row_positions: vec![3, 0, 0, 0],
+            row_request_ids: vec![0, 1, 2, 3],
+            state_block_table_width: 1,
+        };
+        for (config, expected) in [
+            (
+                serde_json::json!({"gpu_name": "NVIDIA H200", "compress_ratio": 4, "num_kv_heads": 1, "head_dim": 512, "rope_head_dim": 64, "logical_block_size": 256, "state_dtype": "fp32", "norm_dtype": "bf16", "cache_dtype": "fp8_ds_mla", "cache_layout": "block_segregated_data_then_scales", "scale_format": "ue8m0", "backends": ["vllm_cutedsl"], "kv_dtype": "fp8_e4m3"}),
+                115_448.0,
+            ),
+            (
+                serde_json::json!({"gpu_name": "NVIDIA H200", "compress_ratio": 4, "num_kv_heads": 1, "head_dim": 128, "rope_head_dim": 64, "logical_block_size": 256, "state_dtype": "fp32", "norm_dtype": "bf16", "cache_dtype": "fp8_indexer", "cache_layout": "block_segregated_data_then_scales", "scale_format": "fp32_per_token", "backends": ["vllm_triton"], "kv_dtype": "fp8_e4m3"}),
+                49_460.0,
+            ),
+        ] {
+            let config: KvCompressStoreKernelConfig = serde_json::from_value(config).unwrap();
+            assert_eq!(logical_bytes(&config, &input), expected);
+        }
+    }
+}

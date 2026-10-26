@@ -1,6 +1,6 @@
 ---
 name: impl-validate-kernel-cache
-description: "Use when implementing the cache-fidelity validation leaf for an VibeSim L1 kernel Rust cost cache. Measure or compare INTERPOLATION / EXTRAPOLATION / QUANTIZATION fidelity against perf_api ground truth at off-grid, extrapolated, or bucket-boundary shapes. Covers any registered KernelSpec. NOT for profiling existing rows or batch-aggregation fidelity."
+description: "Use when implementing the cache-fidelity validation leaf for a ServingStudio Sim L1 kernel Rust cost cache. Measure or compare INTERPOLATION / EXTRAPOLATION / QUANTIZATION fidelity against perf_api ground truth at off-grid, extrapolated, or bucket-boundary shapes. Covers any registered KernelSpec. NOT for profiling existing rows or batch-aggregation fidelity."
 ---
 
 # Impl Validate Kernel Cache Fidelity
@@ -16,6 +16,15 @@ cache variants if the codebase provides one. This is the cache's
   behavior between rows, beyond rows, or at bucket boundaries.
 - **batch-aggregation fidelity** (`agent-trace/attention_cache_fidelity.md`) — how
   an L2 op collapses a heterogeneous batch into one shape. Separate concern.
+
+## Keep the effort proportional to the kernel's share
+
+Validation effort follows the kernel's measured share of iteration time, from
+the real-engine capture (`top-add-new-arch` Phase 0). A kernel that dominates an
+engine phase deserves a full probe set and a remediation attempt; a minor kernel
+needs one pass. Either way, when the bar still fails, record the failing regions
+and move on. Phase 5 alignment shows whether the error matters end to end, and
+that evidence is what justifies more cache work.
 
 ## Architecture (why it can't drift)
 
@@ -57,7 +66,7 @@ Request on stdin, JSON on stdout (tracing goes to stderr — stdout stays pure):
 
 This is all `cache_fidelity.py::ground_truth` does — no per-kernel Python.
 
-## The harness — `main/tools/cache-fidelity-analyzer/`
+## The harness — `ServingStudioSim/tools/cache-fidelity-analyzer/`
 
 - **`cache_fidelity.py`** — generic, kernel-agnostic core + CLI. Exposes
   `kernel_query`, `query_grid`, `eval_kind`, `ground_truth`, `generic_probes`,
@@ -76,7 +85,7 @@ cell midpoints, cross-axis diagonal, beyond-grid extrapolation) automatically,
 1D/2D/3D alike.
 
 ```bash
-cd main
+cd ServingStudioSim
 uv run cargo build --release -p simulator        # kernel-query lives in this binary
 # cfg.json = full KernelConfig, e.g.
 #   {"backends":["cutlass"],"gpu_name":"NVIDIA H200","n":4096,"k":4096,"dtype":"bf16"}
@@ -104,7 +113,7 @@ them) and physical specs to perf_api — the re-axis stays invisible. Use
 `truth_kind=` if a variant profiles through another kind's table (`profile_kind`).
 
 ```bash
-cd main
+cd ServingStudioSim
 uv run python tools/cache-fidelity-analyzer/flashinfer_attn_fidelity.py \
     --model-config model/config/llama3_8b.json --gpu-name "NVIDIA H200" \
     --backends fa2,fa3 --log-dir logs/<YYYYMMDD_N_cache_fidelity>/fidelity
@@ -119,23 +128,46 @@ cells. A CSV of per-probe rows lands in `--log-dir`. `ratio < 1` = the cache
 under-estimates time (too optimistic); `> 1` = over-estimates.
 
 Treat command success as transport only; validation means the final ratios are
-acceptable under the user-specified threshold, or the default ±15% bar. If the
-error is too large, classify the failure before changing code:
+acceptable under the user-specified threshold, or the default ±15% bar. When
+the error is too large and the kernel's share justifies a fix, classify the
+failure before changing code:
 
 - interior interpolation error → consider a denser sweep grid, a different
   built-in cache kind, or an existing fitted variant;
-- extrapolation error → widen the profiled grid or narrow the supported domain;
+- extrapolation error → give the spec an `off_grid` policy (hold the edge's
+  TFLOPS or bandwidth, whichever the largest measured shapes keep flat, or split
+  independent launches), or widen the profiled grid. Do not narrow the supported
+  domain for a shape the production kernel runs;
 - direct-cache quantization error → add bucket-boundary probes, then consider
   denser buckets or a non-direct cache;
 - re-axis/domain error → verify probes are physical query points and revise the
   re-axis if the projection is wrong;
-- noisy backend measurements → rerun/pre-warm before treating it as a cache
-  design problem.
+- noisy backend measurements → rerun the failing probes once before treating
+  it as a cache design problem.
 
-Ask the user before accepting a known inaccurate region, materially increasing
-profiling cost with a denser grid, adding a new cache/fitting mechanism, or
-changing the public query/input contract. After any remediation, rerun fidelity
-and report the new final CSV/log summary.
+Ask the user before materially increasing profiling cost with a denser grid,
+adding a new cache/fitting mechanism, or changing the public query/input
+contract. A known inaccurate region needs no approval: record it and move on.
+After any remediation, rerun fidelity and report the new final CSV/log summary.
+
+Grid refinement must preserve the 500-feasible-coordinate design ceiling from
+`orchestrator-wire-kernel-to-rust`. If a denser candidate would exceed it, do
+not split the profiling work across calls. Remove non-independent axes or
+unreachable shapes, improve the physical projection or cache policy, or narrow
+the supported domain. Then validate the smaller grid against representative
+off-grid physical demand.
+
+Do not add an axis merely because an upstream artifact exposes it. First compare
+the absolute timing effect at matched shapes, the fidelity gain, feasible-grid
+growth, and DB migration cost. Aggregate coordinates are invalid when they hide
+planner, page-lookup, or branch topology; in that case retain exact ragged input
+for identity/provenance and define a source-backed cache projection. Keep
+runtime allocation capacity distinct from checkpoint capability.
+
+When workload derivation or the physical input contract changes, treat old rows
+as belonging to the old contract and re-profile. Cache compatibility is never a
+reason to preserve a model-specific legacy transformation that production no
+longer uses.
 
 ## Gotchas (hard-won)
 

@@ -11,6 +11,10 @@ file exists rather than a flag on the vLLM one:
 * **Flag spellings.** `--model-path`, `--tp-size`, `--chunked-prefill-size`,
   `--mem-fraction-static` where vLLM says `--model`, `--tensor-parallel-size`,
   `--max-num-batched-tokens`, `--gpu-memory-utilization`.
+* **One knob that is not a spelling difference.** `max_cudagraph_capture_size`
+  counts tokens for vLLM and has no SGLang counterpart in the same unit, so
+  `build_server_argv` rejects it instead of forwarding it to a request-count
+  flag.
 * **Targeted capture.** vLLM has a dedicated `--profiler-config.profiler=cuda`
   launch flag; SGLang instead takes the activity per request, so the capture is
   armed with `{"activities": ["CUDA_PROFILER"]}` on `/start_profile` and needs no
@@ -70,6 +74,38 @@ NSYS_CAPTURE_SERVER_ARGS: tuple[str, ...] = ()
 TIMING_INSTRUMENTATION_OFF_ENV = {"SGLANG_ENABLE_NVTX_SCHEDULER": "0"}
 
 
+def validate_nsys_capture_environment(
+    fork_python: str,
+    *,
+    env: dict[str, str],
+    cwd: Path,
+) -> None:
+    """Require the optional package that emits SGLang's iteration ranges.
+
+    SGLang only warns when ``nvtx`` is unavailable and then continues serving.
+    An NSYS run would therefore finish with millions of kernels but no
+    ``sglang_iteration(N): forward`` ranges to attribute them to. Refuse that
+    expensive unusable capture before launching the server.
+    """
+    probe = subprocess.run(
+        [fork_python, "-c", "import nvtx"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=cwd,
+        timeout=30,
+    )
+    if probe.returncode != 0:
+        detail = probe.stderr.strip() or probe.stdout.strip() or "import failed"
+        raise RuntimeError(
+            f"the SGLang fork venv cannot import `nvtx`: {fork_python}\n"
+            "SGLang would serve without iteration markers, leaving captured "
+            "kernels unattributed. Install it with:\n"
+            f"  uv pip install --python {fork_python} nvtx\n"
+            f"Import error: {detail}"
+        )
+
+
 def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
     """The `python -m sglang.launch_server ...` argv."""
     argv = [
@@ -100,7 +136,22 @@ def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
     if cfg.enforce_eager:
         argv.append("--disable-cuda-graph")  # every kernel is a normal launch
     if cfg.max_cudagraph_capture_size is not None:
-        argv += ["--cuda-graph-max-bs", str(cfg.max_cudagraph_capture_size)]
+        # vLLM's field is a token ceiling. SGLang's nearest flag,
+        # --cuda-graph-max-bs-decode, counts concurrent decode requests. There
+        # is no conversion between those independent quantities; forwarding a
+        # 2,048-token chunk budget would ask SGLang to capture graphs for 2,048
+        # requests and can make startup appear hung.
+        raise ValueError(
+            "server.max_cudagraph_capture_size is a vLLM token ceiling and has no "
+            "SGLang equivalent: --cuda-graph-max-bs-decode counts requests, not "
+            "tokens. Drop the field for engine: sglang and, if a decode-graph "
+            "ceiling is wanted, pass --cuda-graph-max-bs-decode in server.extra_args."
+        )
+    if cfg.api_server_count is not None:
+        raise ValueError(
+            "server.api_server_count selects vLLM HTTP API processes and has no "
+            "SGLang equivalent; drop the field for engine: sglang."
+        )
     if cfg.served_model_name:
         argv += ["--served-model-name", cfg.served_model_name]
     argv += list(cfg.extra_args)
@@ -149,9 +200,7 @@ def build_server_env(
         library_paths.append(str(torch_lib))
         break
     if library_paths:
-        env["LD_LIBRARY_PATH"] = os.pathsep.join(
-            [*library_paths, env.get("LD_LIBRARY_PATH", "")]
-        )
+        env["LD_LIBRARY_PATH"] = os.pathsep.join([*library_paths, env.get("LD_LIBRARY_PATH", "")])
     return env
 
 
@@ -184,6 +233,7 @@ def write_launch_metadata(
     cfg: ProfileConfig,
     fork_python: str,
     profiler_provenance: dict[str, str] | None,
+    runtime_provenance: dict | None,
 ) -> None:
     """Persist argv + selected env + fork git state next to the server log."""
     keep = (
@@ -194,20 +244,27 @@ def write_launch_metadata(
         "PATH",
         "LD_LIBRARY_PATH",
     )
+    runtime_env = cfg.python_runtime.environment if cfg.python_runtime is not None else {}
     metadata = {
         "schema_version": 1,
         "engine": "sglang",
         "name": cfg.name,
         "argv": launch_argv,
         "server_argv": server_argv,
-        "env": {key: env[key] for key in keep if key in env},
+        "env": {key: env[key] for key in (*keep, *runtime_env) if key in env},
         "server_config": cfg.server.__dict__,
         "nsys_config": cfg.nsys.__dict__,
         "nsys_profiler": profiler_provenance,
+        "python_runtime": runtime_provenance,
         "fork_python": fork_python,
         "fork_git": _git_info(SGLANG_SOURCE_ROOT.parent),
     }
     Path(path).write_text(json.dumps(metadata, indent=2))
+
+
+def speculative_decode_enabled(cfg: ServerConfig) -> bool:
+    # No speculative alignment capture contract is implemented for this driver.
+    return False
 
 
 def _get(url: str, timeout: float = 5.0):
@@ -218,7 +275,7 @@ def _get(url: str, timeout: float = 5.0):
         return None, None
 
 
-def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 120.0) -> None:
+def set_cuda_profile(base_url: str, *, active: bool, timeout: float | None = None) -> None:
     """Arm or disarm the worker-owned CUDA profiler through SGLang's HTTP API.
 
     `activities=["CUDA_PROFILER"]` selects the `cudaProfilerStart/Stop` profiler
@@ -226,6 +283,11 @@ def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 120.0) -> 
     waiting on -- instead of the torch profiler that would write its own trace.
     """
     action = "start_profile" if active else "stop_profile"
+    # Starting only arms CUPTI and should return promptly. Stopping also makes
+    # NSYS finalize the report in the worker, which can take several minutes
+    # for CUDA-graph-node traces with tens of millions of events.
+    if timeout is None:
+        timeout = 120.0 if active else 600.0
     payload = json.dumps({"activities": ["CUDA_PROFILER"]}).encode() if active else b"{}"
     request = urllib.request.Request(
         f"{base_url}/{action}",
@@ -269,7 +331,11 @@ def extract_worker_device_ranks(server_log: Path) -> dict[int, int]:
     return {}
 
 
-def wait_for_idle(base_url: str, idle: IdleWaitConfig) -> bool:
+def verify_server_started(server_log: Path, cfg: ServerConfig) -> None:
+    """SGLang has one HTTP frontend; nothing to confirm."""
+
+
+def wait_for_idle(base_url: str, idle: IdleWaitConfig, cfg: ServerConfig | None = None) -> bool:
     """Poll /v1/loads until every DP rank reports no running or waiting request."""
     if not idle.enabled:
         return True

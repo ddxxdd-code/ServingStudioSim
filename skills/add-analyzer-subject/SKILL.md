@@ -1,6 +1,6 @@
 ---
 name: add-analyzer-subject
-description: Use when adding a new VibeSim analyzer subject (a metric) end to end — the Rust compute side (a report + payload JSON built from a run's parquet via DataFusion) and the Python render side (a matplotlib PNG drawn from the payload). Covers the flat registry, the report/payload contract, the Applies gate, keeping a large run within the speed budget, and — emphatically — reusing the shared session / io / cdf infra and the Python common style / figure / layout helpers instead of re-implementing them. NOT for running an existing analyzer (that is run-moesim-analyzer) or adding an L1 kernel (that is top-add-kernel).
+description: Use when adding a new ServingStudio Sim analyzer subject (a metric) end to end — the Rust compute side (a report + payload JSON built from a run's parquet via DataFusion) and the Python render side (a matplotlib PNG drawn from the payload). Covers the flat registry, the report/payload contract, the Applies gate, keeping a large run within the speed budget, and — emphatically — reusing the shared session / io / cdf infra and the Python common style / figure / layout helpers instead of re-implementing them. NOT for running an existing analyzer (that is run-moesim-analyzer) or adding an L1 kernel (that is top-add-kernel).
 ---
 
 # Add Analyzer Subject
@@ -104,8 +104,7 @@ Read these first and cite the sections you use:
 
 - `doc/analyzer.md` — the analyzer design contract: the report/payload envelope,
   the flat registry, categories = grain + source (find your metric's row or justify
-  a new category), and the applicability/scope gate. It supersedes the archived
-  `old-doc/analyzer.md`.
+  a new category), and the applicability/scope gate.
 - `analyzer/README.md` — the code-matching reference and the **canonical Subjects
   catalog** (every registered subject + what it reads and emits); confirm your
   metric is not a duplicate and note where it will be listed.
@@ -116,7 +115,7 @@ Read these first and cite the sections you use:
     `analyzer/python/throughput/segment_plot.py`, or the simpler
     `analyzer/rust/src/utilization/series.rs` +
     `analyzer/python/utilization/util_plot.py`.
-- The `cost_log` schema (`old-doc/logging.md`) if your source is `cost_log`.
+- The `cost_log` schema (`simulator/src/log/README.md`) if your source is `cost_log`.
 
 ## Decide before coding
 

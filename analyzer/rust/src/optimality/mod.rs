@@ -15,7 +15,9 @@
 //! | R2 Balanced        | real times, Max→mean | **imbalance** (DP/EP straggler)|
 //! | R3 per-config best | work / grid-peak rate | **batching** (small-batch loss)|
 //! | R4 ignore network  | R3, comm leaves→0  | **communication**               |
-//! | R5 hardware limit  | active work unit / matching spec peak | **profiled↔hardware** |
+//! | R4a sustained limit | active work unit / back-to-back GEMM or large copy (`gpu/spec.json` `sustained`) | **kernel gap** |
+//! | R4b achievable peak | active work unit / best measured GEMM or large copy (`profile.db`) | **power gap** (power-capped clocks) |
+//! | R5 hardware limit  | active work unit / matching spec peak | **hardware gap** (achievable↔spec) |
 //! | R6 segmented necessary | Σ per-location semantic rooflines | **redundant work**    |
 //! | R7 scope-fused necessary | one roofline over this scope's semantic work | **fusion** |
 //!
@@ -37,19 +39,22 @@
 //! never inferred from tp×dp×ep. R0/R1 are exact SQL sums over every row; R2..R5
 //! fold a **stride-sampled** set of rows (a location's rates are near-constant
 //! across iterations) and are anchored to the exact R1 by their sampled ratio, so
-//! the ladder stays monotone and the buckets stay exact. The mean-mode fold is
-//! linear, so each rung factors into a precomputed per-leaf weight `α` times that
-//! leaf's value — one dot product per row, and the same `α` gives the additive
-//! per-kernel attribution for the kernel-level bars.
+//! the ladder stays monotone and the buckets stay exact. Each rung substitutes its
+//! leaf values and re-evaluates the row's tree once (`trace::manifest::BalancedFold`):
+//! rank `Max` → mean, stream `Parallel` → max/overlap. The same walk attributes the
+//! value to its leaves, which gives the additive per-kernel attribution for the
+//! kernel-level bars.
 //!
 //! The locked R6/R7 floors are **stratified**, not exact. They used to label every
 //! iteration, which only looked affordable because equal shapes deduplicate — and
 //! they barely do: `decode_kv` is a running sum, so the 8h GLM-5.2 trace had 911,149
-//! distinct shapes across 978,623 iterations, one label per iteration. Every
-//! prefill-carrying iteration is still labeled (0.76% of iterations, 70.7% of the
-//! matmul-token mass, and all of the variance); the decode-only remainder is sampled
-//! to `FLOORS_TARGET_SAMPLED_ITERS` per worker and reweighted in integers so each
-//! worker's weights still sum to its exact iteration count. See
+//! distinct shapes across 978,623 iterations, one label per iteration. The
+//! prefill-carrying iterations are sampled by a hash of `iter_id` to
+//! `FLOORS_TARGET_SAMPLED_PREFILL_ITERS` per worker (a saturated PP stage is all
+//! prefill: 404,476 distinct shapes per stage on an 8 h run), the decode-only
+//! remainder by stride to `FLOORS_TARGET_SAMPLED_ITERS`, and each stratum is
+//! reweighted in integers so each worker's weights still sum to its exact
+//! iteration count. See
 //! `conservation::workload::collect_workload_shapes_by_worker`.
 //!
 //! ## Files
@@ -57,17 +62,21 @@
 //! - `run.rs` — orchestration: `run_optimality` wires the stages and assembles the
 //!   report/payload JSON (+ the `unavailable` degrade paths).
 //! - `prepare.rs` — preparation: interns manifest leaves into locations and
-//!   precomputes each section's fold weights + rate ceilings (`build_section_fold_plans`).
+//!   precomputes each section's rate ceilings (`build_section_fold_plans`).
 //! - `fold.rs` — the algorithm: exact R0/R1 SQL sums + the stride-sampled R2..R5
-//!   mean-fold (`read_exact_worker_totals`, `accumulate_fold`,
+//!   balanced fold (`read_exact_worker_totals`, `accumulate_fold`,
 //!   `leaf_selected_throughput_ms`).
 //! - `levels.rs` — the worker / pool / cluster tiers: rung assembly + rollup +
 //!   level/report JSON.
 //! - `kernel.rs` — the kernel tier: per-location bars, per-worker kernel ladders,
 //!   and analyzer-owned pool/cluster ladder rollups.
 //! - `grid_peaks.rs` — the R3 grid-peak ceiling sidecar.
-//! - `spec.rs` — the R5 GPU-spec compute/bandwidth ceilings.
+//! - `achievable.rs` — the R4b best-measured GEMM / large-copy ceiling sidecar.
+//! - `spec.rs` — the R5 GPU-spec compute/bandwidth ceilings and the R4a
+//!   sustained rates.
 
+mod achievable;
+mod compute_dtype;
 mod floors;
 mod fold;
 mod grid_peaks;
@@ -76,30 +85,37 @@ mod kernel;
 mod ladder;
 mod levels;
 mod location;
+mod pipeline;
 mod prepare;
 mod run;
+mod scoped;
 mod spec;
 
 pub(crate) use iteration::{
     iteration_kernel_ladder, iteration_waterfall, prediction_kernel_ladder, prediction_waterfall,
 };
 pub use run::run_optimality;
+pub(crate) use scoped::{compute_scoped, run_scoped};
 
 /// Waterfall segment order (top of the Real bar → the irreducible floor).
-pub(crate) const BUCKET_KEYS: [&str; 6] = [
+pub(crate) const BUCKET_KEYS: [&str; 8] = [
     "idle",
     "imbalance",
     "batching",
     "communication",
+    "kernel_gap",
+    "power_gap",
     "hardware_gap",
     "hardware_optimal",
 ];
-pub(crate) const RUNG_KEYS: [&str; 6] = [
+pub(crate) const RUNG_KEYS: [&str; 8] = [
     "real",
     "busy",
     "balanced",
     "per_config_best",
     "ignore_network",
+    "sustained_limit",
+    "achievable_limit",
     "hardware_limit",
 ];
 
@@ -115,10 +131,10 @@ pub(crate) const FLOOR_BUCKET_KEYS: [&str; 3] =
 pub(crate) const FLOOR_RUNG_KEYS: [&str; 2] = ["segmented_necessary", "hardware_necessary"];
 
 /// Waterfall bucket keys in top-down order, with the green split into the three floor
-/// sub-buckets when the labeler floors are present (else the plain 6).
+/// sub-buckets when the labeler floors are present (else the plain 8).
 pub(crate) fn bucket_keys(with_floors: bool) -> Vec<&'static str> {
     if with_floors {
-        BUCKET_KEYS[..5]
+        BUCKET_KEYS[..7]
             .iter()
             .copied()
             .chain(FLOOR_BUCKET_KEYS)
@@ -136,11 +152,13 @@ pub(crate) fn rung_keys(with_floors: bool) -> Vec<&'static str> {
         RUNG_KEYS.to_vec()
     }
 }
-/// The four attributable rungs a kernel carries (R2..R5); no idle/imbalance.
-pub(crate) const KERNEL_RUNG_KEYS: [&str; 4] = [
+/// The six attributable rungs a kernel carries (R2..R5 with R4a, R4b); no idle/imbalance.
+pub(crate) const KERNEL_RUNG_KEYS: [&str; 6] = [
     "balanced",
     "per_config_best",
     "ignore_network",
+    "sustained_limit",
+    "achievable_limit",
     "hardware_limit",
 ];
 
@@ -152,12 +170,18 @@ pub(crate) const TARGET_SAMPLED_ITERS: u64 = 80;
 /// Deliberately its own target, three orders of magnitude above
 /// `TARGET_SAMPLED_ITERS`: that one sizes a sample of per-location *rates*, which are
 /// near-constant across a run, whereas a workload *shape* drifts as context grows.
-/// Prefill-carrying iterations are not sampled at all (see
-/// `collect_workload_shapes_by_worker`); the labeler costs roughly 0.06 ms per
-/// distinct shape, so 50,000 keeps this stage at a few seconds against the ~49 s the
-/// rest of the subject takes. No upper clamp on the resulting stride: a longer run
-/// samples harder rather than labeling more.
+/// Prefill-carrying iterations have their own target,
+/// [`FLOORS_TARGET_SAMPLED_PREFILL_ITERS`]; the labeler costs roughly 0.06 ms per
+/// distinct decode shape, so 50,000 keeps this stage at a few seconds against the
+/// ~49 s the rest of the subject takes. No upper clamp on the resulting stride: a
+/// longer run samples harder rather than labeling more.
 pub(crate) const FLOORS_TARGET_SAMPLED_ITERS: u64 = 50_000;
+
+/// Prefill-carrying iterations kept per worker for the locked floors. A prefill
+/// shape costs the labeler far more than a decode one (a PP8 stage's 404,476
+/// shapes took ~143 s), and 10,000 hashed draws hold the floors' sampling error
+/// near 1% of the stratum's spread.
+pub(crate) const FLOORS_TARGET_SAMPLED_PREFILL_ITERS: u64 = 10_000;
 
 /// Top-N kernels drawn as individual bars at the kernel level; the rest fold into
 /// an `other` bar so the figure stays legible on a many-location deployment.
@@ -198,6 +222,13 @@ pub(crate) fn ratio(num: f64, den: f64) -> f64 {
         0.0
     }
 }
+
+#[cfg(test)]
+mod glm53_tests;
+#[cfg(test)]
+mod inkling_tests;
+#[cfg(test)]
+mod speculative_tests;
 
 #[cfg(test)]
 mod tests {

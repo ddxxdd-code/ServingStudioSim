@@ -44,9 +44,9 @@ policies over `tests/fixtures/distributed_kv.csv`, a small chained session.
 
 | Selector | KV ownership | Admission | Execution | Shell |
 | --- | --- | --- | --- | --- |
-| `remote_cache_unified` | `FullAttnKv` | `RemoteCachePrefillDecodeAdmission` | `UnifiedIterExecution` | `RemoteCacheIterWorker` |
-| `remote_cache_pd_prefill` | `FullAttnKv` + held | `RemoteCachePrefillHandoffAdmission` | `UnifiedIterExecution` | `RemoteCacheIterWorker` |
-| `remote_cache_pd_decode` | `FullAttnKv` + held | Landed ingress in `DecodeCore` | `UnifiedIterExecution` | `RemotePullDecodeWorker` |
+| `remote_cache_unified` | `KvCacheStore` | `RemoteCachePrefillDecodeAdmission` | `UnifiedIterExecution` | `RemoteCacheIterWorker` |
+| `remote_cache_pd_prefill` | `KvCacheStore` + held | `RemoteCachePrefillHandoffAdmission` | `UnifiedIterExecution` | `RemoteCacheIterWorker` |
+| `remote_cache_pd_decode` | `KvCacheStore` + held | Landed ingress in `DecodeCore` | `UnifiedIterExecution` | `RemotePullDecodeWorker` |
 | `distributed_kv_store` | `SessionStore` | None | None | `KvStoreWorker` |
 
 `KvStoreWorker` is a storage-only `IterWorker`. Its `SessionStore` owns the
@@ -357,3 +357,12 @@ The CPU CI commands also passed in a separate Python environment containing
 only pytest, PyArrow, PyYAML and asteval (no Torch or Transformers). Subsequent
 audit hardening passed 13 Python tests, including missing-stream and early
 pin/unpin counterexamples, and all 37 existing runs passed the stronger audit.
+
+## Upstream main integration (2026-10-21)
+
+Remote workers use the shared `KvCacheStore` and `KvAccounting` introduced on
+upstream main. Their token-count transfer protocol requires a linear per-token
+layout without recurrent checkpoints; deployment construction rejects other
+layouts. Local and remote PD workers share `DecodeCore`, including upstream
+iteration plans and layout-derived transfer sizes. Historical measurements
+below the earlier audit sections predate this integration.

@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
-use crate::timing::bridge::{ArgsPayload, KernelKind, KernelMetrics, PerfApiBridge};
-use crate::timing::cache::interp::LeafMetrics;
+use crate::timing::bridge::{ArgsPayload, ConfigGrid, KernelKind, KernelMetrics, PerfApiBridge};
+use crate::timing::cache::interp::{CoverageFlags, LeafMetrics};
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning, PeakRates};
 use crate::timing::result::CacheProbe;
 use crate::timing::sweep::{SweepCoords, SweepGrid};
@@ -34,6 +34,15 @@ pub trait KernelConfig:
     /// Auto-derived as `"{StructName}.backends"`.
     const BACKENDS_FIELD: &'static str;
 
+    /// The field tagged `#[compute_dtype]`, if any. Derived.
+    const COMPUTE_DTYPE_FIELD: Option<&'static str> = None;
+    /// The `Option<DType>` field tagged `#[compute_dtype_override]`, if any:
+    /// when set it is the compute dtype instead of `COMPUTE_DTYPE_FIELD`'s
+    /// value. Derived.
+    const COMPUTE_DTYPE_OVERRIDE_FIELD: Option<&'static str> = None;
+    /// The field tagged `#[kv_dtype]`, if any. Derived.
+    const KV_DTYPE_FIELD: Option<&'static str> = None;
+
     /// The GPU whose profiled rows this config caches. Part of the config
     /// identity (`Hash + Eq`), so distinct GPUs are distinct kernels / caches;
     /// passed to the bridge at `build` (`get_times` / `count_missing`) as the DB
@@ -43,7 +52,8 @@ pub trait KernelConfig:
     /// The compute/activation dtype (a GEMM's `dtype`, attention's `q_dtype`), or
     /// `None` for a dtype-agnostic kernel (size-keyed comm, byte-keyed
     /// elementwise). `#[derive(KernelConfig)]` overrides the default from the
-    /// field tagged `#[compute_dtype]`. Emitted as a typed field in the enumerate
+    /// field tagged `#[compute_dtype]`, or from the `#[compute_dtype_override]`
+    /// field when that one is set. Emitted as a typed field in the enumerate
     /// record so the launcher's capability gate reads it directly — never
     /// re-parses `describe_config`.
     fn compute_dtype(&self) -> Option<DType> {
@@ -61,6 +71,23 @@ pub trait KernelConfig:
     /// introspection and presentation. `Dim` values retain formula provenance.
     fn describe_config(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("KernelConfig must serialize to JSON")
+    }
+
+    /// The config's identity in its kernel-config record: every
+    /// field except `gpu_name` and `backends`, which profile.db rows key in
+    /// their own columns, with each `Dim` reduced to its value. Two configs
+    /// that fold to the same shape share one identity however their dims were
+    /// derived.
+    fn identity(&self) -> serde_json::Value {
+        let mut identity = crate::timing::dims::values_only(|| {
+            serde_json::to_value(self).expect("KernelConfig must serialize to JSON")
+        });
+        let fields = identity
+            .as_object_mut()
+            .expect("KernelConfig must serialize as a struct");
+        fields.remove("gpu_name");
+        fields.remove("backends");
+        identity
     }
 
     /// The `symbol -> value` legend for this config's `Dim` shape fields — the
@@ -127,11 +154,52 @@ pub trait KernelSpec: 'static {
     fn infeasible_mask(_config: &Self::Config, _grid: &SweepGrid) -> Vec<bool> {
         Vec::new()
     }
+
+    /// How `backend` answers an input past the profiled grid. Only called for
+    /// such inputs. Default: [`OffGrid::Cache`], the cache's own extrapolation.
+    fn off_grid(
+        _config: &Self::Config,
+        _input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Cache
+    }
     fn enumerate(
         config: &Self::Config,
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload>;
+
+    /// Reject a config whose external inputs cannot be read, before anything
+    /// builds on them.
+    ///
+    /// `enumerate` has no error channel -- it fills a grid, and a kernel with
+    /// nothing to say about a cell has no way to say so -- which is right for
+    /// the arithmetic every kernel does there, but not for a config that names
+    /// a file. An arch builder proves such a file readable when it constructs
+    /// the config; a config deserialized straight from JSON never went through
+    /// one, so this runs at that boundary instead.
+    ///
+    /// Default: nothing to check.
+    fn validate_config(_config: &Self::Config) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A backend's answer for an input past its profiled grid, picked per spec by
+/// how the kernel scales there.
+pub enum OffGrid<I> {
+    /// Extend the cache's interpolant.
+    Cache,
+    /// Hold the nearest grid point's achieved bandwidth, given the input's
+    /// logical bytes. The bytes must be counted the way the profiler counts
+    /// them for that backend, since the grid point's bandwidth comes from the
+    /// profiler's own counts. A spec picks it when its kernel's bandwidth
+    /// measured flat across its largest shapes.
+    Bandwidth(f64),
+    /// The input runs as these independent launches, one after another: the
+    /// answer is the sum of theirs.
+    Launches(Vec<I>),
 }
 
 /// Generic kernel struct. Per-kernel files export
@@ -175,6 +243,20 @@ impl<S: KernelSpec> Kernel<S> {
             config.backends().len(),
             LeafMetrics::NO_BACKEND,
         );
+
+        // Kernel-config records: record the config and the grid it asks for,
+        // whatever the mode. Recording enumerates the grid itself, so it does not
+        // depend on which of the paths below runs.
+        if bridge.records_configs() {
+            bridge.record_config(
+                &name,
+                S::KIND,
+                S::profile_kind(),
+                config.gpu_name(),
+                config.identity(),
+                || config_grid::<S>(&config),
+            )?;
+        }
 
         // Enumerate mode (`emit-backends`): record this kernel's structural facts
         // and return an empty kernel WITHOUT any profile.db lookup. GPU-free and
@@ -230,6 +312,8 @@ impl<S: KernelSpec> Kernel<S> {
             let mut total = 0;
             for &backend in backends {
                 let specs = drop_infeasible(S::enumerate(&config, &sweep_grid, backend));
+                let specs =
+                    bridge.unique_dry_run_specs(S::profile_kind(), config.gpu_name(), specs);
                 total += specs.len();
                 missing += bridge
                     .count_missing(specs, S::profile_kind(), backend, config.gpu_name())
@@ -297,9 +381,45 @@ impl<S: KernelSpec> Kernel<S> {
 
     /// All-four-metrics best-of-N for the CostTree eval path: return the
     /// [`LeafMetrics`] from the backend with the smallest non-negative wallclock,
-    /// preserving that backend's coverage bits.
+    /// preserving that backend's coverage bits. A covered answer always beats a
+    /// [`CoverageFlags::NO_COVERAGE`] one.
+    ///
+    /// Each backend answers an input past its grid as its spec's
+    /// [`KernelSpec::off_grid`] says.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
         let coords = S::cache_coords(&self.config, input);
+        self.best_of(|index, backend_cache| self.eval_backend(index, backend_cache, input, &coords))
+    }
+
+    fn eval_backend(
+        &self,
+        index: usize,
+        backend_cache: &BackendCache,
+        input: &S::Input,
+        coords: &Coords,
+    ) -> LeafMetrics {
+        if backend_cache.contains(coords) {
+            return backend_cache.eval(coords);
+        }
+        match S::off_grid(&self.config, input, self.config.backends()[index]) {
+            OffGrid::Cache => backend_cache.eval(coords),
+            OffGrid::Bandwidth(bytes) => backend_cache.eval_at_edge_bandwidth(coords, bytes),
+            OffGrid::Launches(launches) => {
+                let mut total = LeafMetrics::ZERO;
+                for launch in &launches {
+                    let launch_coords = S::cache_coords(&self.config, launch);
+                    total.add(self.eval_backend(index, backend_cache, launch, &launch_coords));
+                }
+                total
+            }
+        }
+    }
+
+    fn eval_cache_coords(&self, coords: &Coords) -> LeafMetrics {
+        self.best_of(|_, backend_cache| backend_cache.eval(coords))
+    }
+
+    fn best_of(&self, eval: impl Fn(usize, &BackendCache) -> LeafMetrics) -> LeafMetrics {
         match self.backend_caches.as_slice() {
             [] => panic!("kernel config validation must create at least one backend cache"),
             [backend_cache] => {
@@ -307,20 +427,29 @@ impl<S: KernelSpec> Kernel<S> {
                 // position-local index (0) so the `cost_log` slot_backend column
                 // carries a real choice, not the [`LeafMetrics::NO_BACKEND`]
                 // sentinel a bare cache eval returns.
-                let mut only = backend_cache.eval(&coords);
+                let mut only = eval(0, backend_cache);
                 only.backend_index = 0;
                 only
             }
             [first_cache, rest @ ..] => {
-                let mut best = first_cache.eval(&coords);
-                let mut best_time_ms = best.m.time_ms.max(0.0);
+                // A backend with no coverage at this input answers a 0-time
+                // `MISS`; it must never undercut a backend that measured it. Rank
+                // covered answers ahead of uncovered ones, then by wallclock.
+                let rank = |leaf: &LeafMetrics| {
+                    (
+                        leaf.coverage.contains(CoverageFlags::NO_COVERAGE),
+                        leaf.m.time_ms.max(0.0),
+                    )
+                };
+                let mut best = eval(0, first_cache);
+                let mut best_rank = rank(&best);
                 let mut best_index = 0u8;
                 for (offset, backend_cache) in rest.iter().enumerate() {
-                    let candidate = backend_cache.eval(&coords);
-                    let candidate_time_ms = candidate.m.time_ms.max(0.0);
-                    if candidate_time_ms < best_time_ms {
+                    let candidate = eval(offset + 1, backend_cache);
+                    let candidate_rank = rank(&candidate);
+                    if candidate_rank < best_rank {
                         best = candidate;
-                        best_time_ms = candidate_time_ms;
+                        best_rank = candidate_rank;
                         best_index = (offset + 1) as u8;
                     }
                 }
@@ -370,6 +499,23 @@ where
         Ok(self.eval(&input))
     }
 
+    fn eval_coords(&self, coords: &[f64]) -> anyhow::Result<LeafMetrics> {
+        let expected_dims = S::sweep_grid(&self.config).axes().len();
+        anyhow::ensure!(
+            coords.len() == expected_dims,
+            "query point has {} cache coordinates for {}D {} grid",
+            coords.len(),
+            expected_dims,
+            S::KIND,
+        );
+        anyhow::ensure!(
+            coords.iter().all(|coordinate| coordinate.is_finite()),
+            "query point for {} contains a non-finite cache coordinate",
+            S::KIND,
+        );
+        Ok(self.eval_cache_coords(&Coords::from_slice(coords)))
+    }
+
     fn peak_rates(&self) -> PeakRates {
         Kernel::peak_rates(self)
     }
@@ -400,6 +546,25 @@ impl<S: KernelSpec> Probe for Kernel<S> {
 /// alias), so adding a kernel touches only that kernel's own file.
 pub(crate) struct KernelQueryEntry {
     pub kind: &'static str,
+    /// The DB kind whose rows the kernel reads (`KernelSpec::profile_kind`).
+    pub profile_kind: fn() -> KernelKind,
+    /// `KernelConfig` fields (serde names): what fixes one kernel instance.
+    pub config_fields: fn() -> &'static [&'static str],
+    /// `Input` fields (serde names): the physical query, which is what the
+    /// profile.db rows sweep.
+    pub input_fields: fn() -> &'static [&'static str],
+    /// The cache coordinates an `Input` projects onto (`SweepCoords`).
+    pub coord_fields: fn() -> &'static [&'static str],
+    pub compute_dtype_field: Option<&'static str>,
+    pub compute_dtype_override_field: Option<&'static str>,
+    pub kv_dtype_field: Option<&'static str>,
+    /// `rows` path: the profile.db rows one config measures and the rows each
+    /// runtime input reads ([`rows_from_json`]). No bridge, DB or GPU.
+    pub rows: fn(
+        serde_json::Value,
+        Option<&str>,
+        &[serde_json::Value],
+    ) -> anyhow::Result<serde_json::Value>,
     /// `eval` path: deserialize config, build the kernel (profiles missing grid
     /// rows), box it for interpolation. Needs the bridge.
     pub build: fn(serde_json::Value, &PerfApiBridge) -> anyhow::Result<Box<dyn CacheProbe>>,
@@ -410,6 +575,9 @@ pub(crate) struct KernelQueryEntry {
         serde_json::Value,
     )
         -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>,
+    /// `identity` path: deserialize a config (a manifest slot's
+    /// `kernel_config`) and give [`KernelConfig::identity`].
+    pub identity: fn(serde_json::Value) -> anyhow::Result<serde_json::Value>,
 }
 
 inventory::collect!(KernelQueryEntry);
@@ -426,10 +594,192 @@ impl KernelQueryEntry {
     {
         KernelQueryEntry {
             kind: S::KIND,
+            profile_kind: S::profile_kind,
+            config_fields: serde_field_names::<S::Config>,
+            input_fields: serde_field_names::<S::Input>,
+            coord_fields: <S::Input as SweepCoords>::coord_field_names,
+            compute_dtype_field: <S::Config as KernelConfig>::COMPUTE_DTYPE_FIELD,
+            compute_dtype_override_field: <S::Config as KernelConfig>::COMPUTE_DTYPE_OVERRIDE_FIELD,
+            kv_dtype_field: <S::Config as KernelConfig>::KV_DTYPE_FIELD,
+            rows: rows_from_json::<S>,
             build: build_probe_from_json::<S>,
             describe: describe_from_json::<S>,
+            identity: identity_from_json::<S>,
         }
     }
+}
+
+/// The profile.db rows one kernel instance measures, and which of them each
+/// runtime input reads. The `rows`-path fn pointer; pure metadata (no bridge,
+/// DB or GPU).
+///
+/// Two transforms, both the kernel's own code:
+/// - config → rows: `enumerate` over `sweep_grid`, one row of DB args per grid
+///   cell, row-major. A column whose value changes across the cells is swept;
+///   one that never changes is fixed by the config.
+/// - input → rows: `cache_coords` places a runtime input in the grid. The rows
+///   it reads are the grid cells around it: on an axis value that value, between
+///   two values both, beyond the grid the nearest edge (`extrapolated`). How the
+///   cache weighs those cells depends on the cache kind and is not reported.
+///
+/// `backend` defaults to the config's first backend.
+fn rows_from_json<S>(
+    config: serde_json::Value,
+    backend: Option<&str>,
+    inputs: &[serde_json::Value],
+) -> anyhow::Result<serde_json::Value>
+where
+    S: KernelSpec,
+    S::Config: serde::de::DeserializeOwned,
+    S::Input: serde::de::DeserializeOwned,
+{
+    use serde_json::{json, Map, Value};
+
+    let config: S::Config = serde_json::from_value(config)
+        .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
+    S::validate_config(&config)?;
+    let backend = match backend {
+        Some(name) => *config
+            .backends()
+            .iter()
+            .find(|b| **b == name)
+            .ok_or_else(|| anyhow::anyhow!("{} config has no backend {name}", S::KIND))?,
+        None => *config
+            .backends()
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("{} config lists no backend", S::KIND))?,
+    };
+    let grid = S::sweep_grid(&config);
+    let axes = grid.axes();
+    let cells = grid.expand(|coords| coords.to_vec());
+    let args = S::enumerate(&config, &grid, backend);
+    anyhow::ensure!(
+        args.len() == cells.len(),
+        "{} enumerate returned {} rows for {} grid cells",
+        S::KIND,
+        args.len(),
+        cells.len()
+    );
+    let infeasible = S::infeasible_mask(&config, &grid);
+
+    let mut swept = Vec::new();
+    let mut fixed = Map::new();
+    for (column, first) in args[0].fields() {
+        if args
+            .iter()
+            .all(|row| row.fields().get(column) == Some(first))
+        {
+            fixed.insert(column.clone(), first.clone());
+        } else {
+            swept.push(column.clone());
+        }
+    }
+
+    let rows: Vec<Value> = cells
+        .iter()
+        .zip(&args)
+        .enumerate()
+        .map(|(i, (coords, row))| {
+            json!({
+                "coords": coords,
+                "args": row.fields(),
+                "feasible": !infeasible.get(i).copied().unwrap_or(false),
+            })
+        })
+        .collect();
+
+    let mut reads = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let parsed: S::Input = serde_json::from_value(input.clone())
+            .map_err(|e| anyhow::anyhow!("input does not match {} Input: {e}", S::KIND))?;
+        let coords = S::cache_coords(&config, &parsed);
+        let mut extrapolated = false;
+        // Per axis, the indices of the cells around the coordinate.
+        let around: Vec<Vec<usize>> = axes
+            .iter()
+            .zip(coords.as_slice())
+            .map(|(axis, &x)| {
+                let last = axis.len() - 1;
+                if x < axis[0] || x > axis[last] {
+                    extrapolated = true;
+                    vec![if x < axis[0] { 0 } else { last }]
+                } else if let Some(i) = axis.iter().position(|&v| v == x) {
+                    vec![i]
+                } else {
+                    let upper = axis
+                        .iter()
+                        .position(|&v| v > x)
+                        .expect("x is inside the axis");
+                    vec![upper - 1, upper]
+                }
+            })
+            .collect();
+        let mut indices = vec![0usize];
+        for (d, picks) in around.iter().enumerate() {
+            let stride: usize = axes[d + 1..].iter().map(Vec::len).product();
+            indices = indices
+                .iter()
+                .flat_map(|base| picks.iter().map(move |p| base + p * stride))
+                .collect();
+        }
+        reads.push(json!({
+            "input": input,
+            "coords": coords.as_slice(),
+            "extrapolated": extrapolated,
+            "rows": indices,
+        }));
+    }
+
+    Ok(json!({
+        "kind": S::KIND,
+        "profile_kind": S::profile_kind(),
+        "backend": backend,
+        "cache_coords": <S::Input as SweepCoords>::coord_field_names(),
+        "grid_axes": axes,
+        "swept": swept,
+        "fixed": fixed,
+        "rows": rows,
+        "inputs": reads,
+    }))
+}
+
+/// The field names serde passes to `deserialize_struct` for `T`: a derived
+/// struct's fields, in order, with any `rename` applied. Read by a deserializer
+/// that records them and then refuses the value, so no `T` is built. Empty for
+/// a type that does not deserialize as a struct (e.g. one with a flattened
+/// field, which deserializes as a map).
+fn serde_field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    use serde::de::{self, Visitor};
+
+    struct Probe<'a>(&'a mut &'static [&'static str]);
+
+    impl<'de> de::Deserializer<'de> for Probe<'_> {
+        type Error = de::value::Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+            Err(de::Error::custom("field-name probe"))
+        }
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = fields;
+            Err(de::Error::custom("field-name probe"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    let mut fields: &'static [&'static str] = &[];
+    let _ = T::deserialize(Probe(&mut fields));
+    fields
 }
 
 /// Deserialize `config` into `S::Config`, build that one kernel, box it as a
@@ -445,6 +795,7 @@ where
 {
     let config: S::Config = serde_json::from_value(config)
         .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
+    S::validate_config(&config)?;
     let kernel = Kernel::<S>::build(S::KIND.to_string(), config, bridge)?;
     Ok(Box::new(kernel))
 }
@@ -462,12 +813,37 @@ where
 {
     let config: S::Config = serde_json::from_value(config)
         .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
+    S::validate_config(&config)?;
     let grid_axes = S::sweep_grid(&config).axes().to_vec();
     Ok((
         config.describe_config(),
         grid_axes,
         <S::Input as SweepCoords>::coord_field_names(),
     ))
+}
+
+/// [`KernelConfig::identity`] of a serialized `S::Config`.
+fn identity_from_json<S>(config: serde_json::Value) -> anyhow::Result<serde_json::Value>
+where
+    S: KernelSpec,
+    S::Config: serde::de::DeserializeOwned,
+{
+    let config: S::Config = serde_json::from_value(config)
+        .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
+    Ok(config.identity())
+}
+
+/// [`KernelConfig::identity`] of a config of kernel `kind`, given as JSON (a
+/// manifest slot's `kernel_config`).
+pub(crate) fn config_identity(
+    kind: &str,
+    config: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let entry = inventory::iter::<KernelQueryEntry>
+        .into_iter()
+        .find(|e| e.kind == kind)
+        .ok_or_else(|| anyhow::anyhow!("no kernel kind {kind:?}"))?;
+    (entry.identity)(config)
 }
 
 /// Declare a kernel's public `Kernel<S>` type alias AND register it for
@@ -485,6 +861,49 @@ pub(crate) use register_kernel;
 
 // ─── internal helpers ───────────────────────────────────────────────────────
 
+/// The grid `config` asks profile.db for: cache axes, the args of each cell
+/// (without `backend`) and the infeasible cells. Enumerates every backend so a
+/// kernel whose args depend on the backend fails here instead of recording
+/// rows that only one backend reads.
+fn config_grid<S: KernelSpec>(config: &S::Config) -> Result<ConfigGrid, BuildError> {
+    let grid = S::sweep_grid(config);
+    let cells_for = |backend: &'static str| -> Vec<BTreeMap<String, serde_json::Value>> {
+        S::enumerate(config, &grid, backend)
+            .into_iter()
+            .map(|payload| {
+                let mut args = payload.fields().clone();
+                args.remove("backend");
+                args
+            })
+            .collect()
+    };
+    let (&first, rest) = config
+        .backends()
+        .split_first()
+        .expect("ensure_has_backends ran before recording");
+    let cells = cells_for(first);
+    for &other in rest {
+        if cells_for(other) != cells {
+            return Err(BuildError::BackendDependentArgs {
+                kind: S::KIND,
+                first,
+                other,
+            });
+        }
+    }
+    let infeasible = S::infeasible_mask(config, &grid)
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &drop)| drop.then_some(i))
+        .collect();
+    Ok(ConfigGrid {
+        cache_coords: <S::Input as SweepCoords>::coord_field_names(),
+        axes: grid.axes().to_vec(),
+        cells,
+        infeasible,
+    })
+}
+
 fn ensure_has_backends(
     kernel_kind: KernelKind,
     field_name: &'static str,
@@ -501,9 +920,12 @@ fn ensure_has_backends(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_has_backends, KernelConfig, KernelSpec};
-    use crate::timing::bridge::{ArgsPayload, KernelKind};
-    use crate::timing::cache::{CacheKind, Extrapolation};
+    use std::marker::PhantomData;
+
+    use super::{ensure_has_backends, Kernel, KernelConfig, KernelSpec};
+    use crate::timing::bridge::{ArgsPayload, KernelKind, KernelMetrics};
+    use crate::timing::cache::interp::CoverageFlags;
+    use crate::timing::cache::{BackendCache, CacheKind, Extrapolation};
     use crate::timing::{BuildError, Coords, SweepCoords, SweepGrid};
 
     #[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize)]
@@ -565,6 +987,98 @@ mod tests {
         }
     }
 
+    /// A 2x2 grid whose cell (1, 1) is infeasible; `by_backend` makes one args
+    /// column follow the backend.
+    struct GridSpec;
+
+    impl KernelSpec for GridSpec {
+        type Config = DefaultCoordsConfig;
+        type Input = DefaultCoordsInput;
+
+        const KIND: KernelKind = "grid_test";
+
+        fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+            SweepGrid::new(vec![vec![1.0, 2.0], vec![10.0, 20.0]])
+        }
+
+        fn cache_kind(_backend: &'static str) -> CacheKind {
+            CacheKind::Cache2DLinear(Extrapolation::Clamp)
+        }
+
+        fn infeasible_mask(_config: &Self::Config, _grid: &SweepGrid) -> Vec<bool> {
+            vec![false, false, false, true]
+        }
+
+        fn enumerate(
+            config: &Self::Config,
+            grid: &SweepGrid,
+            backend: &'static str,
+        ) -> Vec<ArgsPayload> {
+            grid.expand(|coords| {
+                let payload = ArgsPayload::new()
+                    .with("backend", backend)
+                    .with("x", coords[0] as u32)
+                    .with("y", coords[1] as u32);
+                if config.gpu_name == "by_backend" {
+                    payload.with("tile", backend)
+                } else {
+                    payload
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn config_grid_records_args_without_backend_and_infeasible_cells() {
+        let config = DefaultCoordsConfig {
+            backends: vec!["a", "b"],
+            gpu_name: "test-gpu".to_string(),
+        };
+        let grid = super::config_grid::<GridSpec>(&config).expect("grid");
+        assert_eq!(grid.cache_coords, &["x", "y"]);
+        assert_eq!(grid.axes, vec![vec![1.0, 2.0], vec![10.0, 20.0]]);
+        let cells: Vec<_> = grid
+            .cells
+            .iter()
+            .map(|cell| serde_json::to_value(cell).unwrap())
+            .collect();
+        assert_eq!(
+            cells,
+            vec![
+                serde_json::json!({"x": 1, "y": 10}),
+                serde_json::json!({"x": 1, "y": 20}),
+                serde_json::json!({"x": 2, "y": 10}),
+                serde_json::json!({"x": 2, "y": 20}),
+            ]
+        );
+        assert_eq!(grid.infeasible, vec![3]);
+    }
+
+    #[test]
+    fn config_grid_rejects_args_that_follow_the_backend() {
+        let config = DefaultCoordsConfig {
+            backends: vec!["a", "b"],
+            gpu_name: "by_backend".to_string(),
+        };
+        assert!(matches!(
+            super::config_grid::<GridSpec>(&config),
+            Err(BuildError::BackendDependentArgs {
+                kind: "grid_test",
+                first: "a",
+                other: "b",
+            })
+        ));
+    }
+
+    #[test]
+    fn identity_leaves_out_gpu_and_backends() {
+        let config = DefaultCoordsConfig {
+            backends: vec!["a"],
+            gpu_name: "test-gpu".to_string(),
+        };
+        assert_eq!(config.identity(), serde_json::json!({}));
+    }
+
     #[test]
     fn ensure_has_backends_rejects_empty_backend_lists() {
         assert!(matches!(
@@ -584,5 +1098,63 @@ mod tests {
             &*DefaultCoordsSpec::cache_coords(&config, &DefaultCoordsInput),
             &[3.0, 5.0]
         );
+    }
+
+    fn metrics(time_ms: f64) -> KernelMetrics {
+        KernelMetrics {
+            time_ms,
+            tflops: Some(1.0),
+            memory_bandwidth_gbps: Some(1.0),
+            algbw_gbps: None,
+            busbw_gbps: None,
+            energy_j: time_ms,
+        }
+    }
+
+    /// One backend per sample time; NaN drops every cell, so that backend
+    /// answers `MISS` everywhere.
+    fn kernel_with_backends(times: &[f64]) -> Kernel<DefaultCoordsSpec> {
+        let grid = SweepGrid::new(vec![vec![1.0, 2.0], vec![1.0, 2.0]]);
+        let backend_caches = times
+            .iter()
+            .map(|&time_ms| {
+                BackendCache::fit(
+                    DefaultCoordsSpec::KIND,
+                    "test",
+                    CacheKind::Cache2DLinear(Extrapolation::Clamp),
+                    &grid,
+                    &vec![metrics(time_ms); 4],
+                )
+                .unwrap()
+                .0
+            })
+            .collect();
+        Kernel {
+            config: DefaultCoordsConfig {
+                backends: vec!["test"; times.len()],
+                gpu_name: "test-gpu".to_string(),
+            },
+            outlier_warnings: Vec::new(),
+            backend_caches,
+            _spec: PhantomData,
+        }
+    }
+
+    #[test]
+    fn best_of_never_selects_a_backend_without_coverage() {
+        let coords = Coords::new([1.5, 1.5]);
+        for (times, covered_index) in [(vec![f64::NAN, 2.0], 1), (vec![2.0, f64::NAN], 0)] {
+            let leaf = kernel_with_backends(&times).eval_cache_coords(&coords);
+            assert_eq!(leaf.backend_index, covered_index);
+            assert_eq!(leaf.coverage, CoverageFlags::EMPTY);
+            assert_eq!(leaf.m.time_ms, 2.0);
+        }
+
+        let leaf = kernel_with_backends(&[3.0, 2.0]).eval_cache_coords(&coords);
+        assert_eq!((leaf.backend_index, leaf.m.time_ms), (1, 2.0));
+
+        let leaf = kernel_with_backends(&[f64::NAN, f64::NAN]).eval_cache_coords(&coords);
+        assert!(leaf.coverage.contains(CoverageFlags::NO_COVERAGE));
+        assert_eq!(leaf.m.time_ms, 0.0);
     }
 }

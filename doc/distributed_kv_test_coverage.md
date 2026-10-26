@@ -6,6 +6,10 @@ Measured on 2026-10-14 against base
 concrete state, tokens, victims, timing/order, output fields, or a specific
 rejection. No new compile-only test is used to meet the target.
 
+These figures predate the upstream-main merge. The recipe now defaults to
+merged upstream base `d2e31e7838fb6a9a2a12e1164480942f88d46bac`; coverage
+has not been remeasured for that base.
+
 ## Measured coverage
 
 | Language | Covered added executable lines | Total added executable lines | Coverage |

@@ -1,8 +1,9 @@
-"""Command line facade for existing L1 profiling entries.
+"""Command line facade for L1 profiling and profile database maintenance.
 
-This module is intentionally thin: it parses human/agent inputs, then calls the
-generated public functions on ``profiling.perf_api``. It must not call runners
-or ``run_profile_batch`` directly, preserving the L1 entry-point invariant.
+This module is intentionally thin: profile execution and queries call the
+generated public functions on ``profiling.perf_api``; database maintenance
+delegates to ``profiling.db``. It must not call runners or ``run_profile_batch``
+directly, preserving the L1 entry-point invariant.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from profiling.db.registry import KernelProfilerSpec, iter_kernel_profiler_specs
 from profiling.db.table import MissingEntry
 from profiling.facade import run_kind_times
 from profiling.gpu_catalog import resolve_gpu_spec
+from profiling.profilers.energy import energy_enabled, set_energy_enabled
 from profiling.runners.metrics import CommMetrics, ComputeMetrics, Metrics
 
 
@@ -60,7 +62,7 @@ def main(
 def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Run/query existing VibeSim L1 profile entries through profiling.perf_api.",
+        description="Run, query, or maintain ServingStudioSim L1 profile data.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -76,10 +78,21 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
         command_parser = subparsers.add_parser(command, help=help_text)
         _add_common_profile_args(command_parser)
         if command == "run":
-            command_parser.add_argument(
+            # Both flags measure every spec; they differ only in whether the rows
+            # are kept, so one may be given, never both.
+            refresh_group = command_parser.add_mutually_exclusive_group()
+            refresh_group.add_argument(
                 "--force",
                 action="store_true",
                 help="Refresh all specs even when profile.db already has rows.",
+            )
+            refresh_group.add_argument(
+                "--fresh",
+                action="store_true",
+                help=(
+                    "Measure all specs like --force but insert nothing: "
+                    "report the rows and leave profile.db untouched."
+                ),
             )
             command_parser.add_argument(
                 "--output-dir",
@@ -89,6 +102,30 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
                     "Required when invoked from a managed Agent turn."
                 ),
             )
+            energy_group = command_parser.add_mutually_exclusive_group()
+            energy_group.add_argument(
+                "--energy",
+                dest="energy",
+                action="store_true",
+                help=(
+                    "Measure the NVML energy window (a second ~500 ms loop per "
+                    "spec). Off by default, matching the launcher."
+                ),
+            )
+            energy_group.add_argument(
+                "--no-energy",
+                dest="energy",
+                action="store_false",
+                help=(
+                    "Skip the NVML energy window. Already the default; pass this "
+                    "to override an inherited VIBESIM_PROFILE_ENERGY=1."
+                ),
+            )
+            # Default None, not False: a concrete default is indistinguishable
+            # from the flag being passed, and would settle the policy over a
+            # caller who exported VIBESIM_PROFILE_ENERGY. None means "nobody
+            # said", which is what leaves the environment its vote.
+            command_parser.set_defaults(energy=None)
         command_parser.set_defaults(
             command_fn={
                 "query": _cmd_query,
@@ -121,7 +158,64 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
         action="store_false",
         help="Warm continuous window (no per-launch L2 displacement); reveals power/clock drift.",
     )
-    measure_parser.set_defaults(command_fn=_cmd_measure, clear_l2=True, telemetry=True)
+    measure_parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Replay the kernel from a CUDA graph so host dispatch leaves no gaps; with "
+            "--no-clear-l2 the window runs back to back at the sustained power limit."
+        ),
+    )
+    measure_energy = measure_parser.add_mutually_exclusive_group()
+    measure_energy.add_argument(
+        "--energy",
+        dest="energy",
+        action="store_true",
+        help="Measure the NVML energy window. Off by default, matching the launcher.",
+    )
+    measure_energy.add_argument(
+        "--no-energy",
+        dest="energy",
+        action="store_false",
+        help="Skip the NVML energy window; the reported energy_j is then 0.0 (not measured).",
+    )
+    measure_parser.set_defaults(
+        command_fn=_cmd_measure, clear_l2=True, telemetry=True, energy=None
+    )
+
+    merge_parser = subparsers.add_parser(
+        "merge-db",
+        help="Merge profile databases by semantic row identity.",
+    )
+    merge_parser.add_argument("left", type=Path, help="First input profile.db.")
+    merge_parser.add_argument("right", type=Path, help="Second input profile.db.")
+    merge_parser.add_argument("--output", type=Path, required=True, help="New merged profile.db.")
+    merge_parser.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path. Defaults to <output>.merge-report.json.",
+    )
+    merge_parser.add_argument("--json", action="store_true", help="Emit the report as JSON.")
+    merge_parser.set_defaults(command_fn=_cmd_merge_db)
+
+    migrate_parser = subparsers.add_parser(
+        "migrate-db",
+        help="Upgrade a profile.db to this checkout's schema in place, then VACUUM it.",
+    )
+    migrate_parser.add_argument("db", type=Path, help="profile.db to upgrade.")
+    migrate_parser.set_defaults(command_fn=_cmd_migrate_db)
+
+    provenance_parser = subparsers.add_parser(
+        "audit-provenance",
+        help="Find rows whose backend lacks a direct literal registration at its stamp.",
+    )
+    provenance_parser.add_argument(
+        "--db",
+        type=Path,
+        help="profile.db path. Defaults to profiling.perf_api.DB_PATH.",
+    )
+    provenance_parser.add_argument("--json", action="store_true", help="Emit the report as JSON.")
+    provenance_parser.set_defaults(command_fn=_cmd_audit_provenance)
     return parser
 
 
@@ -146,6 +240,81 @@ def _add_common_profile_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--gpu-name", help="DB gpu_name key. Defaults to CUDA device 0 name.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+
+def _cmd_migrate_db(args: argparse.Namespace) -> int:
+    from profiling.db.migrate import SCHEMA_VERSION, migrate
+
+    before = args.db.stat().st_size
+    upgraded = migrate(args.db)
+    after = args.db.stat().st_size
+    state = "upgraded" if upgraded else "already current"
+    print(f"{args.db}: {state} (schema v{SCHEMA_VERSION}), {before:,} -> {after:,} bytes")
+    return 0
+
+
+def _cmd_merge_db(args: argparse.Namespace) -> int:
+    from profiling.db.merge import merge_profile_databases
+
+    report = merge_profile_databases(
+        args.left,
+        args.right,
+        args.output,
+        report_path=args.report,
+    )
+    payload = report.to_dict()
+    if args.json:
+        print(json.dumps({"ok": report.published, **payload}, indent=2, sort_keys=True))
+    else:
+        summary = payload["summary"]
+        status = "published" if report.published else "not published: conflicts require review"
+        report_path = (
+            args.report.resolve()
+            if args.report is not None
+            else args.output.resolve().with_name(f"{args.output.name}.merge-report.json")
+        )
+        print(f"Profile DB merge {status}")
+        print(f"Output: {payload['output']['path']}")
+        print(f"Report: {report_path}")
+        print(
+            "Rows: "
+            f"{summary['inserted_rows']} inserted, "
+            f"{summary['duplicate_rows']} duplicates, "
+            f"{summary['conflict_rows']} conflicts"
+        )
+    return 0 if report.published else 1
+
+
+def _cmd_audit_provenance(args: argparse.Namespace) -> int:
+    from profiling.db.provenance import audit_profile_provenance
+
+    db_path = Path(args.db if args.db is not None else perf_api.DB_PATH)
+    repo_root = Path(__file__).resolve().parents[1]
+    report = audit_profile_provenance(db_path, repo_root)
+    payload = report.to_dict()
+    if args.json:
+        print(json.dumps({"ok": True, **payload}, indent=2, sort_keys=True))
+        return 0
+
+    share = 100.0 * report.candidate_rows / report.total_rows if report.total_rows else 0.0
+    print(f"Provenance audit: {db_path}")
+    print(f"Stamped rows: {report.total_rows}")
+    print(
+        "Backend not directly registered at stamped commit: "
+        f"{report.candidate_rows} ({share:.1f}%; diagnostic candidates only)"
+    )
+    if report.unverifiable_rows:
+        print(f"Unverifiable and unchanged: {report.unverifiable_rows}")
+    for finding in report.findings[:15]:
+        print(
+            f"  {finding.rows:7d}  {finding.table} / {finding.backend} / "
+            f"{finding.profiler_git_hash[:12]}  [{finding.verdict}]"
+        )
+    if len(report.findings) > 15:
+        print(f"  ... and {len(report.findings) - 15} more groups")
+    if report.candidate_rows:
+        print("Read-only audit: static Python inspection is not evidence for automatic rewrites.")
+    return 0
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
@@ -207,7 +376,15 @@ def _cmd_query(args: argparse.Namespace) -> int:
 def _cmd_run(args: argparse.Namespace) -> int:
     specs = _load_specs(args.spec, args.specs)
     _set_db_path(args.db)
-    mode = "force-refresh" if args.force else "jit-fill"
+    # Recorded in the environment rather than passed down, because the profiler
+    # that honours it runs in a worker subprocess several frames below here.
+    # Only when the flag was actually given: writing it unconditionally would
+    # clobber an inherited VIBESIM_PROFILE_ENERGY=0.
+    if args.energy is not None:
+        set_energy_enabled(args.energy)
+    # --force and --fresh both re-measure every spec; only --force keeps the rows.
+    measure_all = args.force or args.fresh
+    mode = "fresh" if args.fresh else "force-refresh" if args.force else "jit-fill"
     profiler_spec = _resolve_profiler_spec(args.table, args.backend)
     output_dir = args.output_dir.resolve() if args.output_dir is not None else None
     managed_job = ManagedJob.from_environment("kernel_profile")
@@ -221,13 +398,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # a conversation backend.
     create_time = _utc_now()
     profile_id = _profile_id(output_dir)
-    descriptor = {
-        "table": args.table,
-        "kernelKind": str(profiler_spec.kernel_kind),
-        "backend": args.backend,
-        "metricFamily": profiler_spec.metric_family.value,
-        "pointCount": len(specs),
-    }
+    descriptor = run_descriptor(args, profiler_spec, specs)
     if managed_job is not None:
         assert output_dir is not None
         managed_job.register(
@@ -252,7 +423,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 job_metadata=_profile_job_metadata(managed_job, descriptor, profile_id),
             )
 
-        if args.force:
+        if measure_all:
             outcome = run_kind_times(
                 profiler_spec.kernel_kind,
                 specs,
@@ -261,6 +432,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 db_path=perf_api.DB_PATH,
                 jit_enabled=False,
                 force=True,
+                persist=not args.fresh,
             )
         else:
             perf_api.enable_jit_profiling()
@@ -279,10 +451,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
         results = outcome.results
         run_provenance = outcome.provenance
 
-        missing_count = _count_facade(args.table)(
-            specs,
-            backend=args.backend,
-            gpu_name=args.gpu_name,
+        # A --fresh run wrote nothing, so a DB count would describe the cache rather
+        # than this run. Its equivalent completeness signal is how many of the
+        # requested specs this measurement failed to produce a row for.
+        missing_count = (
+            sum(1 for result in results if isinstance(result, MissingEntry))
+            if args.fresh
+            else _count_facade(args.table)(
+                specs,
+                backend=args.backend,
+                gpu_name=args.gpu_name,
+            )
         )
         payload = _result_payload(
             args,
@@ -290,7 +469,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             results,
             mode=mode,
             missing_count=missing_count,
-        )
+        ) | {"persisted": not args.fresh, "energy_measured": energy_enabled()}
         if output_dir is not None:
             if managed_job is not None:
                 managed_job.report("analysis_running")
@@ -301,7 +480,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 result_payload=payload,
             )
             request_identifier, observed_gpu, _gpu_count = _outcome_provenance(
-                run_provenance, args.gpu_name, forced=args.force
+                run_provenance, args.gpu_name, forced=measure_all
             )
             _validate_measured_gpu_identity(request_identifier, observed_gpu)
             resolved_canonical = (
@@ -361,17 +540,14 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     specs = _load_specs(args.spec, args.specs)
     if len(specs) != 1:
         raise ValueError(f"measure takes exactly one spec, got {len(specs)}")
-    output_dir = args.output_dir or Path(f"measure_{args.table}_{args.backend}")
+    _set_db_path(args.db)
+    if args.energy is not None:
+        set_energy_enabled(args.energy)
+    output_dir = measure_output_dir(args)
     profiler_spec = _resolve_profiler_spec(args.table, args.backend)
     create_time = _utc_now()
     measurement_id = _measurement_id(output_dir)
-    descriptor = {
-        "table": args.table,
-        "backend": args.backend,
-        "pointCount": 1,
-        "durationSeconds": args.duration_s,
-        "clearL2": args.clear_l2,
-    }
+    descriptor = measure_descriptor(args)
     managed_job = ManagedJob.from_environment("kernel_measure")
     if managed_job is not None:
         managed_job.register(
@@ -392,6 +568,7 @@ def _cmd_measure(args: argparse.Namespace) -> int:
             telemetry_hz=args.telemetry_hz,
             telemetry=args.telemetry,
             clear_l2=args.clear_l2,
+            cuda_graph=args.cuda_graph,
         )
         runner_error = result.get("runner_error")
         if runner_error:
@@ -452,6 +629,36 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         _print_measure_result(result)
         print(f"measurement: {output_dir / MEASUREMENT_METADATA_FILENAME}")
     return 0
+
+
+def run_descriptor(
+    args: argparse.Namespace, profiler_spec: KernelProfilerSpec, specs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The managed-job descriptor of a `run` (also registered by `--remote`)."""
+    return {
+        "table": args.table,
+        "kernelKind": str(profiler_spec.kernel_kind),
+        "backend": args.backend,
+        "metricFamily": profiler_spec.metric_family.value,
+        "pointCount": len(specs),
+    }
+
+
+def measure_descriptor(args: argparse.Namespace) -> dict[str, Any]:
+    """The managed-job descriptor of a `measure` (also registered by `--remote`)."""
+    return {
+        "table": args.table,
+        "backend": args.backend,
+        "pointCount": 1,
+        "durationSeconds": args.duration_s,
+        "clearL2": args.clear_l2,
+        # Read after --energy/--no-energy has been applied.
+        "energyMeasured": energy_enabled() if args.energy is None else args.energy,
+    }
+
+
+def measure_output_dir(args: argparse.Namespace) -> Path:
+    return args.output_dir or Path(f"measure_{args.table}_{args.backend}")
 
 
 def _print_measure_result(result: Mapping[str, Any]) -> None:
@@ -785,10 +992,17 @@ def _print_run_summary(payload: Mapping[str, Any]) -> None:
     print(f"table: {payload['table']}")
     print(f"backend: {payload['backend']}")
     print(f"db_path: {payload['db_path']}")
+    if payload.get("persisted") is False:
+        # Say it next to db_path, where a reader would otherwise assume the run landed.
+        print("persisted: no (--fresh measured these rows without inserting them)")
+    if payload.get("energy_measured") is False:
+        # Every energy_j below is 0.0 because it was skipped, not because it is zero.
+        print("energy_measured: no (--no-energy; energy_j = 0.0 means not measured)")
     if payload.get("gpu_name"):
         print(f"gpu_name: {payload['gpu_name']}")
     print(f"spec_count: {payload['spec_count']}")
-    print(f"missing_count: {payload['missing_count']}")
+    label = "unmeasured_count" if payload.get("persisted") is False else "missing_count"
+    print(f"{label}: {payload['missing_count']}")
 
 
 def _print_result_payload(payload: Mapping[str, Any]) -> None:

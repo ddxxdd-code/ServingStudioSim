@@ -1,8 +1,11 @@
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, Int16Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    ArrayRef, Float64Array, Int16Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -14,7 +17,8 @@ use tower::ServiceExt;
 
 use super::alignment::{
     alignment_descriptor, alignment_iteration_detail, alignment_payload, alignment_report,
-    build_alignment_catalog, discover_alignments, resolve_alignment,
+    alignment_sequence_index, build_alignment_catalog, discover_alignments,
+    read_alignment_sequence, resolve_alignment,
 };
 use super::batch::{read_batch_payload, read_batch_report};
 use super::catalog::build_catalog;
@@ -33,7 +37,10 @@ use super::kernel_profile::{
     build_kernel_profile_catalog, discover_kernel_profiles, profile_curve, profile_descriptor,
     resolve_kernel_profile,
 };
-use super::kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
+use super::kernel_time_share::{
+    read_kernel_time_share_payload, read_kernel_time_share_report,
+    read_kernel_time_share_worker_payload,
+};
 use super::kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use super::model::read_model;
 use super::optimality::{
@@ -53,6 +60,7 @@ use super::workload::read_workload;
 use super::workload_conservation::{
     read_workload_conservation_payload, read_workload_conservation_report,
 };
+use super::ArtifactNotFound;
 use super::{
     service_router, timeline_profile_log_line, OperationIndexCache, RootSource, ServiceState,
     TimelineProfileEvent,
@@ -440,6 +448,9 @@ fn prediction_test_router(logs_root: &Path) -> Router {
         operation_indexes: Arc::new(OperationIndexCache::default()),
         alignment_discovery: Arc::new(std::sync::Mutex::new(None)),
         alignment_detail_indexes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        alignment_sequence_indexes: Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     })
 }
 
@@ -459,6 +470,21 @@ async fn get_json(router: Router, uri: &str) -> (StatusCode, Value) {
         .expect("read HTTP test response body");
     let value = serde_json::from_slice(&body).expect("decode HTTP test response JSON");
     (status, value)
+}
+
+#[tokio::test]
+async fn scoped_optimality_routes_require_an_explicit_scope_selector() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let router = prediction_test_router(temporary.path());
+
+    for uri in [
+        "/api/analyzer/v1/runs/r_missing/subjects/scoped-optimality/report",
+        "/api/analyzer/v1/predictions/p_missing/subjects/scoped-optimality/report",
+    ] {
+        let (status, problem) = get_json(router.clone(), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem["code"], "scope_selector_missing");
+    }
 }
 
 fn make_core_run(path: &Path) {
@@ -711,9 +737,34 @@ fn make_core_run(path: &Path) {
                     "share_pct": 100.0
                 }]
             },
-            "pools": [],
-            "workers": [],
-            "positions": [],
+            "pools": [{
+                "pool_tag": "attn",
+                "num_workers": 1,
+                "kernel_time_ms": 10.0,
+                "segments": [{
+                    "position": "attn.decode",
+                    "kind": "flashinfer_attn_decode",
+                    "kernel_time_ms": 10.0,
+                    "share_pct": 100.0
+                }]
+            }],
+            "workers": [{
+                "pool_tag": "attn",
+                "worker_id": 0,
+                "kernel_time_ms": 10.0,
+                "raw_rows": 400,
+                "sampled_rows": 40,
+                "sample_stride": 10,
+                "segments": [{
+                    "position": "attn.decode",
+                    "kind": "flashinfer_attn_decode",
+                    "kernel_time_ms": 10.0,
+                    "share_pct": 100.0
+                }]
+            }],
+            "positions": [
+                {"name": "attn.decode", "kind": "flashinfer_attn_decode", "overall_share_pct": 100.0}
+            ],
             "definitions": {
                 "tree_attribution": "critical path with Sum/Scale/Max/overlap"
             }
@@ -909,6 +960,23 @@ fn prediction_catalog_is_first_class_and_does_not_create_a_run() {
     assert!(descriptor.get("deployment").is_none());
 }
 
+#[test]
+fn speculative_prediction_remains_discoverable_as_a_prediction() {
+    let temporary = TempDir::new().unwrap();
+    let path = temporary.path().join("spec5");
+    make_prediction(&path, "p_spec5");
+    let metadata_path = path.join("prediction.meta.json");
+    let mut metadata: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    metadata["selector"] = json!("speculative_iter");
+    metadata["arch_type"] = json!("glm52_vllm_nvfp4_dsa_moe_speculative");
+    fs::write(metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let roots = configure_logs_roots(vec![temporary.path().to_path_buf()]).unwrap();
+    let catalog = serde_json::to_value(build_prediction_catalog(&roots).unwrap()).unwrap();
+    assert_eq!(catalog["predictions"][0]["selector"], "speculative_iter");
+    assert!(resolve_prediction(&roots, "p_spec5").is_ok());
+    assert!(discover_runs(&roots).unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_json() {
     let temporary = TempDir::new().expect("temporary logs root");
@@ -917,13 +985,16 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
     make_prediction_cost_source(&prediction_path);
     let router = prediction_test_router(temporary.path());
 
-    let (catalog_status, catalog) = get_json(router.clone(), "/api/v1/predictions").await;
+    let (catalog_status, catalog) = get_json(router.clone(), "/api/analyzer/v1/predictions").await;
     assert_eq!(catalog_status, StatusCode::OK);
     assert_eq!(catalog["predictions"][0]["prediction_id"], "p_http_test");
     assert_eq!(catalog["predictions"][0]["status"], "ready");
 
-    let (descriptor_status, descriptor) =
-        get_json(router.clone(), "/api/v1/predictions/p_http_test/descriptor").await;
+    let (descriptor_status, descriptor) = get_json(
+        router.clone(),
+        "/api/analyzer/v1/predictions/p_http_test/descriptor",
+    )
+    .await;
     assert_eq!(descriptor_status, StatusCode::OK);
     assert_eq!(descriptor["kind"], "timing_predict");
     assert_eq!(descriptor["lifecycle"]["prediction"], "complete");
@@ -932,7 +1003,7 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
 
     let (cases_status, cases) = get_json(
         router.clone(),
-        "/api/v1/predictions/p_http_test/cases?offset=0&limit=10",
+        "/api/analyzer/v1/predictions/p_http_test/subjects/cases/payload?offset=0&limit=10",
     )
     .await;
     assert_eq!(cases_status, StatusCode::OK);
@@ -948,12 +1019,56 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
     assert!(cases["cases"][0].get("worker").is_none());
 
     let (missing_status, missing) =
-        get_json(router, "/api/v1/predictions/p_absent/descriptor").await;
+        get_json(router, "/api/analyzer/v1/predictions/p_absent/descriptor").await;
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
     assert_eq!(missing["code"], "prediction_not_found");
     assert!(missing["detail"]
         .as_str()
         .is_some_and(|detail| !detail.contains(temporary.path().to_string_lossy().as_ref())));
+}
+
+#[tokio::test]
+async fn prediction_subject_routes_read_what_the_analysis_wrote_by_registry_name() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let prediction_path = temporary.path().join("predict-llama");
+    make_prediction(&prediction_path, "p_subjects");
+    fs::create_dir_all(prediction_path.join("reports")).unwrap();
+    fs::create_dir_all(prediction_path.join("payloads")).unwrap();
+    fs::write(
+        prediction_path.join("payloads/kernel_time_share_composition.json"),
+        r#"{"available": true, "overall": {"kernel_time_ms": 2.0, "segments": [
+            {"position": "m.mlp", "kind": "single_gemm", "kernel_time_ms": 1.5, "share_pct": 75.0}
+        ]}}"#,
+    )
+    .unwrap();
+    fs::write(
+        prediction_path.join("reports/slo_general_report.json"),
+        r#"{"available": false, "reason": "no requests"}"#,
+    )
+    .unwrap();
+    let router = prediction_test_router(temporary.path());
+    let base = "/api/analyzer/v1/predictions/p_subjects/subjects";
+
+    let (status, share) =
+        get_json(router.clone(), &format!("{base}/kernel-time-share/payload")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(share["overall"]["segments"][0]["position"], "m.mlp");
+
+    // A subject that does not apply is served as the analysis wrote it.
+    let (status, slo) = get_json(router.clone(), &format!("{base}/slo-general/report")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(slo["available"], false);
+
+    // Not run, or not a subject: 404, and the name never becomes a path.
+    for subject in [
+        "kernel-time-share/report",
+        "no-such-subject/payload",
+        "..%2Freports/payload",
+    ] {
+        let (status, missing) = get_json(router.clone(), &format!("{base}/{subject}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{subject}");
+        assert_eq!(missing["code"], "artifact_missing", "{subject}");
+    }
 }
 
 #[test]
@@ -1149,11 +1264,9 @@ fn discovers_nested_runs_and_ignores_directory_shells() {
     let completed_value = serde_json::to_value(completed).expect("serialize completed run");
     assert_eq!(completed_value["lifecycle"]["simulation"], "complete");
     assert_eq!(completed_value["lifecycle"]["analysis"], "complete");
+    // The id is the whole identity a catalog row owes the client. Its addresses
+    // follow from `runs/{run_id}/…`, so the row does not restate them.
     assert!(completed.run_id.starts_with("r_"));
-    assert_eq!(
-        completed.descriptor_href,
-        format!("runs/{}/descriptor", completed.run_id)
-    );
 
     let pending = catalog
         .runs
@@ -1263,7 +1376,11 @@ async fn sweep_catalog_supports_bounded_ready_discovery_and_latest_alias() {
     make_sweep(&temporary.path().join("20260801_0_older_ready"), true);
     let router = prediction_test_router(temporary.path());
 
-    let (status, catalog) = get_json(router.clone(), "/api/v1/sweeps?status=ready&limit=1").await;
+    let (status, catalog) = get_json(
+        router.clone(),
+        "/api/analyzer/v1/sweeps?status=ready&limit=1",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(catalog["sweeps"].as_array().map(Vec::len), Some(1));
     assert_eq!(
@@ -1272,12 +1389,12 @@ async fn sweep_catalog_supports_bounded_ready_discovery_and_latest_alias() {
     );
     assert_eq!(catalog["sweeps"][0]["status"], "ready");
 
-    let (status, latest) = get_json(router.clone(), "/api/v1/sweeps/latest").await;
+    let (status, latest) = get_json(router.clone(), "/api/analyzer/v1/sweeps/latest").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(latest["sweeps"].as_array().map(Vec::len), Some(1));
     assert_eq!(latest["sweeps"][0], catalog["sweeps"][0]);
 
-    let (status, problem) = get_json(router, "/api/v1/sweeps?limit=0").await;
+    let (status, problem) = get_json(router, "/api/analyzer/v1/sweeps?limit=0").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(problem["code"], "invalid_sweep_catalog_limit");
 }
@@ -1438,83 +1555,70 @@ fn descriptor_indexes_existing_core_resources() {
     assert_eq!(descriptor["run_id"], run.run_id);
     assert_eq!(descriptor["deployment"], "afd");
     assert_eq!(descriptor["model_name"], "model/config/qwen.json");
-    assert_eq!(descriptor["model"]["href"], "model");
+    assert_eq!(descriptor["model"]["views"][0], "payload");
     assert_eq!(descriptor["model"]["schema_version"], 2);
-    assert_eq!(descriptor["summary"]["href"], "summary");
-    assert_eq!(descriptor["topology"]["href"], "topology");
+    assert_eq!(descriptor["summary"]["views"][0], "report");
+    assert_eq!(descriptor["topology"]["views"][0], "payload");
     assert_eq!(descriptor["topology"]["schema_version"], 1);
-    assert_eq!(descriptor["workload"]["href"], "workload");
+    assert_eq!(descriptor["workload"]["views"][0], "payload");
     assert_eq!(descriptor["workload"]["schema_version"], 1);
     assert_eq!(descriptor["subjects"]["concurrency"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["concurrency"]["payload_href"],
-        "subjects/concurrency/payload"
-    );
+    assert!(descriptor["subjects"]["concurrency"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["request-state"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["request-state"]["payload_href"],
-        "subjects/request-state/payload"
-    );
+    assert!(descriptor["subjects"]["request-state"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["slo-general"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["slo-general"]["report_href"],
-        "subjects/slo-general/report"
-    );
-    assert_eq!(
-        descriptor["subjects"]["slo-general"]["payload_href"],
-        "subjects/slo-general/payload"
-    );
+    assert!(descriptor["subjects"]["slo-general"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "report")));
+    assert!(descriptor["subjects"]["slo-general"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["throughput"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["throughput"]["report_href"],
-        "subjects/throughput/report"
-    );
-    assert_eq!(
-        descriptor["subjects"]["throughput"]["payload_href"],
-        "subjects/throughput/payload"
-    );
+    assert!(descriptor["subjects"]["throughput"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "report")));
+    assert!(descriptor["subjects"]["throughput"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["utilization"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["utilization"]["report_href"],
-        "subjects/utilization/report"
-    );
-    assert_eq!(
-        descriptor["subjects"]["utilization"]["payload_href"],
-        "subjects/utilization/payload"
-    );
+    assert!(descriptor["subjects"]["utilization"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "report")));
+    assert!(descriptor["subjects"]["utilization"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["kv-occupancy"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["kv-occupancy"]["report_href"],
-        "subjects/kv-occupancy/report"
-    );
-    assert_eq!(
-        descriptor["subjects"]["kv-occupancy"]["payload_href"],
-        "subjects/kv-occupancy/payload"
-    );
+    assert!(descriptor["subjects"]["kv-occupancy"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "report")));
+    assert!(descriptor["subjects"]["kv-occupancy"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(
         descriptor["subjects"]["kernel-input-distribution"]["status"],
         "ready"
     );
-    assert_eq!(
-        descriptor["subjects"]["kernel-input-distribution"]["payload_href"],
-        "subjects/kernel-input-distribution/payload"
-    );
+    assert!(descriptor["subjects"]["kernel-input-distribution"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(
         descriptor["subjects"]["kernel-time-share"]["status"],
         "ready"
     );
-    assert_eq!(
-        descriptor["subjects"]["kernel-time-share"]["payload_href"],
-        "subjects/kernel-time-share/payload"
-    );
+    assert!(descriptor["subjects"]["kernel-time-share"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(
         descriptor["subjects"]["workload-conservation"]["status"],
         "ready"
     );
-    assert_eq!(
-        descriptor["subjects"]["workload-conservation"]["payload_href"],
-        "subjects/workload-conservation/payload"
-    );
+    assert!(descriptor["subjects"]["workload-conservation"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert!(descriptor["analysis"]["revision"]
         .as_str()
         .is_some_and(|revision| revision.starts_with("legacy-sha256-")));
@@ -1594,21 +1698,42 @@ fn model_resource_rejects_paths_outside_model_config() {
     assert!(error.to_string().contains("below model/config"));
 }
 
+/// The run's request record, as the simulator writes `raw/request_slo.parquet`:
+/// one row per released request, `(arrival_time_ms, declared_prefix_tokens,
+/// fresh_prompt_tokens, target_output_tokens)`.
+fn write_released_requests(run_path: &Path, rows: &[(f64, u32, u32, u32)]) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("arrival_time_ms", DataType::Float64, false),
+        Field::new("declared_prefix_tokens", DataType::UInt32, false),
+        Field::new("fresh_prompt_tokens", DataType::UInt32, false),
+        Field::new("target_output_tokens", DataType::UInt32, false),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| row.0))),
+        Arc::new(UInt32Array::from_iter_values(rows.iter().map(|row| row.1))),
+        Arc::new(UInt32Array::from_iter_values(rows.iter().map(|row| row.2))),
+        Arc::new(UInt32Array::from_iter_values(rows.iter().map(|row| row.3))),
+    ];
+    let batch =
+        RecordBatch::try_new(Arc::clone(&schema), columns).expect("build request record batch");
+    let file = fs::File::create(run_path.join("raw/request_slo.parquet"))
+        .expect("create request record");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create parquet writer");
+    writer.write(&batch).expect("write request rows");
+    writer.close().expect("close request record");
+}
+
 #[test]
-fn workload_resource_summarizes_configured_trace() {
+fn workload_resource_summarizes_the_requests_the_run_released() {
     let temporary = TempDir::new().expect("temporary logs root");
     let run_path = temporary.path().join("simulation");
     make_core_run(&run_path);
-    let repo = TempDir::new().expect("temporary repository");
-    fs::create_dir_all(repo.path().join("trace")).expect("create trace directory");
-    fs::write(
-        repo.path().join("trace/workload.csv"),
-        "id,input_len,output_len,arrival_time\n\
-         0,8,32,0\n\
-         1,16,64,2000\n\
-         2,32,128,4000\n",
-    )
-    .expect("write trace");
+    // Released out of order and already on the run's own timeline; no trace
+    // file is read, so none is written.
+    write_released_requests(
+        &run_path,
+        &[(1000.0, 0, 16, 64), (0.0, 0, 8, 32), (2000.0, 0, 32, 128)],
+    );
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
     let run = discover_runs(&roots)
@@ -1616,7 +1741,7 @@ fn workload_resource_summarizes_configured_trace() {
         .pop()
         .expect("one run");
 
-    let workload = read_workload(&run, repo.path()).expect("read workload resource");
+    let workload = read_workload(&run, temporary.path()).expect("read workload resource");
 
     assert_eq!(workload["schema_version"], 1);
     assert_eq!(workload["scope"], "configured_trace");
@@ -1638,31 +1763,20 @@ fn workload_resource_summarizes_configured_trace() {
 }
 
 #[test]
-fn workload_arrival_basis_reads_the_arrival_axis_not_the_capacity_cap() {
+fn workload_resource_counts_a_rounds_carried_context_as_its_prompt() {
     let temporary = TempDir::new().expect("temporary logs root");
     let run_path = temporary.path().join("simulation");
     make_core_run(&run_path);
-    // A capped run is still trace-timed unless it says otherwise, so the
-    // recorded timeline must stay rescaled by request_rate.
     let params = fs::read_to_string(run_path.join("raw/params.json")).expect("read params");
     fs::write(
         run_path.join("raw/params.json"),
         params.replace(
             r#""request_rate": 2.0"#,
-            r#""request_rate": 2.0, "max_concurrency": 2, "arrival_mode": "trace_timed""#,
+            r#""request_rate": 2.0, "arrival_mode": "saturated""#,
         ),
     )
     .expect("write params");
-    let repo = TempDir::new().expect("temporary repository");
-    fs::create_dir_all(repo.path().join("trace")).expect("create trace directory");
-    fs::write(
-        repo.path().join("trace/workload.csv"),
-        "id,input_len,output_len,arrival_time\n\
-         0,8,32,0\n\
-         1,16,64,2000\n\
-         2,32,128,4000\n",
-    )
-    .expect("write trace");
+    write_released_requests(&run_path, &[(0.0, 0, 100, 10), (0.0, 110, 50, 10)]);
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
     let run = discover_runs(&roots)
@@ -1670,44 +1784,75 @@ fn workload_arrival_basis_reads_the_arrival_axis_not_the_capacity_cap() {
         .pop()
         .expect("one run");
 
-    let workload = read_workload(&run, repo.path()).expect("read workload resource");
+    let workload = read_workload(&run, temporary.path()).expect("read workload resource");
 
-    assert_eq!(workload["arrival_basis"], "effective_trace_timed");
-    let arrival_seconds = workload["arrival_seconds"]
-        .as_array()
-        .expect("arrival seconds");
-    assert!((arrival_seconds[1].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    assert_eq!(workload["arrival_basis"], "effective_open_loop");
+    assert_eq!(workload["average_input_tokens"], 130.0);
 }
 
 #[test]
-fn workload_resource_accepts_launcher_experiment_trace_path() {
-    let repository = TempDir::new().expect("temporary repository");
-    let logs_root = repository.path().join("logs");
-    let run_path = repository.path().join("logs/experiment/rate90.0/tp1");
-    make_core_run(&run_path);
-    let source_path = "logs/experiment/trace/workload.csv";
-    let params_path = run_path.join("raw/params.json");
-    let params = fs::read_to_string(&params_path)
-        .expect("read params")
-        .replace("trace/workload.csv", source_path);
-    fs::write(params_path, params).expect("write launcher params");
-    fs::create_dir_all(repository.path().join("logs/experiment/trace"))
-        .expect("create experiment trace directory");
-    fs::write(
-        repository.path().join(source_path),
-        "id,input_len,output_len,arrival_time\n0,8,32,0\n1,16,64,2000\n",
-    )
-    .expect("write experiment trace");
-    let roots = configure_logs_roots(vec![logs_root.clone()]).expect("configure logs root");
+fn workload_resource_without_a_request_record_is_not_found() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
     let run = discover_runs(&roots)
         .expect("discover runs")
         .pop()
         .expect("one run");
 
-    let workload = read_workload(&run, &logs_root).expect("read launcher experiment workload");
+    let error = read_workload(&run, temporary.path()).expect_err("no request record");
 
-    assert_eq!(workload["source_paths"], json!([source_path]));
-    assert_eq!(workload["request_count"], 2);
+    assert!(error.downcast_ref::<ArtifactNotFound>().is_some());
+}
+
+#[test]
+fn workload_resource_labels_a_launcher_experiment_trace() {
+    let repository = TempDir::new().expect("temporary repository");
+    let logs_root = repository.path().join("logs");
+    for (run, source_path) in [
+        ("experiment/rate90.0/tp1", "logs/experiment/trace/workload.csv"),
+        ("experiment/rate32", "logs/experiment/trace.csv"),
+    ] {
+        let run_path = logs_root.join(run);
+        make_core_run(&run_path);
+        let params_path = run_path.join("raw/params.json");
+        let params = fs::read_to_string(&params_path)
+            .expect("read params")
+            .replace("trace/workload.csv", source_path);
+        fs::write(params_path, params).expect("write launcher params");
+        write_released_requests(&run_path, &[(0.0, 0, 1024, 256), (1000.0, 0, 1024, 256)]);
+    }
+    let roots = configure_logs_roots(vec![logs_root.clone()]).expect("configure logs root");
+    for run in discover_runs(&roots).expect("discover runs") {
+        let workload = read_workload(&run, &logs_root).expect("read launcher experiment workload");
+        let source_path = workload["source_paths"][0].as_str().expect("one label");
+        assert!(source_path.starts_with("logs/experiment/"), "{source_path}");
+        assert_eq!(workload["request_count"], 2);
+        assert_eq!(workload["average_input_tokens"], 1024.0);
+    }
+}
+
+#[test]
+fn workload_resource_names_an_absolute_trace_under_the_root_from_its_logs_directory() {
+    let repository = TempDir::new().expect("temporary repository");
+    let logs_root = repository.path().join("logs");
+    let run_path = logs_root.join("service/run");
+    make_core_run(&run_path);
+    let trace = logs_root.join("service/trace.csv");
+    fs::write(&trace, "id,input_len,output_len,arrival_time\n").expect("write trace");
+    let params_path = run_path.join("raw/params.json");
+    let params = fs::read_to_string(&params_path)
+        .expect("read params")
+        .replace("trace/workload.csv", trace.to_str().expect("utf-8 path"));
+    fs::write(params_path, params).expect("write params");
+    write_released_requests(&run_path, &[(0.0, 0, 8, 8)]);
+    let roots = configure_logs_roots(vec![logs_root.clone()]).expect("configure logs root");
+    let run = discover_runs(&roots).expect("discover").pop().expect("run");
+
+    let workload = read_workload(&run, repository.path()).expect("read service run workload");
+
+    assert_eq!(workload["source_paths"], json!(["logs/service/trace.csv"]));
 }
 
 #[test]
@@ -1978,6 +2123,58 @@ fn kernel_time_share_resources_preserve_critical_path_attribution() {
     assert!(payload["definitions"]["tree_attribution"]
         .as_str()
         .is_some_and(|definition| definition.contains("critical path")));
+
+    // Pools stay whole — the entry view is a comparison across them — while
+    // each worker becomes an index entry whose composition has its own address.
+    assert_eq!(payload["schema_version"], 2);
+    assert_eq!(payload["pools"][0]["segments"][0]["share_pct"], 100.0);
+    assert_eq!(payload["workers"][0]["pool_tag"], "attn");
+    assert_eq!(payload["workers"][0]["worker_id"], 0);
+    assert_eq!(payload["workers"][0]["sample_stride"], 10);
+    // The sampling totals in `meta` stay checkable against their parts.
+    assert_eq!(payload["workers"][0]["raw_rows"], 400);
+    assert_eq!(payload["workers"][0]["sampled_rows"], 40);
+    assert!(payload["workers"][0].get("segments").is_none());
+}
+
+#[test]
+fn kernel_time_share_worker_scope_serves_only_that_worker() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let worker =
+        read_kernel_time_share_worker_payload(&run, "attn", 0).expect("read worker composition");
+    assert_eq!(
+        worker["scope"],
+        json!({"kind": "worker", "pool_tag": "attn", "worker_id": 0})
+    );
+    // A stride is chosen from this worker's own row count, so a reader judging
+    // how exact these numbers are does not need the cluster read to find out.
+    assert_eq!(worker["sample_stride"], 10);
+    assert_eq!(worker["segments"][0]["kernel_time_ms"], 10.0);
+
+    // Run-wide material is not repeated once per drill-down.
+    assert!(worker.get("definitions").is_none());
+    assert!(worker.get("positions").is_none());
+    assert!(worker.get("overall").is_none());
+    assert!(worker.get("pools").is_none());
+
+    // An address that names no worker is a miss, not an empty document.
+    for missing in [
+        read_kernel_time_share_worker_payload(&run, "attn", 7).err(),
+        read_kernel_time_share_worker_payload(&run, "moe", 0).err(),
+    ] {
+        assert!(missing
+            .expect("unknown worker must fail")
+            .downcast_ref::<ArtifactNotFound>()
+            .is_some());
+    }
 }
 
 #[test]
@@ -1996,13 +2193,12 @@ fn optimality_resources_expose_waterfall_levels_and_kernels() {
 
     let descriptor = build_descriptor(&run).expect("descriptor");
     assert_eq!(descriptor["subjects"]["optimality"]["status"], "ready");
+    assert!(descriptor["subjects"]["optimality"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(
-        descriptor["subjects"]["optimality"]["payload_href"],
-        "subjects/optimality/payload"
-    );
-    assert_eq!(
-        descriptor["subjects"]["optimality"]["variants"]["batch_locked"]["payload_href"],
-        "subjects/optimality/variants/batch-locked/payload"
+        descriptor["subjects"]["optimality"]["variants"]["batch_locked"]["views"][1],
+        "payload"
     );
     assert_eq!(
         descriptor["details"]["iteration-optimality-kernel-ladder"]["status"],
@@ -2216,6 +2412,253 @@ fn does_not_follow_directory_symlinks() {
     assert!(catalog.runs.is_empty());
 }
 
+/// Issue a request with an `Accept-Encoding` and report what came back.
+///
+/// Returns the negotiated `Content-Encoding` alongside the body so a test can
+/// assert both that compression happened and that the body still decodes — an
+/// encoding header over an unencoded body is the failure worth catching.
+async fn get_with_encoding(
+    router: Router,
+    uri: &str,
+    accept_encoding: &str,
+) -> (StatusCode, Option<String>, axum::body::Bytes) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(axum::http::header::ACCEPT_ENCODING, accept_encoding)
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    let status = response.status();
+    let encoding = response
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("read HTTP test response body");
+    (status, encoding, body)
+}
+
+/// The read tree accepts no writes.
+///
+/// Asserting the old address is gone matters as much as asserting the new one
+/// works: a `POST` route left mounted under the read prefix would keep the read API
+/// looking like it takes writes, which is the whole reason the endpoint moved.
+#[tokio::test]
+async fn the_browser_profiling_sink_is_not_part_of_the_read_only_api() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let router = prediction_test_router(temporary.path());
+    let event = serde_json::to_vec(&json!({
+        "session_id": "s1",
+        "event": "first-paint",
+    }))
+    .expect("encode event");
+
+    let post = |router: Router, uri: &'static str, body: Vec<u8>| async move {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("build HTTP test request"),
+            )
+            .await
+            .expect("route HTTP test request")
+            .status()
+    };
+
+    assert_eq!(
+        post(
+            router.clone(),
+            "/api/dev/v1/profile/timeline",
+            event.clone()
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post(router, "/api/analyzer/v1/profile/timeline", event).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// A reload of an unchanged artifact should cost a conditional request, not a
+/// payload.
+///
+/// The three assertions are the whole contract: the first read carries a
+/// validator, sending that validator back yields 304 with no body, and a
+/// validator that does not match still yields the artifact. Without the last
+/// one a broken comparison would look like a working cache.
+#[tokio::test]
+async fn an_unchanged_artifact_revalidates_instead_of_being_resent() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let prediction_path = temporary.path().join("predict-llama");
+    make_prediction(&prediction_path, "p_http_test");
+    make_prediction_cost_source(&prediction_path);
+    let router = prediction_test_router(temporary.path());
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/analyzer/v1/predictions")
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache"),
+        "an artifact must be storable and revalidated, not uncacheable"
+    );
+    let etag = response
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("first read carries a validator")
+        .to_owned();
+    assert!(etag.starts_with("W/"), "validator is weak: {etag}");
+
+    let (status, body) =
+        conditional_get(router.clone(), "/api/analyzer/v1/predictions", &etag).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty(), "304 must not carry the payload it saved");
+
+    // Pinning the revision into the address makes the answer cacheable outright:
+    // the revision IS the content hash, so a URL carrying it can never resolve
+    // to different bytes.
+    let revision = etag.trim_start_matches("W/").trim_matches('"');
+    let (status, cache_control) = cache_control_of(
+        router.clone(),
+        &format!("/api/analyzer/v1/predictions?rev={revision}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        cache_control.as_deref(),
+        Some("max-age=31536000, immutable")
+    );
+
+    // A pin that no longer matches — the analysis was re-run — falls back to
+    // revalidation rather than serving a year-old promise about new bytes.
+    let (status, cache_control) =
+        cache_control_of(router.clone(), "/api/analyzer/v1/predictions?rev=stale").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache_control.as_deref(), Some("no-cache"));
+
+    // A stale validator is not a match, so the artifact is served in full.
+    let (status, body) = conditional_get(
+        router,
+        "/api/analyzer/v1/predictions",
+        "W/\"not-the-current-one\"",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty());
+}
+
+async fn cache_control_of(router: Router, uri: &str) -> (StatusCode, Option<String>) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    let status = response.status();
+    let cache_control = response
+        .headers()
+        .get(axum::http::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (status, cache_control)
+}
+
+async fn conditional_get(
+    router: Router,
+    uri: &str,
+    if_none_match: &str,
+) -> (StatusCode, axum::body::Bytes) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(axum::http::header::IF_NONE_MATCH, if_none_match)
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("read HTTP test response body");
+    (status, body)
+}
+
+/// Compression is a property of the route table, not of one handler.
+///
+/// The service used to gzip exactly one response — the alignment payload — from
+/// inside its handler, while the other thirty went out uncompressed. These
+/// assertions are about the arrangement: any JSON route compresses, a client
+/// that does not ask still gets plain bytes, and an already-compressed image is
+/// left alone.
+#[tokio::test]
+async fn json_routes_compress_for_clients_that_ask_and_leave_images_alone() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let prediction_path = temporary.path().join("predict-llama");
+    make_prediction(&prediction_path, "p_http_test");
+    make_prediction_cost_source(&prediction_path);
+    make_kernel_measurement(&temporary.path().join("measure-gemm"), "km_http_test");
+    let router = prediction_test_router(temporary.path());
+
+    let (status, encoding, body) =
+        get_with_encoding(router.clone(), "/api/analyzer/v1/predictions", "gzip").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(encoding.as_deref(), Some("gzip"));
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(body.as_ref())
+        .read_to_end(&mut decoded)
+        .expect("decode gzip body");
+    let catalog: Value = serde_json::from_slice(&decoded).expect("decode catalog JSON");
+    assert_eq!(catalog["predictions"][0]["prediction_id"], "p_http_test");
+
+    // Content negotiation still applies: a client that asks for nothing gets a
+    // body it can read without a decoder.
+    let (status, plain) = get_json(router.clone(), "/api/analyzer/v1/predictions").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(plain, catalog);
+
+    // A PNG is already compressed. Re-encoding it would spend CPU to make it
+    // slightly larger, so the default predicate excludes image content types.
+    let (status, encoding, bytes) = get_with_encoding(
+        router,
+        "/api/analyzer/v1/kernel-measurements/km_http_test/plots/runtime_trend.png",
+        "gzip",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(encoding, None);
+    assert_eq!(
+        bytes.as_ref(),
+        &[0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    );
+}
+
 async fn get_bytes(router: Router, uri: &str) -> (StatusCode, axum::body::Bytes) {
     let response = router
         .oneshot(
@@ -2288,29 +2731,30 @@ async fn kernel_profile_http_routes_publish_descriptor_and_enriched_curve() {
     write_gpu_spec_fixture(logs);
     let router = prediction_test_router(logs);
 
-    let (status, catalog) = get_json(router.clone(), "/api/v1/kernel-profiles").await;
+    let (status, catalog) = get_json(router.clone(), "/api/analyzer/v1/kernel-profiles").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(catalog["kernel_profiles"][0]["profile_id"], "kp_http_test");
 
     let (status, descriptor) = get_json(
         router.clone(),
-        "/api/v1/kernel-profiles/kp_http_test/descriptor",
+        "/api/analyzer/v1/kernel-profiles/kp_http_test/descriptor",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(descriptor["kind"], "kernel_profile");
-    assert_eq!(descriptor["workspace_id"], "root_0");
+    assert_eq!(descriptor["workspace_id"], "w_root_0");
     assert_eq!(descriptor["kernel"]["metric_family"], "compute");
     assert_eq!(descriptor["gpu"]["cache_key"], "NVIDIA H200");
     assert_eq!(descriptor["gpu"]["observed_name"], "NVIDIA H200");
     assert_eq!(descriptor["gpu_provenance"]["source"], "measurement");
     assert_eq!(descriptor["lifecycle"]["profile"], "complete");
-    assert_eq!(
-        descriptor["resources"]["curve_href"],
-        "kernel-profiles/kp_http_test/curve"
-    );
+    assert_eq!(descriptor["resources"]["curve"]["views"][0], "payload");
 
-    let (status, curve) = get_json(router, "/api/v1/kernel-profiles/kp_http_test/curve").await;
+    let (status, curve) = get_json(
+        router,
+        "/api/analyzer/v1/kernel-profiles/kp_http_test/subjects/curve/payload",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(curve["schemaVersion"], 1);
     assert_eq!(curve["hardware"]["matched"], true);
@@ -2344,29 +2788,28 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
 
     let (status, descriptor) = get_json(
         router.clone(),
-        "/api/v1/kernel-measurements/km_http_test/descriptor",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/descriptor",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(descriptor["kind"], "kernel_measurement");
-    assert_eq!(descriptor["workspace_id"], "root_0");
+    assert_eq!(descriptor["workspace_id"], "w_root_0");
     assert_eq!(descriptor["gpu"]["observed_name"], "NVIDIA H200");
     assert_eq!(descriptor["gpu_provenance"]["source"], "measurement");
     assert_eq!(descriptor["duration_s"], 10.0);
     assert_eq!(descriptor["shape"]["k"], 8);
-    assert_eq!(
-        descriptor["resources"]["summary_href"],
-        "kernel-measurements/km_http_test/summary"
-    );
+    assert_eq!(descriptor["resources"]["summary"]["views"][0], "report");
     let plots = descriptor["resources"]["plots"].as_array().expect("plots");
     assert_eq!(plots.len(), 2);
+    // Names, not addresses: the plot set is discovered on disk, but where each
+    // one lives follows from the name.
     assert!(plots
         .iter()
-        .any(|p| p.as_str() == Some("kernel-measurements/km_http_test/plots/runtime_trend.png")));
+        .any(|p| p.as_str() == Some("runtime_trend.png")));
 
     let (status, summary) = get_json(
         router.clone(),
-        "/api/v1/kernel-measurements/km_http_test/summary",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/subjects/summary/report",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2375,7 +2818,7 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
 
     let (status, bytes) = get_bytes(
         router.clone(),
-        "/api/v1/kernel-measurements/km_http_test/plots/runtime_trend.png",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/plots/runtime_trend.png",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2387,7 +2830,7 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
     // A traversal-shaped request never resolves to OS files (route mismatch → 4xx).
     let (status, bytes) = get_bytes(
         router.clone(),
-        "/api/v1/kernel-measurements/km_http_test/plots/../curve.json",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/plots/../curve.json",
     )
     .await;
     assert_ne!(status, StatusCode::OK);
@@ -2395,7 +2838,7 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
     // Undeclared names are rejected with the artifact_missing problem body.
     let (status, error) = get_json(
         router,
-        "/api/v1/kernel-measurements/km_http_test/plots/summary.json",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/plots/summary.json",
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2665,8 +3108,11 @@ async fn hardware_gpus_http_route_resolves_and_requires_name() {
     write_gpu_spec_fixture(temporary.path());
     let router = prediction_test_router(temporary.path());
 
-    let (status, value) =
-        get_json(router.clone(), "/api/v1/hardware/gpus?name=NVIDIA%20H200").await;
+    let (status, value) = get_json(
+        router.clone(),
+        "/api/analyzer/v1/hardware/gpus?name=NVIDIA%20H200",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["matched"], true);
     assert_eq!(value["canonical_name"], "H200-SXM-141GB");
@@ -2677,7 +3123,7 @@ async fn hardware_gpus_http_route_resolves_and_requires_name() {
     assert_eq!(value["peaks"]["bf16_tflops"], 990.0);
     assert_eq!(value["hbm_bandwidth_gbps"], 4800.0);
 
-    let (status, value) = get_json(router.clone(), "/api/v1/hardware/gpus").await;
+    let (status, value) = get_json(router.clone(), "/api/analyzer/v1/hardware/gpus").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "gpu_name_required");
 }
@@ -2860,6 +3306,11 @@ fn write_alignment_bundle(root: &Path) -> (Vec<u8>, [usize; 2]) {
         json!({"iterations": [{"iteration_id": 8}]}).to_string(),
     )
     .expect("timeline report");
+    fs::write(
+        kernel.join("reports/alignment_iteration_report.json"),
+        json!({"schema_version": 2, "available": true}).to_string(),
+    )
+    .expect("iteration report");
 
     let first = json!({"iteration_id": 8, "measured": "eight"}).to_string();
     let second = json!({"iteration_id": 9, "measured": "nine"}).to_string();
@@ -2889,6 +3340,37 @@ fn write_alignment_bundle(root: &Path) -> (Vec<u8>, [usize; 2]) {
     )
     .expect("timeline payload");
 
+    let sequence = json!({
+        "phase": "forward",
+        "sequence_id": "sequence_a",
+        "expanded_kernel_count": 1,
+        "iterations": [8],
+        "tracks": [{
+            "track_index": 0,
+            "stream_role": "primary",
+            "kernel_count": 1,
+            "program": [{"kernels": [{"name": "kernel_a"}]}],
+        }],
+    })
+    .to_string();
+    fs::write(
+        kernel.join("payloads/alignment_sequence_programs.jsonl"),
+        format!("{sequence}\n"),
+    )
+    .expect("sequence shard");
+    fs::write(
+        kernel.join("payloads/alignment_iteration_series.json"),
+        json!({
+            "schema_version": 2,
+            "sequence_detail": {
+                "file": "alignment_sequence_programs.jsonl",
+                "byte_ranges": {"forward": {"sequence_a": [0, sequence.len()]}},
+            },
+        })
+        .to_string(),
+    )
+    .expect("iteration payload");
+
     // Configured but never run: manifest present, no report.
     let e2e = bundle.join("analysis_e2e");
     fs::create_dir_all(&e2e).expect("e2e dir");
@@ -2899,6 +3381,18 @@ fn write_alignment_bundle(root: &Path) -> (Vec<u8>, [usize; 2]) {
     fs::create_dir_all(bundle.join("profile/nsys")).expect("profile dir");
     fs::create_dir_all(bundle.join("simulation")).expect("simulation dir");
     (first.into_bytes(), [ranges[0][0], ranges[1][0]])
+}
+
+fn kernel_analysis_config(log_dir: &str) -> String {
+    format!(
+        "schema_version: 1\n\
+         profile_log_dir: ./profile\n\
+         timing_predict_log_dir: ./timing_predict\n\
+         log_dir: {log_dir}\n\
+         iteration:\n\
+           enabled: true\n\
+           labeled_kernel_sequences_file: ./kernel_sequences_labeled.json\n"
+    )
 }
 
 #[test]
@@ -2927,6 +3421,149 @@ fn alignment_catalog_reports_each_analysis_half_separately() {
 }
 
 #[test]
+fn analyze_kernel_yaml_selects_the_kernel_analysis_served_by_the_ui() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    let selected = bundle.join("analysis_kernel_mine");
+    fs::create_dir_all(selected.join("reports")).expect("selected reports");
+    fs::create_dir_all(selected.join("payloads")).expect("selected payloads");
+    fs::write(
+        selected.join("alignment_manifest.json"),
+        json!({"predict_log_dir": bundle.join("timing_predict_second_pass")}).to_string(),
+    )
+    .expect("selected manifest");
+    fs::write(
+        selected.join("reports/alignment_iteration_report.json"),
+        json!({"source": "mine"}).to_string(),
+    )
+    .expect("selected report");
+    fs::write(
+        selected.join("payloads/alignment_iteration_series.json"),
+        json!({"source": "mine"}).to_string(),
+    )
+    .expect("selected payload");
+    fs::write(
+        bundle.join("analyze_kernel.yaml"),
+        kernel_analysis_config("./analysis_kernel_mine"),
+    )
+    .expect("selection config");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    let discovered = discover_alignments(&roots).expect("discover");
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(
+        alignment_report(&discovered[0], "iteration").expect("selected report")["source"],
+        "mine"
+    );
+    assert_eq!(
+        alignment_payload(&discovered[0], "iteration").expect("selected payload")["source"],
+        "mine"
+    );
+    let descriptor = alignment_descriptor(&discovered[0], &roots);
+    assert_eq!(descriptor["prediction"]["prediction_id"], "p_unused");
+}
+
+#[test]
+fn configured_missing_kernel_analysis_never_falls_back_to_stale_legacy_results() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    fs::write(
+        bundle.join("analyze_kernel.yaml"),
+        kernel_analysis_config("./analysis_kernel_not_started"),
+    )
+    .expect("selection config");
+    fs::remove_file(bundle.join("analysis_e2e/alignment_manifest.json"))
+        .expect("remove unrelated e2e half");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    let discovered = discover_alignments(&roots).expect("discover");
+    assert_eq!(
+        discovered.len(),
+        1,
+        "the kernel config itself owns the bundle"
+    );
+    let descriptor = alignment_descriptor(&discovered[0], &roots);
+    assert_eq!(descriptor["lifecycle"]["kernel_analysis"], "not_started");
+    assert_eq!(descriptor["lifecycle"]["e2e_analysis"], "not_started");
+    assert_eq!(
+        descriptor["subjects"]["iteration"]["status"],
+        "not_generated"
+    );
+    assert!(alignment_report(&discovered[0], "iteration").is_err());
+}
+
+#[test]
+fn invalid_or_external_kernel_selection_never_exposes_legacy_results() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    let parent_escape = kernel_analysis_config("../outside_the_bundle");
+    let absolute_escape = kernel_analysis_config("/absolute/outside_the_bundle");
+    for config in [
+        "not: [valid yaml",
+        parent_escape.as_str(),
+        absolute_escape.as_str(),
+    ] {
+        fs::write(bundle.join("analyze_kernel.yaml"), config).expect("selection config");
+        let roots = configure_logs_roots(vec![temporary.path().to_path_buf()])
+            .expect("configure logs root");
+        let discovered = discover_alignments(&roots).expect("discover");
+        assert_eq!(discovered.len(), 1);
+        assert!(alignment_report(&discovered[0], "iteration").is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_regular_config_and_symlink_escape_never_expose_kernel_results() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    let config_path = bundle.join("analyze_kernel.yaml");
+    let real_config = bundle.join("real_analyze_kernel.yaml");
+    fs::write(&real_config, kernel_analysis_config("./analysis_kernel")).expect("real config");
+    symlink(&real_config, &config_path).expect("symlink config");
+
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let discovered = discover_alignments(&roots).expect("discover symlink config");
+    assert_eq!(discovered.len(), 1);
+    assert!(alignment_report(&discovered[0], "iteration").is_err());
+
+    fs::remove_file(&config_path).expect("remove config symlink");
+    let outside = temporary.path().join("outside_analysis");
+    fs::create_dir_all(outside.join("reports")).expect("outside reports");
+    fs::write(outside.join("alignment_manifest.json"), "{}").expect("outside manifest");
+    fs::write(
+        outside.join("reports/alignment_iteration_report.json"),
+        json!({"source": "outside"}).to_string(),
+    )
+    .expect("outside report");
+    symlink(&outside, bundle.join("linked_analysis")).expect("analysis symlink");
+    fs::write(&config_path, kernel_analysis_config("./linked_analysis")).expect("selection config");
+
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let discovered = discover_alignments(&roots).expect("discover escaped selection");
+    assert_eq!(discovered.len(), 1);
+    assert!(alignment_report(&discovered[0], "iteration").is_err());
+}
+
+#[test]
 fn the_bundle_is_the_analysis_parent_and_discovery_stops_there() {
     let temporary = TempDir::new().expect("temp dir");
     write_alignment_bundle(temporary.path());
@@ -2943,7 +3580,7 @@ fn the_bundle_is_the_analysis_parent_and_discovery_stops_there() {
 }
 
 #[test]
-fn an_ungenerated_subject_is_named_but_offers_no_href() {
+fn an_ungenerated_subject_is_named_but_serves_no_view() {
     let temporary = TempDir::new().expect("temp dir");
     write_alignment_bundle(temporary.path());
     let roots =
@@ -2953,14 +3590,22 @@ fn an_ungenerated_subject_is_named_but_offers_no_href() {
     let descriptor = alignment_descriptor(alignment, &roots);
 
     assert_eq!(descriptor["subjects"]["timeline"]["status"], "ready");
-    assert!(descriptor["subjects"]["timeline"]["payload_href"].is_string());
+    assert_eq!(descriptor["subjects"]["timeline"]["views"][1], "payload");
     // Missing is a state, not an absence: the client must be able to say "not
     // generated" rather than infer it from a key that is not there.
     assert_eq!(descriptor["subjects"]["e2e"]["status"], "not_generated");
-    assert!(descriptor["subjects"]["e2e"]["payload_href"].is_null());
-    // Only the sharded subjects offer a per-iteration href.
-    assert!(descriptor["subjects"]["timeline"]["iteration_href"].is_string());
-    assert!(descriptor["subjects"]["e2e"]["iteration_href"].is_null());
+    assert_eq!(
+        descriptor["subjects"]["e2e"]["views"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    // Only the sharded subjects can be read one iteration at a time.
+    assert_eq!(
+        descriptor["subjects"]["timeline"]["has_iteration_detail"],
+        true
+    );
+    assert_eq!(descriptor["subjects"]["e2e"]["has_iteration_detail"], false);
 }
 
 #[test]
@@ -3056,6 +3701,73 @@ fn one_iteration_is_read_by_byte_range_not_by_parsing_the_shard() {
 }
 
 #[test]
+fn a_zstd_frame_shard_serves_the_decoded_object() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let payloads = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32/analysis_kernel/payloads");
+    let lines = [
+        json!({"iteration_id": 8, "measured": "eight"}).to_string() + "\n",
+        json!({"iteration_id": 9, "measured": "nine"}).to_string() + "\n",
+    ];
+    let frames = lines
+        .iter()
+        .map(|line| zstd::bulk::compress(line.as_bytes(), 3).expect("frame"))
+        .collect::<Vec<_>>();
+    fs::write(
+        payloads.join("alignment_timeline_iterations.jsonl.zst"),
+        frames.concat(),
+    )
+    .expect("zstd shard");
+    fs::write(
+        payloads.join("alignment_timeline.json"),
+        json!({
+            "iterations": [{"iteration_id": 8}, {"iteration_id": 9}],
+            "iteration_detail": {
+                "file": "alignment_timeline_iterations.jsonl.zst",
+                "encoding": "zstd-frames",
+                "byte_ranges": {
+                    "8": [0, frames[0].len()],
+                    "9": [frames[0].len(), frames[1].len()],
+                },
+                "decoded_lengths": {"8": lines[0].len(), "9": lines[1].len()},
+            },
+        })
+        .to_string(),
+    )
+    .expect("timeline payload");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+
+    let second = alignment_iteration_detail(alignment, "timeline", "9").expect("iteration 9");
+
+    // The object alone, as a plain shard's range serves it: no trailing newline.
+    assert_eq!(second, lines[1].trim_end().as_bytes());
+}
+
+#[test]
+fn one_sequence_is_read_by_phase_and_id_from_its_shard() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+    let index = alignment_sequence_index(alignment).expect("sequence index");
+
+    let sequence =
+        read_alignment_sequence(&index, "forward", "sequence_a").expect("selected sequence");
+
+    assert_eq!(
+        serde_json::from_slice::<Value>(&sequence).expect("sequence json")["tracks"][0]["program"]
+            [0]["kernels"][0]["name"],
+        "kernel_a"
+    );
+    assert!(read_alignment_sequence(&index, "forward", "../../etc/passwd").is_err());
+}
+
+#[test]
 fn an_unknown_subject_or_iteration_is_a_missing_artifact_not_a_path() {
     let temporary = TempDir::new().expect("temp dir");
     write_alignment_bundle(temporary.path());
@@ -3084,4 +3796,20 @@ fn an_unknown_alignment_id_resolves_to_not_found() {
     assert!(resolve_alignment(&roots, "al_nope").is_err());
     let known = &discover_alignments(&roots).expect("discover")[0].alignment_id;
     assert!(resolve_alignment(&roots, known).is_ok());
+}
+
+#[tokio::test]
+async fn kernel_kinds_route_serves_each_kind_doc_title_and_category() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repository root above analyzer/rust");
+    let router = prediction_test_router(repo);
+
+    let (status, value) = get_json(router, "/api/analyzer/v1/kernel-kinds").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["categories"][0], "GEMM");
+    assert_eq!(value["kinds"]["single_gemm"]["category"], "GEMM");
+    assert_eq!(value["kinds"]["rms_norm"]["title"], "RMSNorm");
 }

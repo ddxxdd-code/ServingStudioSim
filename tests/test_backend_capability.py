@@ -34,10 +34,18 @@ def test_gemm_backend_is_locked_to_dtype():
     assert backend_supports("single_gemm", "torch_linear", DType.BF16)
     assert backend_supports("single_gemm", "torch_linear", DType.FP16)
     assert not backend_supports("single_gemm", "torch_linear", DType.FP8_E4M3)
+    # MXFP8 block-scaled compute is its own dtype: only the MXFP8 linear runs it,
+    # and that backend never serves per-tensor FP8 or BF16 rows.
+    assert supported_backends("single_gemm", DType.MXFP8_E4M3) == ["flashinfer_mxfp8"]
+    assert not backend_supports("single_gemm", "flashinfer_mxfp8", DType.FP8_E4M3)
+    assert not backend_supports("single_gemm", "flashinfer_mxfp8", DType.BF16)
+    assert not backend_supports(
+        "single_gemm", "flashinfer_mxfp8", DType.MXFP8_E4M3, gpu="NVIDIA H200"
+    )
 
 
 def test_attention_backend_dtype_matrix():
-    # Two axes — compute (q) and kv-cache. fp8 *compute* needs fa3/trt; fp8 *KV*
+    # Two axes — compute (q) and kv-cache. fp8 *compute* needs fa3; fp8 *KV*
     # alone is fine on fa2 (a current production config), but not on cudnn.
     for kind in (
         "flashinfer_attn_prefill",
@@ -50,9 +58,8 @@ def test_attention_backend_dtype_matrix():
         assert backend_supports(kind, "fa2", DType.BF16, DType.FP8_E4M3)
         # fp8 compute (query) is NOT supported by fa2.
         assert not backend_supports(kind, "fa2", DType.FP8_E4M3, DType.FP8_E4M3)
-        # fp8 compute needs fa3 (or trt).
+        # fp8 compute needs fa3.
         assert backend_supports(kind, "fa3", DType.FP8_E4M3, DType.FP8_E4M3)
-        assert backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3)
         # cudnn is bf16-only on BOTH axes — fp8 KV is not allowed even with bf16 q.
         assert backend_supports(kind, "cudnn", DType.BF16, DType.BF16)
         assert not backend_supports(kind, "cudnn", DType.BF16, DType.FP8_E4M3)
@@ -69,12 +76,25 @@ def test_comm_and_elementwise_are_dtype_agnostic():
 
 def test_supported_backends_filters_options_by_dtype():
     # The dry-run `options` column: filter registered backends to a dtype.
-    assert supported_backends("single_gemm", DType.FP8_E4M3) == ["deepgemm"]
-    assert supported_backends("single_gemm", DType.BF16) == ["torch", "torch_linear"]
-    assert set(supported_backends("flashinfer_attn_prefill", DType.FP8_E4M3)) == {
-        "fa3",
-        "trt",
-    }
+    assert supported_backends("single_gemm", DType.FP8_E4M3) == [
+        "deepgemm",
+        "flashinfer_fp8_tensor",
+    ]
+    # bmm_fp8's SM10x runners: per-tensor FP8 is not offered on Hopper.
+    assert "flashinfer_fp8_tensor" not in supported_backends(
+        "single_gemm", DType.FP8_E4M3, gpu="NVIDIA H200"
+    )
+    assert "flashinfer_fp8_tensor" in supported_backends(
+        "single_gemm", DType.FP8_E4M3, gpu="NVIDIA B200"
+    )
+    assert supported_backends("single_gemm", DType.BF16) == [
+        "torch",
+        "torch_linear_vllm",
+        "torch_linear",
+        "sglang_bf16_auto",
+        "sglang_fused_a_auto",
+    ]
+    assert supported_backends("flashinfer_attn_prefill", DType.FP8_E4M3) == ["fa3"]
     assert set(supported_backends("flashinfer_attn_prefill", DType.BF16)) == {
         "fa2",
         "fa3",
@@ -82,34 +102,92 @@ def test_supported_backends_filters_options_by_dtype():
     }
 
 
-def test_trt_attention_is_blackwell_gated():
-    # The real trt declaration is GPU-gated: fp8 is legal on B200 but NOT on H200
-    # (trtllm-gen kernels are Blackwell-only). An unknown GPU (None) skips the axis.
-    for kind in (
-        "flashinfer_attn_prefill",
-        "flashinfer_attn_decode",
-        "flashinfer_attn_rect",
-    ):
-        assert backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B200")
-        assert not backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200")
-        assert backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3)  # gpu=None → skip
-        # options at fp8: trt drops on H200 (keeps fa3), returns on B200.
-        assert supported_backends(kind, DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200") == [
-            "fa3"
-        ]
-        assert set(supported_backends(kind, DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B200")) == {
-            "fa3",
-            "trt",
-        }
+def test_trtllm_gen_paged_attention_is_blackwell_gated():
+    # trtllm-gen cubins ship for the SM10x family (sm_100f), so fp8 is legal on
+    # B200/B300 but NOT on H200. An unknown GPU (None) skips the axis.
+    backend = "flashinfer_trtllm_gen"
+    fp8 = DType.FP8_E4M3
+    for kind in ("paged_attn_batch_prefill", "paged_attn_batch_decode"):
+        assert backend_supports(kind, backend, fp8, fp8, gpu="NVIDIA B200")
+        assert backend_supports(kind, backend, fp8, fp8, gpu="NVIDIA B300")
+        assert not backend_supports(kind, backend, fp8, fp8, gpu="NVIDIA H200")
+        assert backend_supports(kind, backend, fp8, fp8)  # gpu=None → skip
+        assert supported_backends(kind, fp8, fp8, gpu="NVIDIA H200") == []
+        assert supported_backends(kind, fp8, fp8, gpu="NVIDIA B200") == [backend]
 
 
-def test_backend_support_allows_gpu_restriction():
-    only_b200 = BackendSupport(compute=frozenset({DType.FP8_E4M3}), gpus=frozenset({"NVIDIA B200"}))
-    assert only_b200.allows(DType.FP8_E4M3, gpu="NVIDIA B200")
-    assert not only_b200.allows(DType.FP8_E4M3, gpu="NVIDIA H200")
-    assert not only_b200.allows(DType.BF16, gpu="NVIDIA B200")
-    # gpu=None means "don't check the gpu axis".
-    assert only_b200.allows(DType.FP8_E4M3, gpu=None)
+def test_vllm_mla_rope_is_bf16_on_sm80_and_newer():
+    assert not backend_supports("vllm_mla_rope", "vllm_inductor", DType.BF16, gpu="NVIDIA V100")
+    assert backend_supports("vllm_mla_rope", "vllm_inductor", DType.BF16, gpu="NVIDIA A100")
+    assert backend_supports(
+        "vllm_mla_rope",
+        "vllm_inductor",
+        DType.BF16,
+        gpu="NVIDIA B200",
+    )
+    assert not backend_supports(
+        "vllm_mla_rope",
+        "vllm_inductor",
+        DType.FP16,
+        gpu="NVIDIA B200",
+    )
+
+
+def test_sm_targets_match_arch_specific_and_family_builds():
+    hopper_or_sm10x = BackendSupport(compute=None, sm_targets=frozenset({"sm_90a", "sm_100f"}))
+    # sm_90a is exactly SM90; sm_100f is every SM10x part.
+    for gpu in ("NVIDIA H100", "NVIDIA H200", "NVIDIA B200", "NVIDIA B300", "NVIDIA GB200"):
+        assert hopper_or_sm10x.allows(DType.BF16, gpu=gpu), gpu
+    for gpu in ("NVIDIA A100", "NVIDIA L40S"):
+        assert not hopper_or_sm10x.allows(DType.BF16, gpu=gpu), gpu
+
+    only_sm100 = BackendSupport(compute=None, sm_targets=frozenset({"sm_100a"}))
+    assert only_sm100.allows(DType.BF16, gpu="NVIDIA B200")
+    assert not only_sm100.allows(DType.BF16, gpu="NVIDIA B300")
+
+
+def test_min_compute_capability_admits_every_newer_gpu():
+    fp8 = BackendSupport(compute=None, min_compute_capability=(8, 9))
+    for gpu in ("NVIDIA L40S", "NVIDIA H200", "NVIDIA B300"):
+        assert fp8.allows(DType.FP8_E4M3, gpu=gpu), gpu
+    assert not fp8.allows(DType.FP8_E4M3, gpu="NVIDIA A100")
+    assert not fp8.allows(DType.FP8_E4M3, gpu="NVIDIA A40")
+
+
+def test_unknown_or_absent_gpu_skips_the_device_check():
+    support = BackendSupport(compute=None, sm_targets=frozenset({"sm_100f"}))
+    # No GPU, a name outside gpu/spec.json, and a non-CUDA part are not refused:
+    # the worker checks the real device when it profiles.
+    assert support.allows(DType.BF16, gpu=None)
+    assert support.allows(DType.BF16, gpu="Some Future GPU")
+    assert support.allows(DType.BF16, gpu="AMD MI300X")
+
+
+def test_catalog_aliases_resolve_to_compute_capability():
+    from profiling.gpu_catalog import gpu_compute_capability
+
+    assert gpu_compute_capability("NVIDIA H200") == (9, 0)
+    assert gpu_compute_capability("H100") == (9, 0)
+    assert gpu_compute_capability("NVIDIA B200") == (10, 0)
+    assert gpu_compute_capability("NVIDIA B300") == (10, 3)
+    assert gpu_compute_capability("NVIDIA L40S") == (8, 9)
+    assert gpu_compute_capability("AMD MI300X") is None
+    assert gpu_compute_capability("Some Future GPU") is None
+
+
+def test_validate_registry_rejects_unknown_sm_target():
+    bad = KernelProfilerSpec(
+        kernel_kind="single_gemm",
+        backend="torch",
+        supports=BackendSupport(compute=None, sm_targets=frozenset({"hopper"})),
+        runner_ref=RunnerRef(module_name="x", function_name="y"),
+        table_name="single_gemm",
+        args_schema=type("A", (), {}),
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+    )
+    with pytest.raises(ValueError, match="unknown sm target"):
+        _validate_registry([bad])
 
 
 def test_validate_registry_rejects_empty_dtype_set():

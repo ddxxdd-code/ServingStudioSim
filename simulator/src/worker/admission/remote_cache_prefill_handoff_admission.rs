@@ -60,7 +60,14 @@ impl<P: PendingOrderPolicy, K: RemotePrefixKv> IterAdmission<K>
             }
         }
     }
-    fn form_batch(&mut self, kv: &mut K, context: &WorkerContext, now: Time) -> bool {
+    fn form_batch(
+        &mut self,
+        kv: &mut K,
+        context: &WorkerContext,
+        batch_plan: &mut crate::worker::types::IterBatchPlan,
+        now: Time,
+    ) -> bool {
+        batch_plan.reset_decode_participation(kv.num_partitions(), true);
         self.state
             .form_batch(kv, context, now, PdStage::Prefill as u16, 1)
     }
@@ -68,6 +75,7 @@ impl<P: PendingOrderPolicy, K: RemotePrefixKv> IterAdmission<K>
         &mut self,
         kv: &mut K,
         context: &WorkerContext,
+        _batch_plan: &crate::worker::types::IterBatchPlan,
         events: &mut Vec<Event>,
         now: Time,
     ) {

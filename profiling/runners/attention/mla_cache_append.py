@@ -1,5 +1,9 @@
 """Profiling runners for GLM-5.2's plain MLA cache append.
 
+The vLLM backend also admits ``rope_dim=0`` (GLM-5.3-Flash: 512-wide latent,
+no decoupled RoPE key). Production passes ``k_pe.squeeze(1)`` of width 0 to the
+same ``concat_and_cache_mla`` op, which then writes only the latent row.
+
 The Torch timed callable contains only the two indexed writes that implement
 the semantic composite. The production-aligned vLLM callable is its single
 fused ``concat_and_cache_mla_kernel`` launch.
@@ -17,13 +21,12 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_KV_LORA_RANK = 512
-_ROPE_DIM = 64
-_BLOCK_SIZE = 64
+# The plain cache format takes kv_lora_rank, pe_dim, and block_size from the
+# tensors at runtime (vLLM concat_and_cache_mla only checks
+# kv_cache.size(2) == kv_lora_rank + pe_dim; the 512/64 checks there apply to
+# the fp8_ds_mla and nvfp4_ds_mla formats, not this one).
 _CACHE_FORMAT = "plain"
-_REQUIRED_GPU = "NVIDIA H200"
 _VLLM_KERNEL_NAME = "concat_and_cache_mla_kernel"
-_VLLM_CACHE_DTYPE = "auto"
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,10 @@ def _validate_args(
     input_dtype: DType | str,
     kv_dtype: DType | str,
     cache_format: str,
+    *,
+    allow_fp8_cache: bool = False,
+    allow_fp8_input: bool = False,
+    allow_zero_rope: bool = False,
 ) -> tuple[int, int, int, int, DType, DType, str]:
     num_tokens = int(num_tokens)
     kv_lora_rank = int(kv_lora_rank)
@@ -54,35 +61,24 @@ def _validate_args(
     kv_dtype = DType.from_value(kv_dtype)
     cache_format = str(cache_format)
 
-    if (
-        num_tokens <= 0
-        or kv_lora_rank <= 0
-        or rope_dim <= 0
-        or block_size <= 0
-    ):
+    min_rope_dim = 0 if allow_zero_rope else 1
+    if num_tokens <= 0 or kv_lora_rank <= 0 or rope_dim < min_rope_dim or block_size <= 0:
         raise ValueError(
-            "num_tokens, kv_lora_rank, rope_dim, and block_size must be > 0, "
+            f"num_tokens, kv_lora_rank, and block_size must be > 0 and rope_dim >= {min_rope_dim}, "
             f"got {num_tokens}, {kv_lora_rank}, {rope_dim}, and {block_size}"
         )
-    if (kv_lora_rank, rope_dim, block_size) != (
-        _KV_LORA_RANK,
-        _ROPE_DIM,
-        _BLOCK_SIZE,
-    ):
+    supported_kv_dtypes = {DType.BF16, DType.FP8_E4M3} if allow_fp8_cache else {DType.BF16}
+    supported_input_dtypes = {DType.BF16, DType.FP8_E4M3} if allow_fp8_input else {DType.BF16}
+    if input_dtype not in supported_input_dtypes or kv_dtype not in supported_kv_dtypes:
         raise ValueError(
-            "torch mla_cache_append requires "
-            "(kv_lora_rank, rope_dim, block_size) == (512, 64, 64), "
-            f"got ({kv_lora_rank}, {rope_dim}, {block_size})"
-        )
-    if input_dtype is not DType.BF16 or kv_dtype is not DType.BF16:
-        raise ValueError(
-            "torch mla_cache_append requires input_dtype=kv_dtype=bf16, "
+            f"mla_cache_append requires {'BF16 or FP8 E4M3' if allow_fp8_input else 'BF16'} "
+            "input and "
+            f"{'BF16 or FP8 E4M3' if allow_fp8_cache else 'BF16'} cache, "
             f"got {input_dtype.value} and {kv_dtype.value}"
         )
     if cache_format != _CACHE_FORMAT:
         raise ValueError(
-            "torch mla_cache_append requires cache_format='plain', "
-            f"got {cache_format!r}"
+            f"torch mla_cache_append requires cache_format='plain', got {cache_format!r}"
         )
     return (
         num_tokens,
@@ -95,32 +91,6 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the torch mla_cache_append backend"
-        )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            "torch mla_cache_append is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
-        )
-
-
-def _validate_vllm_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the mla_cache_append vllm_cuda backend"
-        )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            "mla_cache_append vllm_cuda is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
-        )
-
-
 def _build_operands(
     torch: Any,
     *,
@@ -129,6 +99,7 @@ def _build_operands(
     rope_dim: int,
     block_size: int,
     torch_dtype: Any,
+    cache_torch_dtype: Any,
     device: str,
 ) -> _MlaCacheAppendOperands:
     """Allocate exact plain-cache operands and deterministic scattered slots."""
@@ -163,7 +134,7 @@ def _build_operands(
     cache = torch.full(
         (num_blocks, block_size, kv_lora_rank + rope_dim),
         -1,
-        dtype=torch_dtype,
+        dtype=cache_torch_dtype,
         device=device,
     )
     return _MlaCacheAppendOperands(
@@ -203,9 +174,7 @@ def _logical_bytes(
     """Return logical read/write traffic, excluding allocation/initialization."""
     row_width = kv_lora_rank + rope_dim
     return num_tokens * (
-        row_width * input_dtype.size_bytes()
-        + row_width * kv_dtype.size_bytes()
-        + 8
+        row_width * input_dtype.size_bytes() + row_width * kv_dtype.size_bytes() + 8
     )
 
 
@@ -243,8 +212,6 @@ def profile_mla_cache_append_torch(
             "torch is required for the torch mla_cache_append backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -253,6 +220,7 @@ def profile_mla_cache_append_torch(
             rope_dim=rope_dim,
             block_size=block_size,
             torch_dtype=input_dtype.torch(),
+            cache_torch_dtype=kv_dtype.torch(),
             device="cuda",
         )
 
@@ -282,9 +250,7 @@ def profile_mla_cache_append_torch(
             input_dtype=input_dtype,
             kv_dtype=kv_dtype,
         )
-        bandwidth_gbps = (
-            logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
-        )
+        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,
@@ -293,6 +259,117 @@ def profile_mla_cache_append_torch(
         )
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_mla_cache_append_sglang_cuda(
+    num_tokens: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+    block_size: int,
+    input_dtype: DType | str,
+    kv_dtype: DType | str,
+    cache_format: str,
+) -> ComputeMetrics:
+    """Profile SGLang's scatter of already-quantized FP8 MLA cache rows."""
+    (
+        num_tokens,
+        kv_lora_rank,
+        rope_dim,
+        block_size,
+        input_dtype,
+        kv_dtype,
+        _cache_format,
+    ) = _validate_args(
+        num_tokens,
+        kv_lora_rank,
+        rope_dim,
+        block_size,
+        input_dtype,
+        kv_dtype,
+        cache_format,
+        allow_fp8_cache=True,
+        allow_fp8_input=True,
+    )
+    if input_dtype is not DType.FP8_E4M3 or kv_dtype is not DType.FP8_E4M3:
+        raise ProfilerNotImplemented(
+            "mla_cache_append:sglang_cuda requires pre-quantized FP8 input and FP8 cache"
+        )
+    try:
+        import torch
+        from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_triton
+    except (ImportError, OSError) as exc:
+        raise ProfilerNotImplemented(
+            "mla_cache_append:sglang_cuda requires the SGLang environment"
+        ) from exc
+
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        generator = torch.Generator(device=device).manual_seed(42)
+        num_slots = max(256, math.ceil(num_tokens / block_size) + 1) * block_size
+        kv_buffer = torch.zeros(
+            (num_slots, 1, kv_lora_rank + rope_dim),
+            dtype=torch.uint8,
+            device=device,
+        )
+        cache_k_nope = torch.randint(
+            0,
+            255,
+            (num_tokens, 1, kv_lora_rank),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+        cache_k_rope = torch.randint(
+            0,
+            255,
+            (num_tokens, 1, rope_dim),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+        locations = torch.randperm(
+            num_slots,
+            device=device,
+            generator=generator,
+        )[:num_tokens].to(torch.int64)
+
+        def kernel() -> None:
+            set_mla_kv_buffer_triton(kv_buffer, locations, cache_k_nope, cache_k_rope)
+
+        kernel()
+        torch.cuda.synchronize()
+        time_ms = Timer.cupti(kernel, warmup=5)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+    logical_bytes = _logical_bytes(
+        num_tokens=num_tokens,
+        kv_lora_rank=kv_lora_rank,
+        rope_dim=rope_dim,
+        input_dtype=input_dtype,
+        kv_dtype=kv_dtype,
+    )
+    bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        tflops=0.0,
+        memory_bandwidth_gbps=float(bandwidth_gbps),
+        energy_j=float(energy_j),
+    )
+
+
+def _verify_vllm_launch(
+    torch: Any, kernel: Any, operands: _MlaCacheAppendOperands, kv_lora_rank: int
+) -> None:
+    """Untimed: every mapped slot holds [kv_c, k_pe] cast to the cache dtype (scale 1)."""
+    kernel()
+    torch.cuda.synchronize()
+    rows = operands.cache[operands.block_indices, operands.block_offsets].float()
+    expected = torch.cat([operands.kv_c, operands.k_pe], dim=-1).to(operands.cache.dtype).float()
+    torch.testing.assert_close(rows, expected, rtol=0.0, atol=0.0)
+    if rows.shape[-1] != kv_lora_rank + operands.k_pe.shape[-1]:
+        raise AssertionError("cache row width must equal kv_lora_rank + rope_dim")
 
 
 def profile_mla_cache_append_vllm_cuda(
@@ -321,6 +398,8 @@ def profile_mla_cache_append_vllm_cuda(
         input_dtype,
         kv_dtype,
         cache_format,
+        allow_fp8_cache=True,
+        allow_zero_rope=True,
     )
     try:
         import torch
@@ -331,8 +410,6 @@ def profile_mla_cache_append_vllm_cuda(
             "the mla_cache_append vllm_cuda backend"
         ) from exc
 
-    _validate_vllm_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -341,6 +418,9 @@ def profile_mla_cache_append_vllm_cuda(
             rope_dim=rope_dim,
             block_size=block_size,
             torch_dtype=input_dtype.torch(),
+            cache_torch_dtype=(
+                torch.float8_e4m3fn if kv_dtype is DType.FP8_E4M3 else kv_dtype.torch()
+            ),
             device="cuda",
         )
         scale = torch.ones((), dtype=torch.float32, device="cuda")
@@ -351,9 +431,11 @@ def profile_mla_cache_append_vllm_cuda(
                 operands.k_pe,
                 operands.cache,
                 operands.slot_mapping,
-                _VLLM_CACHE_DTYPE,
+                "auto" if kv_dtype is DType.BF16 else "fp8_e4m3",
                 scale,
             )
+
+        _verify_vllm_launch(torch, kernel, operands, kv_lora_rank)
 
         # Allocation and layout setup stay outside the callable. The CUPTI
         # filter selects only vLLM's one fused device launch.
@@ -373,9 +455,7 @@ def profile_mla_cache_append_vllm_cuda(
             input_dtype=input_dtype,
             kv_dtype=kv_dtype,
         )
-        bandwidth_gbps = (
-            logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
-        )
+        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,

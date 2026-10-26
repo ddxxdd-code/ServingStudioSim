@@ -50,6 +50,43 @@ pub enum BuildError {
 
     #[error("cache fit failed for {kind}: {reason}")]
     FitFailed { kind: KernelKind, reason: String },
+
+    /// A config's grid cells map to different profile.db args under two of its
+    /// backends in a column other than `backend`. A kernel-config record holds
+    /// one set of args per cell, so this would record the wrong rows.
+    #[error(
+        "{kind} enumerates different profile.db args for backends {first} and {other}; \
+         a kernel-config record needs args that differ only in `backend`"
+    )]
+    BackendDependentArgs {
+        kind: KernelKind,
+        first: &'static str,
+        other: &'static str,
+    },
+
+    /// A position's candidate backends disagree on a property that sets the
+    /// leaves around the kernel, so no one leaf structure fits them all and
+    /// best-of-N cannot choose between them.
+    #[error(
+        "{role} ({kind}): backends {backends:?} disagree on whether {property}; \
+         list backends that agree"
+    )]
+    MixedBackendProperty {
+        kind: KernelKind,
+        role: String,
+        backends: Vec<&'static str>,
+        property: &'static str,
+    },
+
+    /// None of a position's candidate backends can run a launch shape the
+    /// position issues.
+    #[error("{role} ({kind}): none of backends {backends:?} can run {launch}")]
+    NoBackendForLaunch {
+        kind: KernelKind,
+        role: String,
+        backends: Vec<&'static str>,
+        launch: &'static str,
+    },
 }
 
 impl BuildError {

@@ -23,7 +23,10 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::PathBuf;
 
-use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::contract::{
+    ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput,
+    SpeculativeUnifiedModel, UnifiedArchInput,
+};
 use crate::common::{Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
@@ -116,6 +119,10 @@ pub struct CostBuffers {
     /// Time is `kernel_time * gpu_time_multiplier` (inter-kernel overhead). From
     /// the worker's [`WorkerConfig`]; 1.0 = no overhead (predict passes 1.0).
     gpu_time_multiplier: f64,
+    /// Multiplier [`run_iter`](Self::run_iter) applies instead when the batch
+    /// schedules any prefill tokens. Equals `gpu_time_multiplier` unless set by
+    /// [`with_prefill_gpu_time_multiplier`](Self::with_prefill_gpu_time_multiplier).
+    prefill_gpu_time_multiplier: f64,
 }
 
 impl CostBuffers {
@@ -151,7 +158,18 @@ impl CostBuffers {
             cache: HashMap::default(),
             key_scratch: Vec::new(),
             gpu_time_multiplier,
+            prefill_gpu_time_multiplier: gpu_time_multiplier,
         }
+    }
+
+    /// Scale prefill-bearing iterations by `multiplier` instead of
+    /// `gpu_time_multiplier`; `None` keeps the single multiplier. Only
+    /// [`run_iter`](Self::run_iter) distinguishes the stages.
+    pub fn with_prefill_gpu_time_multiplier(mut self, multiplier: Option<f64>) -> Self {
+        if let Some(multiplier) = multiplier {
+            self.prefill_gpu_time_multiplier = multiplier;
+        }
+        self
     }
 
     /// Iter-wise convenience constructor: the model exposes one fused CostTree, so
@@ -216,6 +234,35 @@ impl CostBuffers {
             Option<&mut Vec<SlotInput>>,
         ) -> LeafMetrics,
     {
+        let multiplier = self.gpu_time_multiplier;
+        self.run_section_scaled(
+            section, layer, iter_id, batch_id, groups, cache_key, now, multiplier, eval,
+        )
+    }
+
+    /// [`run_section`](Self::run_section) with the wall-time multiplier chosen
+    /// by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn run_section_scaled<G, F>(
+        &mut self,
+        section: &'static str,
+        layer: i16,
+        iter_id: u64,
+        batch_id: u64,
+        groups: &G,
+        cache_key: Option<&[u32]>,
+        now: Time,
+        multiplier: f64,
+        eval: F,
+    ) -> Time
+    where
+        G: GroupLogSource,
+        F: FnOnce(
+            &mut Vec<LeafMetrics>,
+            &mut Vec<LeafMetrics>,
+            Option<&mut Vec<SlotInput>>,
+        ) -> LeafMetrics,
+    {
         // Build the key (packed section name + the caller's small identity) and try a
         // hit. Reuses `key_scratch`, so a hit allocates nothing.
         if let Some(ck) = cache_key {
@@ -259,7 +306,7 @@ impl CostBuffers {
                         tracing::warn!("cost_log record failed: {e}");
                     }
                 }
-                return self.wall_time(&agg);
+                return wall_time(&agg, multiplier);
             }
         }
 
@@ -315,15 +362,7 @@ impl CostBuffers {
             }
             self.cache.insert(self.key_scratch.as_slice().into(), snap);
         }
-        self.wall_time(&agg)
-    }
-
-    /// kernel-folded time → wall `Time`, applying this worker's inter-kernel
-    /// `gpu_time_multiplier` (≥ 1.0). The single place the overhead enters the
-    /// clock; `cost_log` rows are written pre-scale (pure kernel) by the callers
-    /// above, so folding a row's `slot_time_ms` still reproduces its `total_time_ms`.
-    fn wall_time(&self, agg: &LeafMetrics) -> Time {
-        Time::from_ms(agg.m.time_ms as f64 * self.gpu_time_multiplier)
+        wall_time(&agg, multiplier)
     }
 
     /// Iter-wise convenience over [`run_section`](Self::run_section): the whole
@@ -340,21 +379,86 @@ impl CostBuffers {
     ) -> Time {
         // One batch per iteration today; AFD/TBO emit several batches sharing an
         // iter_id with distinct batch_id via `run_section` instead.
-        // `run_section` already applies `gpu_time_multiplier` and returns wall Time.
-        self.run_section(
+        // `run_section_scaled` applies the stage's multiplier and returns wall Time.
+        let multiplier =
+            self.iter_multiplier(arch_input.groups.iter().any(|g| g.prefill_tokens > 0));
+        let eval = |slots: &mut Vec<LeafMetrics>,
+                    scratch: &mut Vec<LeafMetrics>,
+                    inputs: Option<&mut Vec<SlotInput>>| match inputs {
+            Some(i) => model.eval_iter_with_inputs(arch_input, slots, scratch, i),
+            None => model.eval_iter(arch_input, slots, scratch),
+        };
+        // `None` cache key: one fused eval per iteration — nothing to memoize.
+        if model.logs_decode_kv_lens() {
+            let groups = DecodeKvLensGroupLog {
+                groups: &arch_input.groups,
+            };
+            self.run_section_scaled("iter", -1, iter_id, 0, &groups, None, now, multiplier, eval)
+        } else {
+            self.run_section_scaled(
+                "iter",
+                -1,
+                iter_id,
+                0,
+                &arch_input.groups,
+                None,
+                now,
+                multiplier,
+                eval,
+            )
+        }
+    }
+
+    /// The wall-time multiplier of one whole iteration: the prefill one when it
+    /// schedules any prefill tokens, `gpu_time_multiplier` otherwise.
+    fn iter_multiplier(&self, schedules_prefill: bool) -> f64 {
+        if schedules_prefill {
+            self.prefill_gpu_time_multiplier
+        } else {
+            self.gpu_time_multiplier
+        }
+    }
+
+    /// [`run_iter`](Self::run_iter) for a speculating model. Same one fused
+    /// `iter` section and stage multiplier, evaluated through the speculative
+    /// face and logged through [`SpeculativeGroupLog`] so the row separates
+    /// decode query rows from decode request count.
+    pub fn run_speculative_iter<M: SpeculativeUnifiedModel + ?Sized>(
+        &mut self,
+        model: &M,
+        arch_input: &SpeculativeArchInput,
+        iter_id: u64,
+        now: Time,
+    ) -> Time {
+        let multiplier =
+            self.iter_multiplier(arch_input.groups.iter().any(|g| g.prefill_tokens > 0));
+        self.run_section_scaled(
             "iter",
             -1,
             iter_id,
             0,
-            &arch_input.groups,
+            &SpeculativeGroupLog {
+                groups: &arch_input.groups,
+                draft_tokens: arch_input.draft_tokens,
+                max_model_len: model.max_model_len(),
+            },
             None, // one fused eval per iteration — nothing to memoize
             now,
+            multiplier,
             |slots, scratch, inputs| match inputs {
-                Some(i) => model.eval_iter_with_inputs(arch_input, slots, scratch, i),
-                None => model.eval_iter(arch_input, slots, scratch),
+                Some(i) => model.eval_speculative_iter_with_inputs(arch_input, slots, scratch, i),
+                None => model.eval_speculative_iter(arch_input, slots, scratch),
             },
         )
     }
+}
+
+/// kernel-folded time → wall `Time`, applying the inter-kernel multiplier
+/// (≥ 1.0). The single place the overhead enters the clock; `cost_log` rows are
+/// written pre-scale (pure kernel) by the callers above, so folding a row's
+/// `slot_time_ms` still reproduces its `total_time_ms`.
+fn wall_time(agg: &LeafMetrics, multiplier: f64) -> Time {
+    Time::from_ms(agg.m.time_ms as f64 * multiplier)
 }
 
 /// The per-row `input_section` source for [`CostBuffers::run_section`]. Different
@@ -379,6 +483,36 @@ impl GroupLogSource for Vec<ArchGroupInput> {
                 decode_request_count: g.decode_tokens,
                 decode_kv_total: g.total_kv_len,
                 prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                // An ordinary decode request is exactly one query row, so the
+                // two columns coincide here and diverge only under speculation.
+                decode_query_rows: g.decode_tokens,
+                speculative_geometry: None,
+                decode_kv_lens: None,
+            });
+        }
+    }
+}
+
+/// Borrowed [`GroupLogSource`] that also keeps every decode request's KV length,
+/// for models whose necessary work is not linear in the KV total
+/// ([`IterwiseUnifiedModel::logs_decode_kv_lens`]).
+struct DecodeKvLensGroupLog<'a> {
+    groups: &'a [ArchGroupInput],
+}
+
+impl GroupLogSource for DecodeKvLensGroupLog<'_> {
+    fn fill_group_log(&self, dst: &mut Vec<GroupInputLog>) {
+        dst.clear();
+        for g in self.groups {
+            dst.push(GroupInputLog {
+                batch_tokens: g.batch_tokens,
+                prefill_tokens: g.prefill_tokens,
+                decode_request_count: g.decode_tokens,
+                decode_kv_total: g.total_kv_len,
+                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                decode_query_rows: g.decode_tokens,
+                speculative_geometry: None,
+                decode_kv_lens: Some(g.decode_kv_lens.clone()),
             });
         }
     }
@@ -396,6 +530,50 @@ impl GroupLogSource for Vec<u32> {
                 decode_request_count: 0,
                 decode_kv_total: 0,
                 prefill_chunk_pairs: Vec::new(),
+                decode_query_rows: 0,
+                speculative_geometry: None,
+                decode_kv_lens: None,
+            });
+        }
+    }
+}
+
+/// Borrowed [`GroupLogSource`] over a speculative iteration's groups.
+///
+/// A wrapper rather than an impl on `Vec<SpeculativeArchGroupInput>` because the
+/// two decode columns are distinct quantities here: `decode_request_count` counts
+/// requests, `decode_query_rows` counts the verify rows those requests submit.
+/// Borrowing keeps the held [`SpeculativeArchInput`] buffer intact — the log row
+/// is written from it, not from a copy of it.
+struct SpeculativeGroupLog<'a> {
+    groups: &'a [SpeculativeArchGroupInput],
+    draft_tokens: u32,
+    max_model_len: u32,
+}
+
+impl GroupLogSource for SpeculativeGroupLog<'_> {
+    fn fill_group_log(&self, dst: &mut Vec<GroupInputLog>) {
+        dst.clear();
+        for g in self.groups {
+            dst.push(GroupInputLog {
+                batch_tokens: g.batch_tokens,
+                prefill_tokens: g.prefill_tokens,
+                decode_request_count: g.decode_requests.len() as u32,
+                decode_kv_total: g.total_kv_len,
+                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                // The verify width makes these diverge: one request submits
+                // `draft_tokens + 1` rows.
+                decode_query_rows: g.decode_tokens,
+                speculative_geometry: Some(crate::log::rows::SpeculativeGeometryLog {
+                    draft_tokens: self.draft_tokens,
+                    max_model_len: self.max_model_len,
+                    decode: g
+                        .decode_requests
+                        .iter()
+                        .map(|r| (r.kv_len, r.query_len))
+                        .collect(),
+                }),
+                decode_kv_lens: None,
             });
         }
     }
@@ -569,6 +747,92 @@ mod tests {
             },
         );
         assert_eq!(hit.as_ms(), 5.0);
+    }
+
+    /// A prefill multiplier scales only iterations that schedule prefill tokens;
+    /// a decode-only iteration keeps `gpu_time_multiplier`, and without the
+    /// override both stages share it.
+    #[test]
+    fn prefill_multiplier_scales_only_prefill_bearing_iterations() {
+        let model = crate::test_helpers::FakeModel::for_ms(2.0);
+        let decode = UnifiedArchInput {
+            groups: vec![grp(&[100, 200])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let mut mixed = decode.clone();
+        mixed.groups[0].prefill_tokens = 512;
+        mixed.groups[0].batch_tokens += 512;
+        let now = Time::from_ms(0.0);
+
+        let mut staged = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.25)
+            .with_prefill_gpu_time_multiplier(Some(1.5));
+        assert_eq!(staged.run_iter(&model, &decode, 0, now).as_ms(), 2.5);
+        assert_eq!(staged.run_iter(&model, &mixed, 1, now).as_ms(), 3.0);
+
+        let mut single = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.25)
+            .with_prefill_gpu_time_multiplier(None);
+        assert_eq!(single.run_iter(&model, &decode, 0, now).as_ms(), 2.5);
+        assert_eq!(single.run_iter(&model, &mixed, 1, now).as_ms(), 2.5);
+    }
+
+    /// The speculative face picks its multiplier by the same prefill test.
+    #[test]
+    fn prefill_multiplier_scales_prefill_bearing_verify_passes() {
+        struct TwoMsSpeculativeModel;
+        impl SpeculativeUnifiedModel for TwoMsSpeculativeModel {
+            fn eval_speculative_iter(
+                &self,
+                _batch: &SpeculativeArchInput,
+                _slots: &mut Vec<LeafMetrics>,
+                _scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                LeafMetrics {
+                    m: Metrics4 {
+                        time_ms: 2.0,
+                        flops: 0.0,
+                        bytes: 0.0,
+                        energy_j: 0.0,
+                    },
+                    coverage: CoverageFlags::EMPTY,
+                    backend_index: LeafMetrics::NO_BACKEND,
+                }
+            }
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                crate::arch::kv_layout::KvCacheLayout::new()
+                    .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1))
+            }
+            fn max_model_len(&self) -> u32 {
+                4096
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+        }
+        let decode = SpeculativeArchInput {
+            draft_tokens: 3,
+            groups: vec![SpeculativeArchGroupInput {
+                batch_tokens: 4,
+                decode_tokens: 4,
+                ..Default::default()
+            }],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let mut mixed = decode.clone();
+        mixed.groups[0].prefill_tokens = 512;
+        mixed.groups[0].batch_tokens += 512;
+        let now = Time::from_ms(0.0);
+
+        let mut staged = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.25)
+            .with_prefill_gpu_time_multiplier(Some(1.5));
+        let model = TwoMsSpeculativeModel;
+        assert_eq!(
+            staged.run_speculative_iter(&model, &decode, 0, now).as_ms(),
+            2.5
+        );
+        assert_eq!(
+            staged.run_speculative_iter(&model, &mixed, 1, now).as_ms(),
+            3.0
+        );
     }
 
     /// With a logger attached, every call still emits one `cost_log` row (a hit does

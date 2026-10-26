@@ -5,16 +5,16 @@ use crate::worker::admission::LoadBalance;
 use crate::worker::execution::{IterModelExecution, UnifiedIterExecution};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::{FullAttnKv, IterWorkerKv};
+use crate::worker::kv::{IterWorkerKv, KvCacheStore};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{PdDecodeEvent, PdDecodeMsg, WorkerStatus};
 
 use super::decode_core::DecodeCore;
-pub(super) use super::decode_core::PULL_BUDGET_FRACTION;
+
 pub struct PullDecodeWorker<K: IterWorkerKv, E: IterModelExecution<K>> {
     core: DecodeCore<K, E>,
 }
-pub type PdDecodeWorker<M> = PullDecodeWorker<FullAttnKv, UnifiedIterExecution<M>>;
+pub type PdDecodeWorker<M> = PullDecodeWorker<KvCacheStore, UnifiedIterExecution<M>>;
 impl<K: IterWorkerKv, E: IterModelExecution<K>> PullDecodeWorker<K, E> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_components(
@@ -25,7 +25,7 @@ impl<K: IterWorkerKv, E: IterModelExecution<K>> PullDecodeWorker<K, E> {
         cluster: SharedGpuCluster,
         receive_group_id: u16,
         pull_budget_tokens: u64,
-        kv_bytes_per_token: u64,
+        kv_accounting: crate::worker::kv::SharedKvAccounting,
     ) -> Self {
         Self {
             core: DecodeCore::from_components(
@@ -36,7 +36,7 @@ impl<K: IterWorkerKv, E: IterModelExecution<K>> PullDecodeWorker<K, E> {
                 cluster,
                 receive_group_id,
                 pull_budget_tokens,
-                kv_bytes_per_token,
+                kv_accounting,
             ),
         }
     }
@@ -107,6 +107,7 @@ mod tests {
             WorkerId(0),
             "decode",
             Arc::new(FakeModel {
+                kv_layout: None,
                 ms: 1.0,
                 dp_groups: num_partitions,
             }),
@@ -221,6 +222,7 @@ mod tests {
             WorkerId(0),
             "decode",
             Arc::new(FakeModel {
+                kv_layout: None,
                 ms: 1.0,
                 dp_groups: 1,
             }),
@@ -261,6 +263,7 @@ mod tests {
             WorkerId(0),
             "decode",
             Arc::new(FakeModel {
+                kv_layout: None,
                 ms: 1.0,
                 dp_groups: 1,
             }),

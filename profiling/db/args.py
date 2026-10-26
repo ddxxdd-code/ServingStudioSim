@@ -10,9 +10,13 @@ kernels or L1b registry/table code.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from enum import StrEnum
-from typing import Any
+from functools import cache
+from types import NoneType, UnionType
+from typing import Any, get_args, get_type_hints
+
+from profiling.db.doc import arg, optional_arg
 
 
 class DType(StrEnum):
@@ -23,8 +27,16 @@ class DType(StrEnum):
     FP32 = "fp32"
     FP8_E4M3 = "fp8_e4m3"
     FP8_E5M2 = "fp8_e5m2"
+    # OCP MX block format: e4m3 data with one ue8m0 scale per 32 elements.
+    MXFP8_E4M3 = "mxfp8_e4m3"
     INT8 = "int8"
     INT4 = "int4"
+    # Packed e2m1 elements with one fp8 scale per 16-element group: the operand
+    # format of Blackwell FP4 tensor cores. No torch dtype holds it unpacked.
+    NVFP4_E2M1 = "nvfp4_e2m1"
+    # OCP MX block format: packed e2m1 elements with one ue8m0 scale per 32
+    # elements. No torch dtype holds it unpacked.
+    MXFP4_E2M1 = "mxfp4_e2m1"
 
     @classmethod
     def from_value(cls, value: Any) -> DType:
@@ -39,6 +51,7 @@ class DType(StrEnum):
             "torch.bfloat16": cls.BF16,
             "float32": cls.FP32,
             "torch.float32": cls.FP32,
+            "mxfp8": cls.MXFP8_E4M3,
         }
         if normalized in aliases:
             return aliases[normalized]
@@ -51,8 +64,12 @@ class DType(StrEnum):
             DType.FP32: 4,
             DType.FP8_E4M3: 1,
             DType.FP8_E5M2: 1,
+            # Data bytes only; the per-32 ue8m0 scale adds 1/32 byte per element.
+            DType.MXFP8_E4M3: 1,
             DType.INT8: 1,
             DType.INT4: 0.5,
+            DType.NVFP4_E2M1: 0.5,
+            DType.MXFP4_E2M1: 0.5,
         }[self]
 
     # Keep framework conversions lazy so importing DB schemas does not import
@@ -87,6 +104,49 @@ class KernelArgs:
     """
 
 
+@cache
+def field_types(args_schema: type[KernelArgs]) -> dict[str, Any]:
+    """Resolved field types of an args dataclass, in field order.
+
+    ``get_type_hints`` re-evaluates every string annotation on each call, and a
+    build coerces and keys thousands of specs against a few dozen schemas;
+    resolved once per schema, it drops from about half of the profile.db query
+    time to nothing.
+    """
+
+    type_hints = get_type_hints(args_schema)
+    return {field.name: _value_type(type_hints[field.name]) for field in fields(args_schema)}
+
+
+@cache
+def optional_fields(args_schema: type[KernelArgs]) -> dict[str, str]:
+    """``{field: same_as}`` of each field declared with ``optional_arg``."""
+
+    return {f.name: f.metadata["same_as"] for f in fields(args_schema) if "same_as" in f.metadata}
+
+
+def canonical_args(args: KernelArgs) -> KernelArgs:
+    """``args`` with each optional field that equals its ``same_as`` field unset,
+    so a call has one key whether or not its spec spelled the field out."""
+
+    changes = {
+        name: None
+        for name, same_as in optional_fields(type(args)).items()
+        if getattr(args, name) is not None and getattr(args, name) == getattr(args, same_as)
+    }
+    return replace(args, **changes) if changes else args
+
+
+def _value_type(annotation: Any) -> Any:
+    """The type an optional field holds when set (``int | None`` -> ``int``)."""
+
+    if isinstance(annotation, UnionType):
+        members = [member for member in get_args(annotation) if member is not NoneType]
+        if len(members) == 1:
+            return members[0]
+    return annotation
+
+
 @dataclass(frozen=True)
 class Fp8BlockscaleGroupedGemmArgs(KernelArgs):
     """Exact TRT-LLM GroupedWithOffset gate-up GEMM cache identity.
@@ -98,22 +158,29 @@ class Fp8BlockscaleGroupedGemmArgs(KernelArgs):
     ``num_input_tokens * experts_per_token`` capacity.
     """
 
-    n: int
-    k: int
-    dtype: DType
-    num_local_experts: int
-    num_input_tokens: int
-    experts_per_token: int
-    per_group_batches: tuple[int, ...]
+    n: int = arg(unit="elements", doc="Output features in each expert weight.")
+    k: int = arg(unit="elements", doc="Input features in each expert weight.")
+    dtype: DType = arg(doc="Element type of activations and weights; output is bf16.")
+    num_local_experts: int = arg(unit="experts", doc="Experts assigned to this GPU.")
+    num_input_tokens: int = arg(unit="tokens", doc="Input tokens before top-k expert selection.")
+    experts_per_token: int = arg(unit="experts", doc="Experts selected for each input token.")
+    per_group_batches: tuple[int, ...] = arg(
+        unit="tokens", doc="Routed token rows assigned to each local expert, in expert order."
+    )
 
 
 @dataclass(frozen=True)
 class KvCacheAppendArgs(KernelArgs):
-    num_kv_heads: int
-    head_dim: int
-    block_size: int
-    input_dtype: DType
-    kv_dtype: DType
-    cache_layout: str
-    scale_granularity: str
-    num_tokens: int
+    num_kv_heads: int = arg(unit="heads", doc="KV heads written for each token.")
+    head_dim: int = arg(unit="elements", doc="Elements in each key head.")
+    block_size: int = arg(unit="tokens", doc="Token slots in each cache page.")
+    input_dtype: DType = arg(doc="Element type of the new keys and values.")
+    kv_dtype: DType = arg(doc="Element type stored in the KV cache.")
+    cache_layout: str = arg(doc="Physical cache layout, NHD or HND.")
+    scale_granularity: str = arg(doc="FP8 scale granularity, tensor or head.")
+    num_tokens: int = arg(unit="tokens", doc="New tokens whose keys and values are written.")
+    head_dim_v: int | None = optional_arg(
+        unit="elements",
+        same_as="head_dim",
+        doc="Elements in each value head; absent when equal to head_dim (symmetric K/V).",
+    )

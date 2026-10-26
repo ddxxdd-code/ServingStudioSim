@@ -24,27 +24,37 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
+from profiling.gpu_policy import gpu_disabled
+
 from .artifact_kind import ArtifactKind, write_artifact_kind
+from .corpus import CorpusError, resolve_hf_references
 from .exec import (
+    ERROR_JSON,
     REPO_ROOT,
     _build_subprocess_env,
+    binary_error,
     binary_path,
     cargo_build,
     run_analysis,
+    run_essential_analysis,
     run_iter_breakdown,
     run_logged_process,
 )
 from .managed_job import prepare_managed_job
+from .process import ProcessSpec, ProcessSupervisor
 from .process.artifacts import ArtifactValidationError, validate_timing_prediction_artifacts
 from .process.journal import RunJournal, StageState
 from .process.leases import LauncherLeases
 
 _LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
+_PROCESS_SUPERVISOR = ProcessSupervisor()
 
 # The simulator's offline writer uses this physical stream tag. The prediction
 # API keeps it private, but the semantic labeler needs one stable key to match
@@ -54,14 +64,35 @@ PREDICTION_PROVENANCE_FILE = "prediction_provenance.json"
 
 
 def _load_config(path: Path) -> dict:
-    """Parse the minimal predict config (JSON or YAML) — only `log_dir` /
-    `cases_file` are needed launcher-side; the binary re-parses the whole thing."""
+    """Parse the predict config (JSON or YAML) as the binary does. The binary
+    re-parses the whole thing, but a config with `hf://` references reaches it
+    as the launcher's resolved JSON copy, so the two must read alike."""
     text = path.read_text()
     if path.suffix == ".json":
         return json.loads(text)
     import yaml
 
-    return yaml.safe_load(text)
+    return yaml.load(text, Loader=_binary_yaml_loader(yaml))
+
+
+def _binary_yaml_loader(yaml):
+    """A safe loader that reads booleans as the binary's serde_yaml (YAML 1.2)
+    does: only true and false. PyYAML's YAML 1.1 also reads on, off, yes and
+    no as booleans, which would turn `mtp_mode: off` into `false`."""
+
+    bool_tag = "tag:yaml.org,2002:bool"
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    Loader.yaml_implicit_resolvers = {
+        first: [(tag, regexp) for tag, regexp in resolvers if tag != bool_tag]
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    Loader.add_implicit_resolver(
+        bool_tag, re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
+    )
+    return Loader
 
 
 def _prediction_labeler_params(cfg: dict) -> dict | None:
@@ -87,9 +118,7 @@ def _prediction_labeler_params(cfg: dict) -> dict | None:
         return None
     return {
         "pools": {
-            PREDICTION_POOL_TAG: {
-                "groups": [{"arch": dict(architecture_config), "gpu": gpu_name}]
-            }
+            PREDICTION_POOL_TAG: {"groups": [{"arch": dict(architecture_config), "gpu": gpu_name}]}
         }
     }
 
@@ -168,8 +197,7 @@ def _valid_prediction_id(value: object) -> bool:
         1 <= len(suffix) <= 64
         and suffix.isascii()
         and all(
-            character.islower() or character.isdigit() or character == "_"
-            for character in suffix
+            character.islower() or character.isdigit() or character == "_" for character in suffix
         )
     )
 
@@ -281,12 +309,53 @@ def _predict_case_count(config_path: Path, cfg: dict) -> int | None:
     return len(payload) if isinstance(payload, list) else None
 
 
-async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
-    """Run one already-built predictor config.
+def _resolved_config(config_path: Path, cfg: dict) -> dict | None:
+    """`cfg` with hub references resolved, or None when it has none.
 
-    Public so the alignment timing-predict stage can reuse the exact predictor
-    execution/snapshot path.
+    The binary only reads paths. `cases_file` is made absolute because the
+    binary resolves it against the directory of the config it reads, and the
+    resolved copy lives elsewhere.
     """
+    resolved = resolve_hf_references(cfg)
+    if resolved == cfg:
+        return None
+    cases_file = resolved.get("cases_file")
+    if isinstance(cases_file, str) and not Path(cases_file).is_absolute():
+        resolved["cases_file"] = str((config_path.parent / cases_file).resolve())
+    return resolved
+
+
+def _binary_config(config_path: Path, resolved: dict | None, log_dir: Path) -> Path:
+    """The config the binary reads: this one, or the resolved copy beside the outputs.
+
+    Writes into the run directory, so call it only while holding its lease.
+    """
+    if resolved is None:
+        return config_path
+    copy = log_dir / "timing_predict_config.resolved.json"
+    copy.write_text(json.dumps(resolved, indent=2))
+    return copy
+
+
+# How much of the Analyzer runs after a prediction: "full" (every applicable
+# subject, the trace, the plots unless --no-plot, and the iteration breakdown),
+# "essential" (--analyzer-essential-only: the breakdown and the kernel ranking,
+# `run_essential_analysis`), or "none" (--no-analyze).
+ANALYSIS_LEVELS = ("full", "essential", "none")
+
+
+async def run_one(
+    config_path: Path, build_type: str, analysis: str = "full", *, render: bool = True
+) -> bool:
+    """Run one already-built predictor config with ``analysis`` (one of
+    ANALYSIS_LEVELS). ``render=False`` (``--no-plot``) keeps a full analysis
+    but draws no PNGs.
+
+    Public so the public API's ``/predict`` runs the CLI's own execution and
+    snapshot path.
+    """
+    if analysis not in ANALYSIS_LEVELS:
+        raise ValueError(f"analysis must be one of {ANALYSIS_LEVELS}, not {analysis!r}")
     cfg = _load_config(config_path)
     log_dir = Path(cfg["log_dir"])
     if not log_dir.is_absolute():
@@ -294,6 +363,9 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         # launcher-side log_dir to the same root so stdout.log + analysis line up.
         log_dir = REPO_ROOT / log_dir
 
+    # Before any job is announced: a reference that cannot be fetched is a
+    # config error, not a failed prediction.
+    resolved = _resolved_config(config_path, cfg)
     prediction_id = _prediction_id(log_dir)
     descriptor = _predict_descriptor(config_path, cfg)
     managed_job = prepare_managed_job(
@@ -310,14 +382,25 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         if managed_job is not None:
             managed_job.report("running")
         write_artifact_kind(log_dir, ArtifactKind.TIMING_PREDICTION)
+        binary_config = _binary_config(config_path, resolved, log_dir)
         binary = binary_path(build_type)
-        argv = [str(binary), "timing-predict", str(config_path)]
+        (log_dir / "raw").mkdir(parents=True, exist_ok=True)
+        argv = [
+            str(binary),
+            "timing-predict",
+            str(binary_config),
+            "--error-json",
+            str(log_dir / "raw" / ERROR_JSON),
+        ]
         journal = RunJournal(log_dir)
-        async with _LAUNCHER_LEASES.profile_database(write=True):
+        # The predictor writes profile.db only to JIT-profile a missing row, which
+        # it refuses to do without a GPU: then predictions share the database.
+        write = not gpu_disabled()
+        async with _LAUNCHER_LEASES.profile_database(write=write):
             journal.update(
                 "timing_predict",
                 StageState.RUNNING,
-                resources=["profile-db:exclusive"],
+                resources=[f"profile-db:{'exclusive' if write else 'shared'}"],
             )
             try:
                 result = await run_logged_process(
@@ -336,6 +419,7 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
                 result=result,
                 error="predictor failed or left process-group descendants",
             )
+            _report_failure(log_dir)
             if managed_job is not None:
                 managed_job.report("failed")
             return False
@@ -365,16 +449,19 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
             result=result,
             artifacts=validation.paths,
         )
-        if analyze:
-            if managed_job is not None:
-                managed_job.report("analysis_running")
+        if analysis != "none" and managed_job is not None:
+            managed_job.report("analysis_running")
+        if analysis == "full":
             # Best-effort: `analyze trace` (the Perfetto tree) + `analyze run`. Cost
             # subjects apply; request/throughput subjects self-skip on a predict dir.
-            await run_analysis(log_dir, build_type)
-            # Predict-only: the human-readable cost tree (reports/iter_breakdown.ans).
-            # Not in the shared run_analysis — a real run's thousands of iters would
-            # make that file enormous; a predict dir has only a few cases.
+            await run_analysis(log_dir, build_type, render=render)
+            # Predict-only: the cost tree per case, with each node's time and share
+            # (reports/iter_breakdown.ans and its JSON twin). Not in the shared
+            # run_analysis — a real run's thousands of iters would make that file
+            # enormous; a predict dir has only a few cases.
             await run_iter_breakdown(log_dir, build_type)
+        elif analysis == "essential":
+            await run_essential_analysis(log_dir, build_type)
         if managed_job is not None:
             managed_job.report("ready", summary=descriptor)
         return True
@@ -391,22 +478,113 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
             run_directory_lease.release()
 
 
+def _report_failure(log_dir: Path) -> None:
+    """Name the failed prediction's log and the binary's error on stderr."""
+    log_path = log_dir / "stdout.log"
+    cause = binary_error(log_dir / "raw" / ERROR_JSON)
+    print(f"[failed] timing-predict: see {log_path}", file=sys.stderr)
+    if cause:
+        print(f"  {cause}", file=sys.stderr)
+
+
+def dry_run_one(config_path: Path, build_type: str) -> bool:
+    """Validate one predictor config without running it, printing its report."""
+    output, report, _ = dry_run_report(config_path, build_type)
+    print(output, end="" if output.endswith("\n") else "\n")
+    return report is not None
+
+
+def dry_run_report(config_path: Path, build_type: str) -> tuple[str, dict | None, str | None]:
+    """Validate one predictor config without running it: the binary's printed
+    report, the report as its `--report-json` document (None when the config is
+    invalid), and the binary's error (None when it wrote none).
+
+    The binary builds the model on its dry-run bridge, lowers every case against
+    it, and reports the `profile.db` specs a real run would JIT-profile. Nothing is
+    costed or written under `log_dir`, no job is announced, and no GPU is used.
+    """
+    cfg = _load_config(config_path)
+    if not isinstance(cfg.get("log_dir"), str) or not cfg["log_dir"]:
+        raise ValueError("timing-predict config requires log_dir")
+    _resolve_cases(config_path, cfg)
+    resolved = _resolved_config(config_path, cfg)
+    with tempfile.TemporaryDirectory(prefix="timing-predict-dry-run-") as directory:
+        scratch = Path(directory)
+        binary_config = config_path
+        if resolved is not None:
+            binary_config = scratch / "timing_predict_config.resolved.json"
+            binary_config.write_text(json.dumps(resolved, indent=2))
+        report_path, error_path = scratch / "dry_run_report.json", scratch / ERROR_JSON
+        argv = [
+            str(binary_path(build_type)),
+            "timing-predict",
+            "--dry-run",
+            str(binary_config),
+            "--report-json",
+            str(report_path),
+            "--error-json",
+            str(error_path),
+        ]
+        # The model build logs every cost tree at info; the report is the output.
+        env = {"RUST_LOG": "warn", **_build_subprocess_env()}
+        with _LAUNCHER_LEASES.profile_database(write=False):
+            result = _PROCESS_SUPERVISOR.run_sync(
+                ProcessSpec(
+                    argv=argv,
+                    cwd=REPO_ROOT,
+                    env=env,
+                    capture_output=True,
+                    name="timing-predict-dry-run",
+                )
+            )
+        report = json.loads(report_path.read_text()) if result.succeeded else None
+        return result.output, report, binary_error(error_path)
+
+
+def _build_argparse():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m launcher timing-predict",
+        description="Evaluate explicit batch shapes with the offline timing predictor.",
+    )
+    parser.add_argument("configs", nargs="*", help="Timing-predict config YAML/JSON path(s).")
+    parser.add_argument(
+        "--build-type", default="release", help="Cargo profile of the binary (default: release)."
+    )
+    analysis = parser.add_mutually_exclusive_group()
+    analysis.add_argument(
+        "--no-analyze",
+        dest="analysis",
+        action="store_const",
+        const="none",
+        default="full",
+        help="Skip the analyzer after each prediction.",
+    )
+    analysis.add_argument(
+        "--analyzer-essential-only",
+        dest="analysis",
+        action="store_const",
+        const="essential",
+        help="Run only the essential analyzer subjects.",
+    )
+    parser.add_argument("--no-plot", action="store_true", help="Render no PNGs.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check every case against the model and print the specs a real run would JIT.",
+    )
+    return parser
+
+
 def main(argv: list[str]) -> int:
-    build_type = "release"
-    analyze = True
-    configs: list[str] = []
-    it = iter(argv)
-    for tok in it:
-        if tok == "--build-type":
-            build_type = next(it, "")
-            if not build_type:
-                sys.exit("timing-predict: --build-type needs a value")
-        elif tok == "--no-analyze":
-            analyze = False
-        elif tok.startswith("-"):
-            sys.exit(f"timing-predict: unknown flag {tok}")
-        else:
-            configs.append(tok)
+    # Intermixed: config paths may follow options, as the hand-written parser allowed.
+    args = _build_argparse().parse_intermixed_args(argv)
+    build_type = args.build_type
+    analysis = args.analysis
+    render = not args.no_plot
+    dry_run = args.dry_run
+    configs: list[str] = args.configs
 
     if not configs:
         sys.exit(
@@ -415,7 +593,7 @@ def main(argv: list[str]) -> int:
         )
 
     # INV-8: the single shared build (also produces the analyzer binary).
-    if not cargo_build(build_type, build_analyzer=analyze):
+    if not cargo_build(build_type, build_analyzer=analysis != "none" and not dry_run):
         sys.exit("build failed (see errors above)")
 
     rc = 0
@@ -425,6 +603,24 @@ def main(argv: list[str]) -> int:
             print(f"[invalid] {c}: not a file", file=sys.stderr)
             rc = 2
             continue
-        if not asyncio.run(run_one(config_path, build_type, analyze)):
+        try:
+            if dry_run:
+                print(f"[dry-run] {c}")
+                succeeded = dry_run_one(config_path, build_type)
+            else:
+                succeeded = asyncio.run(run_one(config_path, build_type, analysis, render=render))
+        except ValueError as exc:
+            # Only the dry run reports a config error this way; a real run's
+            # ValueError is raised after launch and keeps its traceback.
+            if not dry_run:
+                raise
+            print(f"[invalid] {c}: {exc}", file=sys.stderr)
+            rc = 2
+            continue
+        except CorpusError as exc:
+            print(f"[invalid] {c}: {exc}", file=sys.stderr)
+            rc = 2
+            continue
+        if not succeeded:
             rc = rc or 1
     return rc
